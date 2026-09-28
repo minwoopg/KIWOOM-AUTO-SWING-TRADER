@@ -4,7 +4,7 @@
 단타 레포 [`kiwoom-auto-trader`](https://github.com/minwoopg/kiwoom-auto-trader)
 (`bdde6c2`, 2026-09-28)에서 **매매 로직을 제외한 기반 코드**를 가져와 시작했습니다.
 
-> 현재 상태(6라운드): 하루 수명주기(기동 → 장중 폴링 → 마감 후 대조 → 종료)와 안전 한도, 체결 원장 자동 기록까지 연결.
+> 현재 상태(7라운드, 뼈대 완료): 하루 수명주기·안전 한도·체결 원장 자동 기록·일일 리포트·번들·작업 스케줄러·CI.
 > 전략 자리는 비어 있음(`NullStrategy` — 주문을 내지 않음).
 
 ---
@@ -59,6 +59,11 @@ swing-auto-trader/
 ├── utils/time_utils.py, trade_outcome.py
 ├── utils/trading_calendar.py       # KRX 거래일·장 단계 (config/krx_calendar.yaml)
 ├── tools/probe_market_data.py      # 조회 전용 실측 프로브 (모의투자 도메인만)
+├── infra/reporting/                # 일일 리포트·마스킹
+├── app/reports.py                  # 리포트·번들 조립
+├── tools/daily_report.py, export_bundle.py  # 리포트 재생성·번들 내보내기
+├── scripts/*.ps1                   # 작업 스케줄러 등록·실행
+├── .github/workflows/regression.yml  # 푸시마다 회귀 테스트 (Windows·Ubuntu)
 ├── tools/equivalence/              # OrderExecutor ↔ 단타 TradingService 동작 비교 도구
 ├── provenance.json                 # 파일별 원본 출처·해시
 ├── testing_helpers.py              # 테스트 공용 Settings 헬퍼
@@ -94,6 +99,8 @@ python -m app.main --check-only   # 기동 점검만
 python run_regression_tests.py
 ```
 
+GitHub Actions가 main 푸시마다 Windows·Ubuntu에서 같은 테스트를 돌립니다(실측 fixture가 필요한 `test_broker_order_status.py`만 제외).
+
 `test_broker_order_status.py`는 실측 fixture가 필요합니다. 단타 레포 로컬의
 `tests/fixtures/order_reconciliation/` 폴더를 같은 경로로 복사하세요
 (단타 레포 git에도 포함돼 있지 않은 파일입니다).
@@ -119,6 +126,23 @@ if sub.block_code: ...                                # 주문 안전 게이트�
 ```powershell
 python tools/equivalence/compare.py --orig ..\KIWOOM-AUTO-TRADER
 ```
+
+## 매일 자동 실행 (작업 스케줄러)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\register_task.ps1                 # 평일 08:40
+powershell -ExecutionPolicy Bypass -File scripts\register_task.ps1 -Time 08:30 -Python "C:\경로\.venv\Scripts\python.exe"
+Start-ScheduledTask -TaskName SwingAutoTrader                                        # 지금 한 번 실행해 확인
+powershell -ExecutionPolicy Bypass -File scripts\unregister_task.ps1               # 해제
+```
+
+공휴일은 프로그램이 캘린더로 판단해 바로 종료합니다. 실행 출력: `logs\scheduler\run_<시각>.log`.
+
+## 리포트·번들
+
+- 하루가 끝나면 `reports\daily_report_<날짜>.md`가 자동 생성됩니다(평가는 완성 일봉 종가 기준).
+- 다시 만들기: `python tools/daily_report.py --date 2026-09-28`
+- 공유용 번들(민감정보 가림): `python tools/export_bundle.py --date 2026-09-28` → `exports\swing_bundle_<날짜>.zip`
 
 ## 상태와 원장 — 한 사실은 한 곳에만
 

@@ -261,4 +261,41 @@
 ### 전달 파일
 - 패치 0001 (수명주기·한도·기록기·main·설정·테스트), 0002 (CHANGELOG/README)
 
+---
+
+## 2026-09-28 — 7라운드: 일일 리포트·번들, 작업 스케줄러, GitHub Actions (뼈대 마지막)
+
+### 배경
+- 뼈대 작업 8·9·10번. 매매 로직 없음.
+
+### 변경 내용
+- **일일 리포트** `infra/reporting/daily_report.py` (순수 함수) + `app/reports.py`(파일 조립)
+  - `reports/daily_report_<날짜>.md`: 요약(보유 수·원가·평가액·평가손익·당일/누적 실현, Base·Stress 비용 차감) / 보유 종목(수량·평균단가·첫 진입일·보유 거래일·종가·평가손익·손절가·전략) / 당일 체결(가격 출처) / 당일 실현 매칭(보유 거래일·추정 여부) / 미해결 주문 / 장부 대조 / 세션 요약
+  - 평가는 **완성된 일봉 종가**만 사용(장중 가격 안 씀). 종가가 없으면 제외하고 안내.
+  - 하루 수명주기 끝에 자동 생성(휴장일 제외, 실패해도 매매 결과에 영향 없음). `tools/daily_report.py [--date]`로 다시 생성.
+- **번들** `tools/export_bundle.py [--date]` → `exports/swing_bundle_<날짜>.zip`
+  - 그날 app.log(순환 파일 포함)·trades.csv·position_lifecycle.csv 행, 체결 원장, state.json, 주문 저널, 실행 기준선, 리포트, 체결조회 관측의 그날 줄 + manifest(해시·git SHA).
+  - `infra/reporting/masking.py`: 단타 `export_daily_bundle.py`의 마스킹 코드를 그대로 가져옴(자격증명 누출 재현 후 보강된 코드). 텍스트는 정규식, JSON은 키 기준(구조·주문번호 보존).
+- **작업 스케줄러** `scripts/register_task.ps1` / `run_swing.ps1` / `unregister_task.ps1`
+  - 평일 08:40(변경 가능) 실행, 공휴일은 프로그램이 캘린더로 판단해 바로 종료. 중복 실행 무시, 최대 9시간, 배터리 모드에서도 실행.
+  - 실행 출력은 `logs/scheduler/run_<시각>.log`, 종료 코드를 작업 스케줄러에 그대로 전달.
+  - PowerShell 5.1이 한글을 읽도록 UTF-8 BOM으로 저장. 파이썬 stderr가 PowerShell 오류로 바뀌어 멈추지 않게 처리.
+- **GitHub Actions** `.github/workflows/regression.yml`: main 푸시·PR마다 Windows·Ubuntu × Python 3.11·3.12 회귀 테스트. 실측 fixture 없는 `test_broker_order_status.py`만 명시적으로 건너뜀.
+- `run_regression_tests.py`: `--skip FILE` 옵션 추가(provenance `modified`).
+- `config`: `storage.reports_dir`. `.gitignore`: `reports/`, `exports/` (손익 등 개인 기록).
+
+### 테스트 및 검증
+- `test_daily_report.py` 27건 (리포트 본문 수치·표 행, 지난 날짜 평가, 마스킹, 번들 내용·날짜 필터·가림·manifest), `test_session_runner.py` 30→32건(하루 끝 리포트 생성, 휴장일 미생성).
+- `run_regression_tests.py --skip test_broker_order_status.py`: **23개 전부 통과** (UTF-8 모드에서도 동일). 동등성 18/18.
+
+### 확인하지 못한 것
+- PowerShell 스크립트는 이 작업 환경에 PowerShell이 없어 실행 검증을 못 함 → 등록 후 `Start-ScheduledTask`로 한 번 확인 필요.
+- GitHub Actions의 Windows 러너 결과는 첫 푸시 후 Actions 탭에서 확인 필요(로컬 검증은 Linux).
+
+### 뼈대 완료 — 다음 단계
+- 전략 설계(백테스트 엔진 포함)로 넘어갈 준비 완료. 남은 운영 확인: 장 마감 후 당일 봉 확정, 장 시작 전 체결조회 범위(프로브).
+
+### 전달 파일
+- 패치 0001 (리포트·번들·스케줄러·CI), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
