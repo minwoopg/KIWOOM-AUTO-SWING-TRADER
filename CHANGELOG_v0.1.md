@@ -220,4 +220,45 @@
 ### 전달 파일
 - 패치 0001 (일봉 계층·설정·CLI·테스트), 0002 (CHANGELOG/README)
 
+---
+
+## 2026-09-28 — 6라운드: 하루 수명주기 + 계좌 안전 한도 + 체결 원장 자동 기록
+
+### 배경
+- 뼈대 작업 6·7번. 전략 자리는 비워둠(NullStrategy) — 매매 판단 없음.
+- 5라운드 실사용 확인: `update_daily_bars.py 005930 000660` → 각 1799행(당일 미완성 봉 제외)·9/23까지, 호출 7회 중 1초 간격에서도 429 1회 → 재시도로 복구.
+
+### 변경 내용
+- `app/session_runner.py` (`SessionRunner`): 프로세스 1회 = 거래일 하루
+  - CLOSED_DAY 즉시 종료 / PRE_OPEN 대기 / 장중 `poll_interval_sec`(기본 60초)마다 tick / 마감 후 미해결 주문이 없어질 때까지(최대 15:45) 대조만 → 요약 → 종료
+  - tick 순서: 잔고 → `OrderExecutor.sync_with_balance` → 체결 원장 기록 → 끝난 주문 추적 종료 → 장부 대조(원장·잔고·메타) → 전략 `on_tick` → 안전 한도 → 주문
+  - 잔고 조회 실패 폴링은 주문 없음(연속 5회부터 CRITICAL). 전략 예외는 CRITICAL 후 계속. 원장 손상·기록 실패 → 이번 프로세스 신규 주문 중단(대조는 계속, 프로세스는 끝까지 정상 종료).
+  - 청산 완료(원장·잔고 보유 없음, 진행 중 주문 없음) 종목의 포지션 메타 자동 정리. 매수 접수 시 메타 생성(전략 ID).
+- `domain/strategy/interface.py`: `OrderIntent`(시장가, forced는 매도만), `TickContext`(읽기 전용 스냅샷), `Strategy` 프로토콜, `NullStrategy`.
+- `domain/risk/account_guard.py` (`check_intent`, 순수 함수): 신규 주문 시간대(09:05~15:15, 강제 매도 예외) / 장부 불일치·검토 필요 종목 차단(강제 매도 포함) / 1회 주문 금액 / 최대 보유 종목 수 / 총 노출 / 현금 버퍼 / 매도 ≤ 원장 보유 / 허용 종목 목록.
+- `domain/service/fill_recorder.py` (`FillRecorder`): 접수된 주문만 추적해 잔고 변화로 BUY/SELL 사건 기록. 매수 원가는 잔고 평균단가 역산(BROKER_AVG), 매도는 주문가 추정(ORDER_ESTIMATE). event_id = 주문번호:누적체결 → 중복 기록 없음. 추적 안 한 수량 변화(HTS 수동 매매)는 기록하지 않고 대조에서 드러남.
+- `app/main.py`: 기동 점검 후 하루 수명주기 실행. `--check-only`로 이전 동작(점검만). 마감 후 일봉 갱신은 설정으로 선택(`session.update_daily_bars_after_close`).
+- `config`: `session`(폴링 간격 10초 미만 거부, 마감 후 대조 한계, 감시 종목), `guard`(한도 값) 섹션.
+
+### 테스트 및 검증
+- `test_account_guard.py` 26건, `test_fill_recorder.py` 14건, `test_session_runner.py` 30건 (가짜 시계로 하루 전체: 휴장일 / 전략 없는 하루 391회 폴링 / 매수→체결 기록→매도→청산·메타 정리 / 다음 날 재기동 대조 일치 / 미체결로 15:45까지 대기 / 잔고 장애 / 전략 예외 / 중지 요청 / HTS 수동 보유 종목 차단 / 원장 손상 시 중단).
+  - 테스트 중 발견·수정: 원장이 손상된 상태에서 추적 주문이 체결되면 기록 단계 예외로 러너 전체가 죽음 → 신규 주문 중단으로 처리하도록 수정.
+- `run_regression_tests.py`: 23개 파일 중 22개 통과 (실패 1개는 기존과 동일 — 실측 fixture 없음). 동등성 18/18.
+- `python -m app.main --check-only` 정상, MockBroker + 가짜 시계 하루 실행 정상(391회 폴링, 대조 일치).
+
+### 변경하지 않은 것
+- 매매 판단 없음 — `NullStrategy`는 주문을 내지 않음.
+- 매도 체결가는 주문가 추정으로만 기록(체결조회 증거로 실제 체결가를 붙이는 것은 이후 과제).
+- 체결 추적 정보는 메모리 전용 — 주문 도중 재시작하면 OrderExecutor가 ERROR로 복원하고 기동 대조에서 불일치로 보고됨(사람 확인 원칙 유지).
+
+### 운영 주의
+- `python -m app.main`은 이제 **장 마감(15:30~15:45)까지 실행**됩니다. 점검만 하려면 `--check-only`.
+- `broker.use_mock: true`면 MockBroker(즉시 체결 가짜 계좌)로 하루가 돌아갑니다. 스윙 모의계좌로 돌리려면 `false`.
+
+### 다음 작업 (뼈대 마지막)
+- 7라운드: 일일 리포트(보유·평가손익·실현손익·미해결 주문)·로그 번들, Windows 작업 스케줄러 등록 스크립트, GitHub Actions 회귀 테스트.
+
+### 전달 파일
+- 패치 0001 (수명주기·한도·기록기·main·설정·테스트), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

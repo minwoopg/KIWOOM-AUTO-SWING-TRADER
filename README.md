@@ -4,9 +4,8 @@
 단타 레포 [`kiwoom-auto-trader`](https://github.com/minwoopg/kiwoom-auto-trader)
 (`bdde6c2`, 2026-09-28)에서 **매매 로직을 제외한 기반 코드**를 가져와 시작했습니다.
 
-> 현재 상태(5라운드): 매매 루프 없음. 주문 실행부(`OrderExecutor`) 추출 완료, 아직 진입점에는 연결 안 됨.
->  `python -m app.main`은 기동 점검
-> (인증 → 잔고 → 미해결 주문 흔적 확인 → 시작 알림)만 하고 종료합니다.
+> 현재 상태(6라운드): 하루 수명주기(기동 → 장중 폴링 → 마감 후 대조 → 종료)와 안전 한도, 체결 원장 자동 기록까지 연결.
+> 전략 자리는 비어 있음(`NullStrategy` — 주문을 내지 않음).
 
 ---
 
@@ -23,7 +22,8 @@
 
 ```
 swing-auto-trader/
-├── app/main.py                     # 진입점 — 1라운드: 기반 점검 모드
+├── app/main.py                     # 진입점 — 기동 점검 + 하루 수명주기 (--check-only: 점검만)
+├── app/session_runner.py           # 하루 수명주기 (장전 대기·장중 폴링·마감 후 대조)
 ├── config/
 │   ├── settings.py                 # App/Broker/Storage/Kakao 설정만
 │   └── settings.yaml
@@ -37,7 +37,10 @@ swing-auto-trader/
 │   ├── service/lot_ledger.py       # 여러 날 FIFO 로트·실현/평가손익
 │   ├── service/order_executor.py   # 주문 실행·체결 추적·재시작 복구 (단타 TradingService에서 추출)
 │   ├── service/pnl_calculator.py   # FIFO 손익 (여러 날 보유 대응 수정 예정)
+│   ├── strategy/interface.py       # 전략 자리: OrderIntent·TickContext·NullStrategy
 │   ├── strategy/exit_calc.py       # 손절·트레일링 순수 계산
+│   ├── risk/account_guard.py       # 계좌 안전 한도 (전략과 무관한 절대 한도)
+│   ├── service/fill_recorder.py    # 체결 → 원장 자동 기록
 │   ├── market_data/daily_bar.py    # 일봉 모델·엄격 파서
 │   └── indicator/indicators.py     # ATR·볼린저
 ├── infra/
@@ -78,8 +81,12 @@ Copy-Item .env.example .env   # 스윙 계좌 값 입력
 ## 실행
 
 ```powershell
-python -m app.main
+python -m app.main                # 장 시작 전 기동 → 장 마감 후(15:30~15:45) 자동 종료
+python -m app.main --check-only   # 기동 점검만
 ```
+
+하루 흐름: 휴장일이면 바로 종료 → 장 시작 대기 → 60초마다 잔고·주문 대조·원장 기록·장부 대조·전략·안전 한도
+→ 마감 후 미해결 주문 대조 → 요약(`[SESSION_SUMMARY]`) 후 종료. 한도 값은 `config/settings.yaml`의 `guard`.
 
 ## 테스트
 
