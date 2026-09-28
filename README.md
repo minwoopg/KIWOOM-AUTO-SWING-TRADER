@@ -4,7 +4,7 @@
 단타 레포 [`kiwoom-auto-trader`](https://github.com/minwoopg/kiwoom-auto-trader)
 (`bdde6c2`, 2026-09-28)에서 **매매 로직을 제외한 기반 코드**를 가져와 시작했습니다.
 
-> 현재 상태(2라운드): 매매 루프 없음. 주문 실행부(`OrderExecutor`) 추출 완료, 아직 진입점에는 연결 안 됨.
+> 현재 상태(3라운드): 매매 루프 없음. 주문 실행부(`OrderExecutor`) 추출 완료, 아직 진입점에는 연결 안 됨.
 >  `python -m app.main`은 기동 점검
 > (인증 → 잔고 → 미해결 주문 흔적 확인 → 시작 알림)만 하고 종료합니다.
 
@@ -46,6 +46,8 @@ swing-auto-trader/
 │       ├── process_lock.py                 # 중복 실행 차단
 │       └── logger.py                       # app.log / trades.csv / position_lifecycle.csv
 ├── utils/time_utils.py, trade_outcome.py
+├── utils/trading_calendar.py       # KRX 거래일·장 단계 (config/krx_calendar.yaml)
+├── tools/probe_market_data.py      # 조회 전용 실측 프로브 (모의투자 도메인만)
 ├── tools/equivalence/              # OrderExecutor ↔ 단타 TradingService 동작 비교 도구
 ├── provenance.json                 # 파일별 원본 출처·해시
 ├── testing_helpers.py              # 테스트 공용 Settings 헬퍼
@@ -102,6 +104,20 @@ if sub.block_code: ...                                # 주문 안전 게이트�
 ```powershell
 python tools/equivalence/compare.py --orig ..\KIWOOM-AUTO-TRADER
 ```
+
+## 거래일 캘린더
+
+`config/krx_calendar.yaml`에 연도별 평일 휴장일을 적습니다. 목록에 없는 연도를 조회하면
+예외가 납니다 — **매년 말 다음 해 휴장일을 추가하세요.**
+
+## 실측 프로브 (조회 전용)
+
+```powershell
+python tools/probe_market_data.py                     # 장중 1회 + 장 마감 후 1회
+python tools/probe_market_data.py --env-file ..\KIWOOM-AUTO-TRADER\.env --skip-daily   # 장 시작 전, 주문 이력 있는 모의계좌
+```
+
+결과 요약은 `logs/probes/*_summary.txt`에 남습니다.
 
 ## 카카오 알림
 

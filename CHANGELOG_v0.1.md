@@ -92,4 +92,43 @@
 ### 전달 파일
 - 패치 0001 (코드 + 테스트 + 도구), 0002 (CHANGELOG/README)
 
+---
+
+## 2026-09-28 — 3라운드: 거래일 캘린더 + 조회 전용 실측 프로브
+
+### 배경
+- 뼈대 작업 1·2번. 매매 로직은 다루지 않음.
+- 단타 `time_utils.is_market_open()`은 평일 09:00~15:20만 보고 휴장일을 모름 → "N거래일 보유", "직전 거래일 완성 봉" 계산 불가.
+- 일봉 당일 미완성 봉 포함 여부, 체결조회 범위는 지금까지 추정만 있었음.
+
+### 변경 내용
+- `config/krx_calendar.yaml`: 2026년 KRX 평일 휴장일 17일 + 특수 운영일(1/2 10시 개장). 출처 주석 포함.
+  - 확인된 2026년 특이사항: 7/17 제헌절 재지정 휴장, 6/3 지방선거, 5/25·10/5 대체공휴일 휴장, 9/28은 정상 개장(추석 토요일 겹침은 대체공휴일 아님).
+- `utils/trading_calendar.py` (`TradingCalendar`)
+  - `is_trading_day` / `next_trading_day` / `previous_trading_day` / `add_trading_days` / `trading_days_between`(보유 거래일수) / `trading_days_in_range`
+  - `phase(now)`: CLOSED_DAY / PRE_OPEN / REGULAR / CLOSING_AUCTION(15:20~) / POST_CLOSE
+  - `last_completed_session(now)`: 정규장이 끝난 마지막 거래일 — 일봉 판정 기준일
+  - `compare_with_bar_dates()`: 실제 일봉 날짜와 캘린더 대조
+  - fail-closed: 파일 없음·형식 오류·주말을 휴장일로 적음·다루지 않는 연도 조회 → 예외 (다음 해를 "평일이니 개장"으로 추측하지 않음)
+- `tools/probe_market_data.py`: 조회 전용 프로브 (모의투자 도메인만, 주문 API 호출 불가, 계좌·토큰 값 가림)
+  - A. 일봉(ka10081) 당일 미완성 봉 포함 여부·페이지 크기·연속조회
+  - B. 일봉 날짜 ↔ 캘린더 대조
+  - C. 미체결(ka10075)·체결(ka10076)이 이전 거래일 주문을 보여주는지
+- `utils/time_utils.py`는 원본 그대로 유지 (provenance `unchanged`).
+
+### 테스트 및 검증
+- `test_trading_calendar.py` 42건, `test_probe_market_data.py` 22건 (가짜 세션 — 네트워크 없음, 주문 API 미호출·비밀값 미기록 확인 포함).
+- `run_regression_tests.py`: 16개 파일 중 15개 통과 (실패 1개는 기존과 동일 — 실측 fixture 없음).
+
+### 변경하지 않은 것
+- 캘린더는 2026년만 다룸. 2027년 목록은 거래소 공지 후 추가. 2026-01-02에 `previous_trading_day`를 부르면 2025년이 없어 예외가 남(의도된 fail-closed).
+- 수능일 개장 지연은 공지 후 추가.
+
+### 다음 작업
+- 프로브 실행 결과를 보고 일봉 데이터 계층 설계 확정 (완성 봉 판정 규칙, 페이지 수, 저장 형식).
+- 4라운드: 스윙 상태 모델 + 여러 날 보유 원장.
+
+### 전달 파일
+- 패치 0001 (캘린더·프로브·테스트), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
