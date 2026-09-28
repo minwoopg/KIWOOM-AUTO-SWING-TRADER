@@ -16,6 +16,7 @@ from __future__ import annotations
 6. 이전 프로세스가 남긴 미해결 주문 흔적 확인
    (state.json의 unresolved_order_intents + tracked_order_journal)
    — 읽기만 하고 아무것도 자동 해소하지 않습니다.
+6-1. 체결 원장 ↔ 잔고 ↔ 포지션 메타 대조 보고 (4라운드, 읽기 전용)
 7. 카카오 시작 알림 (백그라운드, 실패해도 무시)
 
 주문 실행부(OrderExecutor)와 스윙 매매 루프는 다음 라운드에서 연결합니다.
@@ -36,7 +37,10 @@ from infra.broker.mock_broker import MockBroker
 from infra.storage.logger import build_app_logger
 from infra.storage.process_lock import single_instance_lock
 from infra.storage.run_baseline import perform_run_baseline_startup
-from infra.storage.state_store import JsonStateStore
+from domain.position.position_book import ReconcileReport, reconcile
+from domain.service.lot_ledger import LotMatchError, apply_events
+from infra.storage.fill_ledger import FillLedgerCorruptError, FillLedgerStore
+from infra.storage.swing_state_store import SwingStateStore
 from infra.storage.tracked_order_journal import (
     TrackedOrderJournalCorruptError,
     TrackedOrderJournalStore,
@@ -101,6 +105,8 @@ class StartupReport:
     unresolved_intent_symbols: list[str] = field(default_factory=list)
     journal_symbols: list[str] = field(default_factory=list)
     journal_error: str = ""
+    ledger_error: str = ""
+    reconcile: ReconcileReport | None = None
 
     @property
     def has_unresolved_orders(self) -> bool:
@@ -132,10 +138,11 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
             raise StartupBlockedError("실전투자 시작 시 잔고 조회 실패") from exc
 
     # ── 이전 프로세스의 미해결 주문 흔적 (읽기 전용) ───────────
-    # 단타 레포 TradingService._restore_order_recovery_blocks()가 보는 두
-    # 출처와 동일. 이 라운드는 PSM이 없으므로 "있다/없다"만 보고합니다.
+    # OrderExecutor.restore_order_recovery_blocks()가 보는 두 출처와 동일.
+    # 여기서는 "있다/없다"만 보고합니다.
+    state = None
     try:
-        state, _highest = JsonStateStore(settings.storage.state_file).load()
+        state, _ = SwingStateStore(settings.storage.state_file).load()
         report.unresolved_intent_symbols = sorted(state.unresolved_order_intents)
     except Exception as exc:
         # state.json 손상도 "미해결 주문 여부를 알 수 없음"으로 취급
@@ -158,6 +165,29 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
         )
     else:
         app_logger.info("[STARTUP_ORDER_RECOVERY] 미해결 주문 흔적 없음")
+
+    # ── 체결 원장 ↔ 잔고 ↔ 포지션 메타 대조 (4라운드, 읽기 전용) ──
+    ledger_store = FillLedgerStore(settings.storage.fill_ledger_file)
+    try:
+        ledger = apply_events(ledger_store.load())
+    except (FillLedgerCorruptError, LotMatchError) as exc:
+        report.ledger_error = f"{type(exc).__name__}: {exc}"
+        app_logger.critical(f"[STARTUP_LEDGER] 체결 원장을 신뢰할 수 없음: {report.ledger_error}")
+        if is_live:
+            raise StartupBlockedError("실전투자 — 체결 원장 손상으로 시작하지 않습니다.") from exc
+        return report
+    for torn in ledger_store.torn_tail_paths:
+        app_logger.critical(f"[STARTUP_LEDGER] 끊긴 마지막 줄 격리: {torn} — 잔고와 대조 필요")
+    if report.balance is not None and state is not None:
+        report.reconcile = reconcile(
+            ledger, report.balance, state.positions,
+            orders_in_flight=report.has_unresolved_orders,
+        )
+        for line in report.reconcile.lines():
+            (app_logger.critical if line.startswith("[BLOCK]") else app_logger.info)(
+                f"[STARTUP_RECONCILE] {line}")
+        if report.reconcile.issues == []:
+            app_logger.info("[STARTUP_RECONCILE] 원장·잔고·메타 일치")
     return report
 
 
@@ -205,7 +235,12 @@ async def _run_application(settings: Settings) -> None:
     else:
         print(f"  잔고 조회 실패: {report.balance_error}")
     print(f"  미해결 주문 흔적: {'있음 — app.log 확인' if report.has_unresolved_orders else '없음'}")
-    app_logger.info("[STARTUP] 기반 점검 완료 — 매매 루프 없이 종료합니다(1라운드).")
+    if report.ledger_error:
+        print(f"  체결 원장: 오류 — {report.ledger_error}")
+    elif report.reconcile is not None:
+        print(f"  장부 대조: {'일치' if report.reconcile.ok else '불일치 — app.log [STARTUP_RECONCILE] 확인'}"
+              f" (어긋남 {len(report.reconcile.issues)}건)")
+    app_logger.info("[STARTUP] 기반 점검 완료 — 매매 루프 없이 종료합니다(매매 루프 미연결).")
 
 
 def main() -> int:

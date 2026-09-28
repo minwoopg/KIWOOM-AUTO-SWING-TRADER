@@ -17,9 +17,12 @@ from unittest.mock import Mock
 sys.path.insert(0, ".")
 
 from app.main import StartupBlockedError, retry_on_429, run_startup_checks
-from domain.models import RuntimeState
+from domain.models import Position
+from domain.position.fill_event import FillEvent
+from domain.position.swing_state import PositionMeta, SwingState
 from infra.broker.mock_broker import MockBroker
-from infra.storage.state_store import JsonStateStore
+from infra.storage.fill_ledger import FillLedgerStore
+from infra.storage.swing_state_store import SwingStateStore
 from infra.storage.tracked_order_journal import TrackedOrderJournalStore, TrackedOrderRecord
 from testing_helpers import build_minimal_settings
 
@@ -134,9 +137,9 @@ with tempfile.TemporaryDirectory() as tmp:
 # ── 4. 이전 프로세스의 미해결 주문 흔적 ─────────────────────
 with tempfile.TemporaryDirectory() as tmp:
     s = build_minimal_settings(tmp)
-    st = RuntimeState()
+    st = SwingState()
     st.unresolved_order_intents["005930"] = {"side": "BUY", "quantity": 1, "order_id": "", "created_at": "x"}
-    JsonStateStore(s.storage.state_file).save(st, {})
+    SwingStateStore(s.storage.state_file).save(st)
     TrackedOrderJournalStore(s.storage.tracked_order_journal_file).upsert(TrackedOrderRecord(
         symbol="000660", side="SELL", order_id="0012345",
         base_quantity_before_order=10, target_quantity_after_order=0,
@@ -162,6 +165,60 @@ with tempfile.TemporaryDirectory() as tmp:
         check("5-2) 실전투자: 손상 저널이면 시작 중단", False)
     except StartupBlockedError:
         check("5-2) 실전투자: 손상 저널이면 시작 중단", True)
+
+# ── 6. 상태 파일 형식 (4라운드: SwingState) ───────────────────
+with tempfile.TemporaryDirectory() as tmp:
+    s = build_minimal_settings(tmp)
+    Path(s.storage.state_file).write_text('{"bought_symbols_today": []}', encoding="utf-8")
+    r = _run(s, MockBroker())
+    check("6-1) 단타 형식 state.json → 주문 기록 확인 실패로 보고", "state.json 읽기 실패" in r.journal_error)
+    try:
+        _run(_live(s), MockBroker())
+        check("6-2) 실전투자: 단타 형식 state.json이면 시작 중단", False)
+    except StartupBlockedError:
+        check("6-2) 실전투자: 단타 형식 state.json이면 시작 중단", True)
+
+# ── 7. 체결 원장 대조 ─────────────────────────────────────────
+def _fill(eid, kind, sym, qty, price):
+    return FillEvent(eid, kind, sym, qty, price, "BROKER_FILL", datetime(2026, 9, 21).date(),
+                     datetime(2026, 9, 21, 9, 30))
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    s = build_minimal_settings(tmp)
+    b = MockBroker()
+    b._positions["005930"] = Position("005930", 10, 70000)
+    FillLedgerStore(s.storage.fill_ledger_file).append(_fill("b1", "BUY", "005930", 10, 70000))
+    st = SwingState()
+    st.upsert_position_meta(PositionMeta("005930", strategy_id="t"))
+    SwingStateStore(s.storage.state_file).save(st)
+    r = _run(s, b)
+    check("7-1) 원장·잔고·메타 일치 → 대조 통과", r.reconcile is not None and r.reconcile.ok
+          and r.reconcile.issues == [])
+    b._positions["005930"] = Position("005930", 7, 70000)
+    logger = Mock()
+    r = _run(s, b, logger)
+    check("7-2) 수량 불일치 → 대조 보고(blocking) + CRITICAL 로그",
+          not r.reconcile.ok and "[STARTUP_RECONCILE] [BLOCK] QTY_MISMATCH" in
+          " ".join(str(c.args[0]) for c in logger.critical.call_args_list))
+    check("7-3) 대조는 아무것도 고치지 않음(원장 1건 그대로)",
+          len(FillLedgerStore(s.storage.fill_ledger_file).load()) == 1)
+
+with tempfile.TemporaryDirectory() as tmp:
+    s = build_minimal_settings(tmp)
+    Path(s.storage.fill_ledger_file).write_text("{broken}\n", encoding="utf-8")
+    r = _run(s, MockBroker())
+    check("7-4) 손상 원장 → ledger_error 보고", bool(r.ledger_error))
+    try:
+        _run(_live(s), MockBroker())
+        check("7-5) 실전투자: 손상 원장이면 시작 중단", False)
+    except StartupBlockedError:
+        check("7-5) 실전투자: 손상 원장이면 시작 중단", True)
+    FillLedgerStore(s.storage.fill_ledger_file).path.write_text("", encoding="utf-8")
+    FillLedgerStore(s.storage.fill_ledger_file).append(_fill("s1", "SELL", "005930", 1, 70000))
+    r = _run(s, MockBroker())
+    check("7-6) 보유 없이 매도만 있는 원장(LotMatchError) → ledger_error", "LotMatchError" in r.ledger_error)
+
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

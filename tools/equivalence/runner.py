@@ -32,9 +32,9 @@ def build():
         settings = build_minimal_settings(tmp)
         from domain.service.order_executor import OrderExecutor
         from infra.storage.logger import TradeCsvLogger, build_app_logger, PositionLifecycleLogger
-        from infra.storage.state_store import JsonStateStore
+        from infra.storage.swing_state_store import SwingStateStore  # 4라운드: 스윙 상태 저장소로 교체
         lg = build_app_logger(settings.storage.app_log_file, "INFO")
-        ss = JsonStateStore(settings.storage.state_file)
+        ss = SwingStateStore(settings.storage.state_file)
         state, hp = ss.load()
         ex = OrderExecutor(settings=settings, broker=broker, state=state, highest_price=hp, state_store=ss,
                            app_logger=lg, trade_logger=TradeCsvLogger(settings.storage.trade_log_file),

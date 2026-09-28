@@ -51,10 +51,22 @@
       "source_path": "domain/position/__init__.py",
       "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
+    "domain/position/fill_event.py": {
+      "status": "new"
+    },
     "domain/position/lifecycle.py": {
       "status": "unchanged",
       "source_path": "domain/position/lifecycle.py",
       "source_sha256": "f7d56b78191e2752880e1d5c52956b5716984739faf72399b8191bd8f526f8b6"
+    },
+    "domain/position/position_book.py": {
+      "status": "new"
+    },
+    "domain/position/swing_state.py": {
+      "status": "new"
+    },
+    "domain/service/lot_ledger.py": {
+      "status": "new"
     },
     "domain/service/order_executor.py": {
       "status": "rewritten",
@@ -106,6 +118,9 @@
       "source_path": "infra/notify/kakao_notifier.py",
       "source_sha256": "7020d7705595c934d300ec15a88f1699689aee150109f10e7e2ee6049c5d90da"
     },
+    "infra/storage/fill_ledger.py": {
+      "status": "new"
+    },
     "infra/storage/logger.py": {
       "status": "modified",
       "source_path": "infra/storage/logger.py",
@@ -130,6 +145,9 @@
       "status": "unchanged",
       "source_path": "infra/storage/state_store.py",
       "source_sha256": "c1c46319b4dfb14046ae68653422d1ced90967310af776db23b7ea794421251f"
+    },
+    "infra/storage/swing_state_store.py": {
+      "status": "new"
     },
     "infra/storage/tracked_order_journal.py": {
       "status": "unchanged",
@@ -169,6 +187,9 @@
       "source_path": "test_cost_model.py",
       "source_sha256": "2b5d0fcd2faa0a76356c768742b8f2614f3820d03a484e9ba35a52dc932f5bc1"
     },
+    "test_fill_ledger.py": {
+      "status": "new"
+    },
     "test_kakao_notifier_token_lifecycle.py": {
       "status": "modified",
       "source_path": "test_kakao_notifier_token_lifecycle.py",
@@ -192,6 +213,9 @@
     "test_order_executor.py": {
       "status": "new"
     },
+    "test_position_book.py": {
+      "status": "new"
+    },
     "test_position_lifecycle.py": {
       "status": "derived",
       "source_path": "test_partial_fill_lifecycle.py",
@@ -204,6 +228,9 @@
       "status": "modified",
       "source_path": "test_run_baseline.py",
       "source_sha256": "cb02270a65a42eb795d1c56915309435e164f82e476d2c5c5e1ba83713461dd3"
+    },
+    "test_swing_state.py": {
+      "status": "new"
     },
     "test_tracked_order_journal_store.py": {
       "status": "derived",

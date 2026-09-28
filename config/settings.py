@@ -88,6 +88,8 @@ class StorageConfig:
     run_baseline_log_file: str = "logs/run_baseline.csv"
     # 체결조회 증거(JSON Lines, append-only)
     order_status_observation_log_file: str = "logs/order_status_observations.jsonl"
+    # 체결 원장(JSON Lines, append-only) — 보유 수량·매입단가·진입일의 단일 원천 (4라운드)
+    fill_ledger_file: str = "data/fill_ledger.jsonl"
 
 
 @dataclass(frozen=True)
