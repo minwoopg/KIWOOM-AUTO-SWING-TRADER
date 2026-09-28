@@ -4,7 +4,8 @@
 단타 레포 [`kiwoom-auto-trader`](https://github.com/minwoopg/kiwoom-auto-trader)
 (`bdde6c2`, 2026-09-28)에서 **매매 로직을 제외한 기반 코드**를 가져와 시작했습니다.
 
-> 현재 상태(1라운드): 매매 루프 없음. `python -m app.main`은 기동 점검
+> 현재 상태(2라운드): 매매 루프 없음. 주문 실행부(`OrderExecutor`) 추출 완료, 아직 진입점에는 연결 안 됨.
+>  `python -m app.main`은 기동 점검
 > (인증 → 잔고 → 미해결 주문 흔적 확인 → 시작 알림)만 하고 종료합니다.
 
 ---
@@ -30,6 +31,7 @@ swing-auto-trader/
 │   ├── models.py                   # 주문·잔고·체결 모델 (RuntimeState는 단타용 — 교체 예정)
 │   ├── cost_model.py               # 비용 3시나리오 (fail-closed 로딩)
 │   ├── position/lifecycle.py       # 포지션 상태머신(PSM) — 체결 확인 게이트
+│   ├── service/order_executor.py   # 주문 실행·체결 추적·재시작 복구 (단타 TradingService에서 추출)
 │   ├── service/pnl_calculator.py   # FIFO 손익 (여러 날 보유 대응 수정 예정)
 │   ├── strategy/exit_calc.py       # 손절·트레일링 순수 계산
 │   └── indicator/indicators.py     # ATR·볼린저
@@ -44,6 +46,7 @@ swing-auto-trader/
 │       ├── process_lock.py                 # 중복 실행 차단
 │       └── logger.py                       # app.log / trades.csv / position_lifecycle.csv
 ├── utils/time_utils.py, trade_outcome.py
+├── tools/equivalence/              # OrderExecutor ↔ 단타 TradingService 동작 비교 도구
 ├── provenance.json                 # 파일별 원본 출처·해시
 ├── testing_helpers.py              # 테스트 공용 Settings 헬퍼
 └── test_*.py                       # 회귀 테스트 (run_regression_tests.py)
@@ -77,6 +80,32 @@ python run_regression_tests.py
 `test_broker_order_status.py`는 실측 fixture가 필요합니다. 단타 레포 로컬의
 `tests/fixtures/order_reconciliation/` 폴더를 같은 경로로 복사하세요
 (단타 레포 git에도 포함돼 있지 않은 파일입니다).
+
+## 주문 실행 (`OrderExecutor`)
+
+```python
+executor = OrderExecutor(settings=..., broker=..., state=state, highest_price=hp,
+                         state_store=store, app_logger=log, trade_logger=trades,
+                         on_first_fill_buy=..., on_sell_closed=...)
+executor.sync_with_balance(balance, watch_symbols)   # 매 폴링, 주문 판단 전에
+sub = executor.submit_buy("005930", 10, 70000, context={"entry_strategy": "..."})
+if sub.block_code: ...                                # 주문 안전 게이트에 막힘
+```
+
+- 진입 조건·리스크 한도는 호출부가 먼저 판단합니다. `OrderExecutor`는 주문 안전 게이트만 봅니다.
+- 첫 체결과 완전 청산은 훅으로 알려줍니다(접수 시점이 아님).
+- 사람 확인이 필요한 상태(ERROR / orphan)는 `commands/ack_error_{종목}.json`,
+  `commands/ack_orphan_{종목}.json` 파일로만 해제됩니다.
+
+동작이 단타 레포와 같은지 확인:
+
+```powershell
+python tools/equivalence/compare.py --orig ..\KIWOOM-AUTO-TRADER
+```
+
+## 카카오 알림
+
+`.env`의 `KAKAO_*` 값을 비워두면 알림이 자동으로 꺼집니다(코드 변경 불필요).
 
 ## 원본과의 관계 (`provenance.json`)
 
