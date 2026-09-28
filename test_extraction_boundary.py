@@ -53,6 +53,10 @@ for py in Path(".").rglob("*.py"):
     rel = py.as_posix()
     if rel.startswith((".venv/", "venv/")) or rel == "test_extraction_boundary.py":
         continue
+    # tools/equivalence/는 단타 레포의 TradingService와 동작을 비교하는 도구라
+    # orig 모드에서 단타 모듈을 (단타 레포 안에서) import함 — 스윙 코드가 아님
+    if rel.startswith("tools/equivalence/"):
+        continue
     tree = ast.parse(py.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         names = []

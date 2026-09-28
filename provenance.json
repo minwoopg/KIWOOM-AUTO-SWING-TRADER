@@ -53,6 +53,11 @@
       "source_path": "domain/position/lifecycle.py",
       "source_sha256": "f7d56b78191e2752880e1d5c52956b5716984739faf72399b8191bd8f526f8b6"
     },
+    "domain/service/order_executor.py": {
+      "status": "rewritten",
+      "source_path": "domain/service/trading_service.py",
+      "source_sha256": "3ee6231f17ba43e888a64e56696c3ee7d38dd6baff457daad051dba34176b7fb"
+    },
     "domain/service/pnl_calculator.py": {
       "status": "unchanged",
       "source_path": "domain/service/pnl_calculator.py",
@@ -181,6 +186,14 @@
       "source_path": "test_minute_bar_diagnostics.py",
       "source_sha256": "1f445a7ebd4d5cc1f8d107cd40dc5790894abf298062f69462b6a394ef9fff7c"
     },
+    "test_order_executor.py": {
+      "status": "new"
+    },
+    "test_position_lifecycle.py": {
+      "status": "derived",
+      "source_path": "test_partial_fill_lifecycle.py",
+      "source_sha256": "65c7de011329e3e72f9c2e8105d3c923427fc73eefc9236aa97977cedf5c43a2"
+    },
     "test_run_baseline.py": {
       "status": "modified",
       "source_path": "test_run_baseline.py",
@@ -192,6 +205,18 @@
       "source_sha256": "4a73d8b39ffbe7e5e73dfe2f6c4aeb2422b9f34e90c895f5069c70cef4e93ac0"
     },
     "testing_helpers.py": {
+      "status": "new"
+    },
+    "tools/equivalence/common.py": {
+      "status": "new"
+    },
+    "tools/equivalence/compare.py": {
+      "status": "new"
+    },
+    "tools/equivalence/runner.py": {
+      "status": "new"
+    },
+    "tools/equivalence/scenarios.py": {
       "status": "new"
     },
     "utils/time_utils.py": {
