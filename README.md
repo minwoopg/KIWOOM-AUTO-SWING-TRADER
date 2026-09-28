@@ -120,6 +120,8 @@ if sub.block_code: ...                                # 주문 안전 게이트�
 - 첫 체결과 완전 청산은 훅으로 알려줍니다(접수 시점이 아님).
 - 사람 확인이 필요한 상태(ERROR / orphan)는 `commands/ack_error_{종목}.json`,
   `commands/ack_orphan_{종목}.json` 파일로만 해제됩니다.
+  처리된 파일은 `commands/processed/`, 실패한 파일은 사유(`.error.txt`)와 함께
+  `commands/failed/`로 옮겨집니다(BOM 있는 UTF-8도 허용).
 
 동작이 단타 레포와 같은지 확인:
 

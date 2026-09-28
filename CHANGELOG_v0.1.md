@@ -298,4 +298,37 @@
 ### 전달 파일
 - 패치 0001 (리포트·번들·스케줄러·CI), 0002 (CHANGELOG/README)
 
+## 2026-09-28 — 8-A: Windows CI 줄바꿈 고정, 수동 복구 명령 BOM·보관 (GPT 기반 검토 F8·F7)
+
+### 배경
+- GPT 기반 구조 검토(`5901a05` 기준)의 8건 중 운영 검증 기반 2건을 먼저 처리.
+- F8: GitHub Actions Windows 두 환경만 실패 — `test_extraction_boundary`의 원본 바이트 해시 검사.
+  `.gitattributes`가 없어 Windows(`core.autocrlf=true`) 체크아웃에서 LF→CRLF로 바뀜.
+- F7: PowerShell 5.1 `Out-File -Encoding utf8`은 BOM을 붙이는데 명령 파일을 `utf-8`로 읽어
+  파싱 실패 → ERROR 유지된 채 명령 파일이 삭제돼 원인 추적 불가.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `.gitattributes` (신규) | `* text=auto eol=lf` — OS와 무관하게 작업 폴더도 LF. zip/이미지는 binary |
+| `domain/service/order_executor.py` | 명령 파일을 `utf-8-sig`로 읽음. JSON 객체 여부, `broker_quantity`(bool·문자열·음수 거부), `note`(공백 거부) 검증. 처리 후 삭제 대신 `commands/processed/` 또는 `commands/failed/`로 이동(시각 접미사), 실패 사유는 `.error.txt`. 이동 자체가 실패하면 반복 처리 방지를 위해 삭제 |
+| `test_order_executor.py` | 4-10·15-5 기대값을 이동으로 변경, 18절(BOM+CRLF 정상 처리, 잘못된 입력 6종 → ERROR 유지·원문 보존, 사유 파일, 재처리 없음) 추가 — 98 → 109건 |
+| `README.md` | 명령 파일 보관 위치 안내 |
+
+### 테스트 및 검증
+- F8 재현·해결: `core.autocrlf=true`로 클론 시 `.gitattributes` 없으면 88개 파일 CRLF → 해시 검사 실패(재현),
+  추가 후 전 파일 LF → 통과. 실제 Windows runner 결과는 푸시 후 Actions에서 확인 필요.
+- `run_regression_tests.py --skip test_broker_order_status.py`: 23개 전부 통과.
+- 단타 원본 동등성 18/18 동일(명령 파일 처리 방식 변경은 상태 전이에 영향 없음).
+
+### 변경하지 않은 것
+- 해시 검사 자체는 그대로(제외하거나 해시를 덮어쓰지 않음).
+- 명령의 의미(ERROR/orphan 해제 조건), 매매 로직, F1~F6.
+
+### 다음 작업
+- 8-B: F1 장부 대조를 종목·주문 단위로, F3 계좌 전체 노출 한도.
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

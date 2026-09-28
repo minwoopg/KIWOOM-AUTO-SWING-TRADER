@@ -174,7 +174,9 @@ e.cmd_dir.mkdir(exist_ok=True)
     json.dumps({"broker_quantity": 0, "note": "HTS 확인"}), encoding="utf-8")
 e.sync()
 check("4-9) ack_error 명령으로만 해제", e.st("005930").lifecycle != L.ERROR)
-check("4-10) 명령 파일은 처리 후 삭제", not (e.cmd_dir / "ack_error_005930.json").exists())
+check("4-10) 명령 파일은 처리 후 processed/로 이동",
+      not (e.cmd_dir / "ack_error_005930.json").exists()
+      and len(list((e.cmd_dir / "processed").glob("ack_error_005930.*.json"))) == 1)
 check("4-11) 해제 후 매수 가능", e.ex.submit_buy("000660", 5, 180000).accepted)
 
 # ── 5. place_order 예외 ────────────────────────────────────────
@@ -400,8 +402,10 @@ check("15-4) 보류 중이던 매수 컨텍스트 폐기, 훅 미호출",
       "005930" not in e.ex._pending_buy_side_effects and e.fills == [])
 (e.cmd_dir / "ack_orphan_000660.json").write_text(json.dumps({"note": "x"}), encoding="utf-8")
 e.sync()
-check("15-5) orphan 없는 종목 명령은 오류 로그 후 삭제",
-      not (e.cmd_dir / "ack_orphan_000660.json").exists() and e.logger.error.called)
+check("15-5) orphan 없는 종목 명령은 오류 로그 후 failed/로 이동(사유 파일 포함)",
+      not (e.cmd_dir / "ack_orphan_000660.json").exists() and e.logger.error.called
+      and len(list((e.cmd_dir / "failed").glob("ack_orphan_000660.*.json"))) == 1
+      and len(list((e.cmd_dir / "failed").glob("ack_orphan_000660.*.error.txt"))) == 1)
 
 
 # ── 16. 저널 I/O 실패 ─────────────────────────────────────────
@@ -449,6 +453,48 @@ check("17-3) ambiguous도 accepted=False, AMBIGUOUS 메시지로 기록",
       rows[0]["accepted"] == "False" and rows[0]["message"].startswith("AMBIGUOUS:"))
 check("17-4) 수량 0 이하 주문은 전송 전 거부",
       e2.ex.submit_sell("000660", 0).block_code == "INVALID_QUANTITY")
+
+# ── 18. 수동 복구 명령: BOM·잘못된 입력 (8-A, F7) ─────────────
+def _error_env():
+    e = Env()
+    e.sync()
+    e.broker.next_result.append("ambiguous")
+    e.ex.submit_buy("005930", 10, 70000)
+    e.sync()
+    e.cmd_dir.mkdir(exist_ok=True)
+    return e
+
+e = _error_env()
+check("18-0) 준비: ambiguous 매수 → ERROR", e.st("005930").lifecycle == L.ERROR)
+# PowerShell 5.1 Out-File -Encoding utf8 형식(BOM + CRLF)
+(e.cmd_dir / "ack_error_005930.json").write_bytes(
+    b"\xef\xbb\xbf" + json.dumps({"broker_quantity": 0, "note": "HTS 확인"}, ensure_ascii=False).encode("utf-8") + b"\r\n")
+e.sync()
+check("18-1) BOM 포함 명령도 정상 처리 → ERROR 해제", e.st("005930").lifecycle != L.ERROR)
+check("18-2) 처리된 BOM 명령은 processed/에 보관",
+      len(list((e.cmd_dir / "processed").glob("ack_error_005930.*.json"))) == 1)
+
+for i, (label, raw) in enumerate([
+    ("깨진 JSON", b"{broker_quantity: 0"),
+    ("수량이 bool", json.dumps({"broker_quantity": True, "note": "x"}).encode()),
+    ("수량이 문자열", json.dumps({"broker_quantity": "0", "note": "x"}).encode()),
+    ("수량 음수", json.dumps({"broker_quantity": -1, "note": "x"}).encode()),
+    ("note 공백", json.dumps({"broker_quantity": 0, "note": "  "}).encode()),
+    ("JSON 배열", b"[0]"),
+], start=3):
+    e = _error_env()
+    (e.cmd_dir / "ack_error_005930.json").write_bytes(raw)
+    e.sync()
+    failed_files = list((e.cmd_dir / "failed").glob("ack_error_005930.*.json"))
+    check(f"18-{i}) {label} → ERROR 유지, 원문은 failed/에 보존",
+          e.st("005930").lifecycle == L.ERROR and len(failed_files) == 1
+          and failed_files[0].read_bytes() == raw
+          and not (e.cmd_dir / "ack_error_005930.json").exists())
+check("18-9) 실패 사유 파일 기록(마지막 사례: JSON 배열)",
+      "JSON 객체가 아님" in next((e.cmd_dir / "failed").glob("*.error.txt")).read_text(encoding="utf-8"))
+e.sync()
+check("18-10) 보관된 실패 명령은 다시 처리되지 않음(같은 폴링 반복에도 ERROR 유지)",
+      e.st("005930").lifecycle == L.ERROR and len(list((e.cmd_dir / "failed").glob("*.json"))) == 1)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

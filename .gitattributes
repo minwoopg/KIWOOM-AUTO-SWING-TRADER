@@ -1,0 +1,9 @@
+# 8-A (F8): 모든 텍스트 파일을 작업 폴더에서도 LF로 유지합니다.
+# Windows(core.autocrlf=true)에서 CRLF로 바뀌면 test_extraction_boundary의
+# 원본 바이트 해시 검사가 실패하므로, OS와 무관하게 저장소 바이트 그대로 체크아웃합니다.
+* text=auto eol=lf
+
+*.zip binary
+*.png binary
+*.jpg binary
+*.xlsx binary

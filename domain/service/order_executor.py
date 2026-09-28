@@ -1022,7 +1022,7 @@ class OrderExecutor:
                 )
 
     # ══════════════════════════════════════════════════════════════
-    # 사람 확인 파일 명령 (원본 그대로, 폴더 경로만 인자화)
+    # 사람 확인 파일 명령 (폴더 경로 인자화 + 8-A: BOM 허용·입력 검증·처리 파일 보관)
     # ══════════════════════════════════════════════════════════════
 
     def _process_pending_ack_error_commands(self) -> None:
@@ -1031,7 +1031,8 @@ class OrderExecutor:
         사용법 (PowerShell):
             $body = @{ broker_quantity = 100; note = "HTS 직접 확인" } | ConvertTo-Json
             $body | Out-File -Encoding utf8 commands\\ack_error_475150.json
-        처리 후(성공/실패 모두) 파일을 삭제합니다.
+        처리 후 파일은 삭제하지 않고 commands/processed/ 또는 commands/failed/로
+        옮깁니다(실패 시 사유는 같은 이름의 .error.txt). BOM 있는 UTF-8도 읽습니다.
         """
         commands_dir = self._commands_dir
         if not commands_dir.is_dir():
@@ -1039,21 +1040,27 @@ class OrderExecutor:
         for cmd_file in sorted(commands_dir.glob("ack_error_*.json")):
             symbol = cmd_file.stem[len("ack_error_"):]
             try:
-                payload = json.loads(cmd_file.read_text(encoding="utf-8"))
-                broker_quantity = int(payload["broker_quantity"])
-                note = str(payload["note"])
+                payload = _read_command_json(cmd_file)
+                broker_quantity = payload.get("broker_quantity")
+                if type(broker_quantity) is not int or broker_quantity < 0:
+                    raise ValueError(f"broker_quantity는 0 이상 정수여야 합니다: {broker_quantity!r}")
+                raw_note = payload.get("note")
+                if not isinstance(raw_note, str) or not raw_note.strip():
+                    raise ValueError("note는 비어 있지 않은 문자열이어야 합니다")
+                note = raw_note.strip()
                 self._position_state_machine.acknowledge_error(symbol, broker_quantity, note)
                 self.app_logger.warning(
                     f"[ACK_ERROR_COMMAND] {symbol} | 파일 명령으로 ERROR 해제 — "
                     f"broker_quantity={broker_quantity}, note={note!r}"
                 )
             except Exception as exc:
+                dest = _archive_command(cmd_file, ok=False, error=f"{type(exc).__name__}: {exc}")
                 self.app_logger.error(
-                    f"[ACK_ERROR_COMMAND] {symbol} | 명령 파일 처리 실패, 무시하고 "
-                    f"삭제합니다: {exc} — 파일을 다시 만들어 재시도하세요"
+                    f"[ACK_ERROR_COMMAND] {symbol} | 명령 파일 처리 실패, 상태 변경 없음: {exc} — "
+                    f"원본은 {dest}로 옮김. 파일을 고쳐 commands/에 다시 넣으세요"
                 )
-            finally:
-                cmd_file.unlink(missing_ok=True)
+            else:
+                _archive_command(cmd_file, ok=True)
 
     def _process_pending_ack_orphan_commands(self) -> None:
         """commands/ack_orphan_{symbol}.json 파일로 orphan을 해제합니다.
@@ -1068,8 +1075,8 @@ class OrderExecutor:
         for cmd_file in sorted(commands_dir.glob("ack_orphan_*.json")):
             symbol = cmd_file.stem[len("ack_orphan_"):]
             try:
-                payload = json.loads(cmd_file.read_text(encoding="utf-8"))
-                raw_note = payload["note"]
+                payload = _read_command_json(cmd_file)
+                raw_note = payload.get("note")
                 if not isinstance(raw_note, str) or not raw_note.strip():
                     raise ValueError("note는 비어 있지 않은 문자열이어야 합니다")
                 note = raw_note.strip()
@@ -1088,9 +1095,39 @@ class OrderExecutor:
                     f"sell_ctx_cleared={had_sell_ctx}"
                 )
             except Exception as exc:
+                dest = _archive_command(cmd_file, ok=False, error=f"{type(exc).__name__}: {exc}")
                 self.app_logger.error(
-                    f"[ACK_ORPHAN_COMMAND] {symbol} | 명령 파일 처리 실패, 무시하고 "
-                    f"삭제합니다: {exc} — 파일을 다시 만들어 재시도하세요"
+                    f"[ACK_ORPHAN_COMMAND] {symbol} | 명령 파일 처리 실패, 상태 변경 없음: {exc} — "
+                    f"원본은 {dest}로 옮김. 파일을 고쳐 commands/에 다시 넣으세요"
                 )
-            finally:
-                cmd_file.unlink(missing_ok=True)
+            else:
+                _archive_command(cmd_file, ok=True)
+
+
+# ── 사람 확인 파일 명령 보관 (8-A, F7) ──────────────────────────────
+def _read_command_json(path: Path) -> dict:
+    """PowerShell 5.1 `Out-File -Encoding utf8`은 BOM을 붙이므로 utf-8-sig로 읽습니다."""
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON 객체가 아님: {type(payload).__name__}")
+    return payload
+
+
+def _archive_command(path: Path, *, ok: bool, error: str = "") -> Path:
+    """명령 파일을 processed/ 또는 failed/로 옮깁니다(삭제하지 않음 — 재현·감사용).
+
+    옮기기 자체가 실패하면 같은 명령이 매 폴링마다 반복 처리되지 않도록 마지막
+    수단으로 삭제합니다.
+    """
+    sub = path.parent / ("processed" if ok else "failed")
+    stamp = now_kst().strftime("%Y%m%d_%H%M%S_%f")
+    dest = sub / f"{path.stem}.{stamp}{path.suffix}"
+    try:
+        sub.mkdir(parents=True, exist_ok=True)
+        path.replace(dest)
+        if not ok:
+            dest.with_suffix(".error.txt").write_text(error + "\n", encoding="utf-8")
+        return dest
+    except OSError:
+        path.unlink(missing_ok=True)
+        return Path("(삭제됨 — 보관 실패)")
