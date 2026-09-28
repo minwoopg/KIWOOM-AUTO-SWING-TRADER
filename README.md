@@ -4,7 +4,7 @@
 단타 레포 [`kiwoom-auto-trader`](https://github.com/minwoopg/kiwoom-auto-trader)
 (`bdde6c2`, 2026-09-28)에서 **매매 로직을 제외한 기반 코드**를 가져와 시작했습니다.
 
-> 현재 상태(4라운드): 매매 루프 없음. 주문 실행부(`OrderExecutor`) 추출 완료, 아직 진입점에는 연결 안 됨.
+> 현재 상태(5라운드): 매매 루프 없음. 주문 실행부(`OrderExecutor`) 추출 완료, 아직 진입점에는 연결 안 됨.
 >  `python -m app.main`은 기동 점검
 > (인증 → 잔고 → 미해결 주문 흔적 확인 → 시작 알림)만 하고 종료합니다.
 
@@ -38,9 +38,11 @@ swing-auto-trader/
 │   ├── service/order_executor.py   # 주문 실행·체결 추적·재시작 복구 (단타 TradingService에서 추출)
 │   ├── service/pnl_calculator.py   # FIFO 손익 (여러 날 보유 대응 수정 예정)
 │   ├── strategy/exit_calc.py       # 손절·트레일링 순수 계산
+│   ├── market_data/daily_bar.py    # 일봉 모델·엄격 파서
 │   └── indicator/indicators.py     # ATR·볼린저
 ├── infra/
 │   ├── broker/                     # 키움 REST 브로커 + MockBroker + 미체결/체결 판정
+│   ├── market_data/                # 일봉 수집(속도 제한·429 재시도)·저장·증분 갱신
 │   ├── notify/kakao_notifier.py    # 카카오 알림
 │   └── storage/
 │       ├── tracked_order_journal.py        # 체결 확정 전 주문 원자적 보존
@@ -122,6 +124,17 @@ python tools/equivalence/compare.py --orig ..\KIWOOM-AUTO-TRADER
 기동할 때 원장·잔고·메타를 대조해 `app.log`의 `[STARTUP_RECONCILE]`에 남깁니다.
 어긋나도 자동으로 고치지 않습니다. 이미 계좌에 있던 종목을 인수하려면 사람이 확인한 뒤
 `opening_events_from_balance()`로 OPENING 사건을 기록합니다.
+
+## 일봉 데이터
+
+```powershell
+python tools/update_daily_bars.py 005930 000660        # 첫 실행: 약 7년치, 이후: 1페이지 증분
+```
+
+- 장중에 실행해도 **당일 미완성 봉은 저장하지 않습니다**(마지막 완성 거래일까지).
+- 호출 간격 1초, 429는 대기 후 재시도 (실측: 0.5초 간격 5번째 호출에서 429).
+- 저장된 과거 값과 새로 받은 값이 다르면(액면분할 등 수정주가 재계산) 그 종목을 전체 재수집합니다.
+- 저장 위치: `data/daily_bars/<종목코드>.csv` + `.meta.json`
 
 ## 거래일 캘린더
 
