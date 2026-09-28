@@ -1,0 +1,93 @@
+# Swing Auto Trader
+
+키움증권 REST API 기반 스윙 자동매매 시스템.
+단타 레포 [`kiwoom-auto-trader`](https://github.com/minwoopg/kiwoom-auto-trader)
+(`bdde6c2`, 2026-09-28)에서 **매매 로직을 제외한 기반 코드**를 가져와 시작했습니다.
+
+> 현재 상태(1라운드): 매매 루프 없음. `python -m app.main`은 기동 점검
+> (인증 → 잔고 → 미해결 주문 흔적 확인 → 시작 알림)만 하고 종료합니다.
+
+---
+
+## 운영 원칙
+
+- **계좌 분리**: 단타 프로그램과 다른 계좌·앱키를 사용합니다. 단타 프로그램은
+  계좌의 모든 보유 종목을 자기 포지션으로 처리하고 15:10 이후 강제청산하므로
+  같은 계좌를 쓰면 스윙 보유분이 청산됩니다.
+- **매일 기동·종료**: 장 시작 전에 켜고 장 마감 후 끕니다.
+  (그래서 토큰 자동 갱신은 넣지 않았습니다 — 키움 토큰은 시작 시 1회 발급)
+- **시장가 주문만 사용** (취소 주문 API 미구현)
+
+## 프로젝트 구조
+
+```
+swing-auto-trader/
+├── app/main.py                     # 진입점 — 1라운드: 기반 점검 모드
+├── config/
+│   ├── settings.py                 # App/Broker/Storage/Kakao 설정만
+│   └── settings.yaml
+├── domain/
+│   ├── models.py                   # 주문·잔고·체결 모델 (RuntimeState는 단타용 — 교체 예정)
+│   ├── cost_model.py               # 비용 3시나리오 (fail-closed 로딩)
+│   ├── position/lifecycle.py       # 포지션 상태머신(PSM) — 체결 확인 게이트
+│   ├── service/pnl_calculator.py   # FIFO 손익 (여러 날 보유 대응 수정 예정)
+│   ├── strategy/exit_calc.py       # 손절·트레일링 순수 계산
+│   └── indicator/indicators.py     # ATR·볼린저
+├── infra/
+│   ├── broker/                     # 키움 REST 브로커 + MockBroker + 미체결/체결 판정
+│   ├── notify/kakao_notifier.py    # 카카오 알림
+│   └── storage/
+│       ├── tracked_order_journal.py        # 체결 확정 전 주문 원자적 보존
+│       ├── order_status_observation_store.py # 체결조회 증거 JSONL
+│       ├── state_store.py                  # 상태 JSON (원자적 쓰기)
+│       ├── run_baseline.py                 # 실행 기준선 기록
+│       ├── process_lock.py                 # 중복 실행 차단
+│       └── logger.py                       # app.log / trades.csv / position_lifecycle.csv
+├── utils/time_utils.py, trade_outcome.py
+├── provenance.json                 # 파일별 원본 출처·해시
+├── testing_helpers.py              # 테스트 공용 Settings 헬퍼
+└── test_*.py                       # 회귀 테스트 (run_regression_tests.py)
+```
+
+단타 레포와 **같은 상대 경로**를 유지했습니다. 단타 쪽에서 브로커·상태머신이
+수정되면 같은 경로끼리 바로 diff해 반영할 수 있습니다.
+
+## 환경 설정
+
+```powershell
+pip install -r requirements.txt
+Copy-Item .env.example .env   # 스윙 계좌 값 입력
+```
+
+`config/settings.yaml`의 `broker.use_mock: true`로 시작합니다. 실제 키움
+모의투자 서버로 점검하려면 `false`로 바꿉니다.
+
+## 실행
+
+```powershell
+python -m app.main
+```
+
+## 테스트
+
+```powershell
+python run_regression_tests.py
+```
+
+`test_broker_order_status.py`는 실측 fixture가 필요합니다. 단타 레포 로컬의
+`tests/fixtures/order_reconciliation/` 폴더를 같은 경로로 복사하세요
+(단타 레포 git에도 포함돼 있지 않은 파일입니다).
+
+## 원본과의 관계 (`provenance.json`)
+
+| status | 의미 |
+|---|---|
+| `unchanged` | 원본과 바이트 동일 — `test_extraction_boundary.py`가 해시로 검증 |
+| `modified` | 원본을 부분 수정 |
+| `rewritten` | 원본을 참고해 새로 작성 |
+| `derived` | 원본 테스트 일부를 옮김 |
+| `new` | 신규 |
+
+`unchanged` 파일을 수정하면 `provenance.json`의 status를 `modified`로 바꿔야
+테스트가 통과합니다. 단타 레포 수정 사항을 가져올 때는 `unchanged` 파일부터
+원본과 비교하세요.
