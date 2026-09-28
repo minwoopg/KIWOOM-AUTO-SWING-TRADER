@@ -1,0 +1,50 @@
+# 스윙 자동매매 설정 (2026-09-28, 스윙 분리 1라운드)
+# 단타 레포(kiwoom-auto-trader bdde6c2)의 settings.yaml에서 매매 로직과
+# 무관한 항목(app/broker/cost_model/storage/kakao)만 가져왔습니다.
+# 스윙 전략·리스크 설정은 스윙 로직 라운드에서 추가합니다.
+
+app:
+  name: swing-auto-trader
+  env: local
+  log_level: INFO
+
+broker:
+  provider: kiwoom
+  # true  -> 가짜 MockBroker 사용
+  # false -> 실제 Kiwoom REST API 사용
+  use_mock: true
+  # 키움 모의투자 REST 서버
+  # 실전투자로 바꿀 때는 https://api.kiwoom.com 으로 변경합니다.
+  base_url: https://mockapi.kiwoom.com
+  # 스윙 전용 계좌의 앱키/시크릿/계좌번호 (.env)
+  app_key: ${KIWOOM_APP_KEY}
+  secret_key: ${KIWOOM_SECRET_KEY}
+  account_number: ${KIWOOM_ACCOUNT_NUMBER}
+  # 비민감 계좌 라벨 — 단타 계좌("acct-a")와 겹치지 않게 지정
+  account_scope_id: "acct-swing"
+  is_paper_trading: true
+
+# 거래 비용 모델 (domain/cost_model.py가 fail-closed로 읽음)
+# 값은 단타 레포와 동일하게 시작 — 스윙 비용 재산정은 백테스트 라운드에서
+cost_model:
+  gross_roundtrip_pct: 0.00
+  base_roundtrip_pct: 0.35
+  stress_roundtrip_pct: 0.90
+
+storage:
+  state_file: data/state.json
+  trade_log_file: logs/trades.csv
+  app_log_file: logs/app.log
+  position_lifecycle_log_file: logs/position_lifecycle.csv
+  tracked_order_journal_file: data/tracked_order_journal.json
+  run_baseline_log_file: logs/run_baseline.csv
+  order_status_observation_log_file: logs/order_status_observations.jsonl
+
+# ── 카카오톡 알림 ──────────────────────────────────────────
+# .env 파일에 아래 키를 입력하세요 (.gitignore로 보호됨)
+kakao:
+  access_token:  "${KAKAO_ACCESS_TOKEN}"
+  refresh_token: "${KAKAO_REFRESH_TOKEN}"
+  rest_api_key:  "${KAKAO_REST_API_KEY}"
+  client_secret: "${KAKAO_CLIENT_SECRET}"
+  token_state_file: data/kakao_token_state.json

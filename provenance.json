@@ -1,0 +1,209 @@
+{
+  "source_repo": "minwoopg/kiwoom-auto-trader",
+  "source_commit": "bdde6c228f66375717f3c1a9843dfbb9cadcd871",
+  "source_commit_date": "2026-09-28",
+  "files": {
+    ".gitignore": {
+      "status": "unchanged",
+      "source_path": ".gitignore",
+      "source_sha256": "056bb38fef8883ea3b579003b1598a29561c3adeac70c5b9d4e598d3b4e1767e"
+    },
+    "app/main.py": {
+      "status": "rewritten",
+      "source_path": "app/main.py",
+      "source_sha256": "8d843b564659c02846e0746f85e25729d5cf887f36fafc17a3c36cd42ea4b536"
+    },
+    "config/settings.py": {
+      "status": "modified",
+      "source_path": "config/settings.py",
+      "source_sha256": "1e96097cade9d0cce27c0bd81db622c89a82c61793489bab20e1eec92607dda8"
+    },
+    "config/settings.yaml": {
+      "status": "modified",
+      "source_path": "config/settings.yaml",
+      "source_sha256": "e22dccab5eb62373925618320ed8bc2b23030c5e9c4269c65b2fd059f796ff3c"
+    },
+    "domain/cost_model.py": {
+      "status": "unchanged",
+      "source_path": "domain/cost_model.py",
+      "source_sha256": "c3b7ae02409fa20101c1bddc369ef786506bea5fa028740dc91262bff12b0c07"
+    },
+    "domain/indicator/__init__.py": {
+      "status": "unchanged",
+      "source_path": "domain/indicator/__init__.py",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "domain/indicator/indicators.py": {
+      "status": "unchanged",
+      "source_path": "domain/indicator/indicators.py",
+      "source_sha256": "dff4d4616d53751d6459269a84ad3ba590d17cb451e203153355deb44021f670"
+    },
+    "domain/models.py": {
+      "status": "unchanged",
+      "source_path": "domain/models.py",
+      "source_sha256": "e627e7d2d53e7e2049a257f232276a72ba766bb7a85b91b58fd4892a6665510a"
+    },
+    "domain/position/__init__.py": {
+      "status": "unchanged",
+      "source_path": "domain/position/__init__.py",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "domain/position/lifecycle.py": {
+      "status": "unchanged",
+      "source_path": "domain/position/lifecycle.py",
+      "source_sha256": "f7d56b78191e2752880e1d5c52956b5716984739faf72399b8191bd8f526f8b6"
+    },
+    "domain/service/pnl_calculator.py": {
+      "status": "unchanged",
+      "source_path": "domain/service/pnl_calculator.py",
+      "source_sha256": "b12e2dc22b0523dd86dd79270cf66e2c8b332d929c215c0ecd95a214417d0294"
+    },
+    "domain/strategy/exit_calc.py": {
+      "status": "unchanged",
+      "source_path": "domain/strategy/exit_calc.py",
+      "source_sha256": "a2ca755e5eddca6cb99e922050bc9a6f0a8844d5fae3a04baa0fa83ea02de9b7"
+    },
+    "infra/broker/base.py": {
+      "status": "unchanged",
+      "source_path": "infra/broker/base.py",
+      "source_sha256": "ca17d5529a60920e864ccdb5b43fbcddecfd42b486b9c81869f01d2fa449c8a9"
+    },
+    "infra/broker/kiwoom_broker.py": {
+      "status": "unchanged",
+      "source_path": "infra/broker/kiwoom_broker.py",
+      "source_sha256": "a1aae804cead66db57a8e2661cd3c4e2ce74d0e4cac19aa1d4d10a72547a2c04"
+    },
+    "infra/broker/kiwoom_order_status.py": {
+      "status": "unchanged",
+      "source_path": "infra/broker/kiwoom_order_status.py",
+      "source_sha256": "9a1640b1ef87865caebacc17c29e148cb764583813b7c0247e182b8ea289a8d1"
+    },
+    "infra/broker/kiwoom_parsing.py": {
+      "status": "unchanged",
+      "source_path": "infra/broker/kiwoom_parsing.py",
+      "source_sha256": "d89cf3350a6f953d187cebcf2a0856cc570e03ef74d5048253fa4a8ae99ae885"
+    },
+    "infra/broker/minute_bar_diagnostics.py": {
+      "status": "unchanged",
+      "source_path": "infra/broker/minute_bar_diagnostics.py",
+      "source_sha256": "b721a140866c50c3c727af2e2b36f4f8b8c7da1374b9dd16036a15efc9bcb3a7"
+    },
+    "infra/broker/mock_broker.py": {
+      "status": "unchanged",
+      "source_path": "infra/broker/mock_broker.py",
+      "source_sha256": "3c642b71a181c736fe30570ffdb937afc726c7b38f72f755448ff030e558e3a3"
+    },
+    "infra/notify/kakao_notifier.py": {
+      "status": "modified",
+      "source_path": "infra/notify/kakao_notifier.py",
+      "source_sha256": "7020d7705595c934d300ec15a88f1699689aee150109f10e7e2ee6049c5d90da"
+    },
+    "infra/storage/logger.py": {
+      "status": "modified",
+      "source_path": "infra/storage/logger.py",
+      "source_sha256": "b11a062f5021db22c8743e4548cb838f14bb78b95f03e11439414303949f4e04"
+    },
+    "infra/storage/order_status_observation_store.py": {
+      "status": "unchanged",
+      "source_path": "infra/storage/order_status_observation_store.py",
+      "source_sha256": "50009421d46998111705a9c88ef01b5a2f95098fe21883017336d2f595305364"
+    },
+    "infra/storage/process_lock.py": {
+      "status": "unchanged",
+      "source_path": "infra/storage/process_lock.py",
+      "source_sha256": "cddfdd00503c132aacfa3b63fcf2667a9f945b9c2d28b3a2462a8288ac12c5ed"
+    },
+    "infra/storage/run_baseline.py": {
+      "status": "unchanged",
+      "source_path": "infra/storage/run_baseline.py",
+      "source_sha256": "c1310cd4ff3931ce249b7ff2ff2aed3fe708e6249416c700be2b0cf04b52541c"
+    },
+    "infra/storage/state_store.py": {
+      "status": "unchanged",
+      "source_path": "infra/storage/state_store.py",
+      "source_sha256": "c1c46319b4dfb14046ae68653422d1ced90967310af776db23b7ea794421251f"
+    },
+    "infra/storage/tracked_order_journal.py": {
+      "status": "unchanged",
+      "source_path": "infra/storage/tracked_order_journal.py",
+      "source_sha256": "5a4e408fcd491b9ceba14ee8995242dc70ebd58dadff39c76f6a276bc5c1fcfa"
+    },
+    "requirements.txt": {
+      "status": "unchanged",
+      "source_path": "requirements.txt",
+      "source_sha256": "9ed2e8cbaa45b66fc1ace0e828ccd91b3a5d17c565ceb655bd5602c67a960078"
+    },
+    "run_regression_tests.py": {
+      "status": "unchanged",
+      "source_path": "run_regression_tests.py",
+      "source_sha256": "d344189892eba3ecfe9a29642daa632da31d0d97be9965a4c7819fef3bb4a3ca"
+    },
+    "test_app_startup.py": {
+      "status": "new"
+    },
+    "test_broker_order_query_pagination.py": {
+      "status": "unchanged",
+      "source_path": "test_broker_order_query_pagination.py",
+      "source_sha256": "c011ae08ee9de2e80b26909861848ef5b1c80fa02872247fa4547560c35da6f6"
+    },
+    "test_broker_order_status.py": {
+      "status": "unchanged",
+      "source_path": "test_broker_order_status.py",
+      "source_sha256": "b75b0f5ef30f596c4e57036681a4ea77ad9c32a4b6e78faa79e7b89c909c5d56"
+    },
+    "test_broker_read_only_wiring.py": {
+      "status": "unchanged",
+      "source_path": "test_broker_read_only_wiring.py",
+      "source_sha256": "d324f2b181e8726deeffbc6cea40b77223f1a19bd8cc13bdccf6339b7c36d38c"
+    },
+    "test_cost_model.py": {
+      "status": "modified",
+      "source_path": "test_cost_model.py",
+      "source_sha256": "2b5d0fcd2faa0a76356c768742b8f2614f3820d03a484e9ba35a52dc932f5bc1"
+    },
+    "test_kakao_notifier_token_lifecycle.py": {
+      "status": "modified",
+      "source_path": "test_kakao_notifier_token_lifecycle.py",
+      "source_sha256": "7e44bd57cfca7088a6d5fb48ad1524cb897fc8d20ec8f342b2d46b4ead50e623"
+    },
+    "test_kakao_notifier_verify_account.py": {
+      "status": "modified",
+      "source_path": "test_kakao_notifier_verify_account.py",
+      "source_sha256": "bce730650ae687d13bd843536b6c9bb26ebdf1e15fc60412ac5d120d804c5a4d"
+    },
+    "test_kiwoom_broker_placement_failure.py": {
+      "status": "unchanged",
+      "source_path": "test_kiwoom_broker_placement_failure.py",
+      "source_sha256": "45e694a3dd5cbce94c9f0a14f9df3013ce21e70458cac55df7170d270afba50f"
+    },
+    "test_minute_bar_diagnostics.py": {
+      "status": "unchanged",
+      "source_path": "test_minute_bar_diagnostics.py",
+      "source_sha256": "1f445a7ebd4d5cc1f8d107cd40dc5790894abf298062f69462b6a394ef9fff7c"
+    },
+    "test_run_baseline.py": {
+      "status": "modified",
+      "source_path": "test_run_baseline.py",
+      "source_sha256": "cb02270a65a42eb795d1c56915309435e164f82e476d2c5c5e1ba83713461dd3"
+    },
+    "test_tracked_order_journal_store.py": {
+      "status": "derived",
+      "source_path": "test_tracked_order_journal.py",
+      "source_sha256": "4a73d8b39ffbe7e5e73dfe2f6c4aeb2422b9f34e90c895f5069c70cef4e93ac0"
+    },
+    "testing_helpers.py": {
+      "status": "new"
+    },
+    "utils/time_utils.py": {
+      "status": "unchanged",
+      "source_path": "utils/time_utils.py",
+      "source_sha256": "e27967737cbac37dd64fae0b8046d9f94d01c7d7363ebcc7c8fbbef18522105c"
+    },
+    "utils/trade_outcome.py": {
+      "status": "unchanged",
+      "source_path": "utils/trade_outcome.py",
+      "source_sha256": "5d9a3598f4a1761a809ecc8565dbaf79e2e88de8f76f1ac89170d9e9b4b84948"
+    }
+  },
+  "_note": "status: unchanged=원본과 바이트 동일(test_extraction_boundary.py가 해시로 검증) / modified=원본을 부분 수정 / rewritten=원본을 참고해 새로 작성 / derived=원본 테스트 일부를 옮김 / new=신규. unchanged 파일을 수정하면 status를 modified로 바꾸세요."
+}

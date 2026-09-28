@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+"""실제 증권사 연결 없이 전체 흐름을 테스트하기 위한 가짜 브로커.
+
+이 클래스는 매우 중요합니다.
+실제 API를 붙이기 전에 프로그램 구조가 맞는지 검증할 수 있기 때문입니다.
+"""
+
+from datetime import datetime
+from itertools import count
+
+from domain.models import AccountBalance, BrokerOrder, BrokerOrderStatus, MarketPrice, OrderRequest, OrderResult, Position, PriceBar, WeeklyBar, MinuteBar
+from infra.broker.base import Broker
+
+
+class MockBroker(Broker):
+    """메모리 안에서만 동작하는 테스트용 브로커입니다."""
+
+    def __init__(self) -> None:
+        """초기 현금, 초기 가격, 주문 번호 시퀀스를 준비합니다."""
+
+        self._seq = count(1)
+        self._cash = 1_000_000
+        self._positions: dict[str, Position] = {}
+        self._orders: dict[str, BrokerOrder] = {}
+        self._prices = {
+            "005930": 71000,
+            "000660": 185000,
+        }
+
+    def authenticate(self) -> None:
+        """가짜 브로커라서 실제 인증은 하지 않습니다."""
+
+        return None
+
+    def get_market_price(self, symbol: str) -> MarketPrice:
+        """미리 넣어둔 가짜 가격으로 현재가 객체를 만들어 돌려줍니다."""
+
+        current = self._prices.get(symbol, 10000)
+        return MarketPrice(
+            symbol=symbol,
+            current_price=current,
+            reference_price=current,
+            previous_close=int(current * 0.985),
+            timestamp=datetime.now(),
+        )
+
+    def get_account_balance(self) -> AccountBalance:
+        """현재 현금과 보유 포지션을 반환합니다."""
+
+        return AccountBalance(cash=self._cash, total_asset=self._cash, positions=list(self._positions.values()))
+
+    def place_order(self, order: OrderRequest) -> OrderResult:
+        """매수/매도를 메모리 상에서 흉내 냅니다."""
+
+        order_id = f"MOCK-{next(self._seq):06d}"
+        if order.quantity <= 0:
+            return OrderResult(order_id, order.symbol, order.side, order.quantity, False, "invalid quantity", datetime.now())
+
+        if order.side.value == "BUY":
+            current_price = self._prices.get(order.symbol, 10000)
+            cost = current_price * order.quantity
+            if self._cash < cost:
+                return OrderResult(order_id, order.symbol, order.side, order.quantity, False, "insufficient cash", datetime.now())
+            self._cash -= cost
+            existing = self._positions.get(order.symbol)
+            old_qty = existing.quantity if existing else 0
+            old_cost = old_qty * existing.average_price if existing else 0
+            new_qty = old_qty + order.quantity
+            self._positions[order.symbol] = Position(order.symbol, new_qty, (old_cost + cost) // new_qty)
+            fill_price = current_price
+        else:
+            position = self._positions.get(order.symbol)
+            if position is None:
+                return OrderResult(order_id, order.symbol, order.side, order.quantity, False, "no position", datetime.now())
+            if order.quantity > position.quantity:
+                return OrderResult(order_id, order.symbol, order.side, order.quantity, False, "insufficient quantity", datetime.now())
+            sell_price = self._prices.get(order.symbol, position.average_price)
+            self._cash += sell_price * order.quantity
+            remaining = position.quantity - order.quantity
+            if remaining:
+                self._positions[order.symbol] = Position(order.symbol, remaining, position.average_price)
+            else:
+                self._positions.pop(order.symbol, None)
+            fill_price = sell_price
+
+        self._orders[order_id] = BrokerOrder(
+            order_id, order.symbol, BrokerOrderStatus.FILLED, side=order.side,
+            requested_quantity=order.quantity, open_quantity=0,
+            filled_quantity=order.quantity, filled_price=fill_price,
+        )
+        return OrderResult(order_id, order.symbol, order.side, order.quantity, True, "accepted", datetime.now())
+
+    def get_order_status(self, order_id: str, symbol: str) -> BrokerOrder:
+        order = self._orders.get(order_id)
+        if order is not None and order.symbol == symbol:
+            return order
+        return BrokerOrder(order_id, symbol, BrokerOrderStatus.UNKNOWN)
+
+    def get_open_orders(self, symbol: str) -> list[BrokerOrder]:
+        # This broker intentionally models immediate fills only. Async/partial
+        # fill safety tests must use an explicitly controlled pending broker.
+        return []
+
+    def get_daily_prices(self, symbol: str, days: int) -> list[PriceBar]:
+        """테스트용 가짜 일봉을 생성합니다.
+
+        기준가에서 ±2% 범위의 랜덤 일봉을 days개 만들어 반환합니다.
+        골든크로스 패턴(상승장)을 시뮬레이션하기 위해 완만한 우상향 추세를 넣었습니다.
+        """
+        import random
+
+        base = self._prices.get(symbol, 10000)
+        bars: list[PriceBar] = []
+
+        price = int(base * 0.9)  # 30일 전 시작가를 현재보다 낮게 설정 → 상승장 시뮬레이션
+        for i in range(days):
+            # 완만하게 올라가는 추세 + 약간의 노이즈
+            trend = base * 0.1 / days  # 전체 기간 동안 10% 상승
+            noise = random.uniform(-0.01, 0.013) * price
+            close = int(price + trend + noise)
+            high = int(close * random.uniform(1.002, 1.015))
+            low = int(close * random.uniform(0.985, 0.998))
+            open_p = int(price * random.uniform(0.995, 1.005))
+            bars.append(PriceBar(
+                date=f"2026{(i + 1):04d}",
+                open_price=open_p,
+                high_price=high,
+                low_price=low,
+                close_price=close,
+                volume=random.randint(100_000, 1_000_000),
+            ))
+            price = close
+
+        return bars
+
+    def get_weekly_prices(self, symbol: str, weeks: int) -> list[WeeklyBar]:
+        """테스트용 가짜 주봉을 생성합니다. 완만한 상승 추세로 설정합니다."""
+        import random
+
+        base = self._prices.get(symbol, 10000)
+        bars: list[WeeklyBar] = []
+        price = int(base * 0.85)
+
+        for i in range(weeks):
+            trend = base * 0.15 / weeks
+            noise = random.uniform(-0.015, 0.02) * price
+            close = int(price + trend + noise)
+            high  = int(close * random.uniform(1.005, 1.02))
+            low   = int(close * random.uniform(0.98, 0.995))
+            open_p = int(price * random.uniform(0.99, 1.01))
+            bars.append(WeeklyBar(
+                date=f"2026W{i+1:02d}",
+                open_price=open_p,
+                high_price=high,
+                low_price=low,
+                close_price=close,
+                volume=random.randint(500_000, 5_000_000),
+            ))
+            price = close
+
+        return bars
+
+    def get_minute_bars(self, symbol: str, tick_scope: int = 3, count: int = 40) -> list[MinuteBar]:
+        """테스트용 가짜 분봉을 생성합니다.
+
+        눌림목 후 반등 패턴: 전반부 고점에서 눌리고 후반부 반등합니다.
+        """
+        import random
+        from datetime import datetime, timedelta
+
+        base = self._prices.get(symbol, 10000)
+        bars: list[MinuteBar] = []
+        now = datetime.now()
+        acc_vol = 0
+
+        for i in range(count):
+            if i < count // 2:
+                price = int(base * (1.03 - i * 0.003))
+            else:
+                price = int(base * (0.97 + (i - count // 2) * 0.002))
+
+            noise = random.uniform(-0.003, 0.003)
+            close = int(price * (1 + noise))
+            high  = int(close * random.uniform(1.001, 1.008))
+            low   = int(close * random.uniform(0.992, 0.999))
+            vol   = random.randint(5_000, 50_000)
+            acc_vol += vol
+
+            bar_time = now - timedelta(minutes=(count - i) * tick_scope)
+            bars.append(MinuteBar(
+                cntr_tm=bar_time.strftime("%Y%m%d%H%M%S"),
+                open_price=close,
+                high_price=high,
+                low_price=low,
+                close_price=close,
+                volume=vol,
+                acc_volume=acc_vol,
+            ))
+
+        return bars
