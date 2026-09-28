@@ -41,6 +41,9 @@
       "source_path": "domain/indicator/indicators.py",
       "source_sha256": "dff4d4616d53751d6459269a84ad3ba590d17cb451e203153355deb44021f670"
     },
+    "domain/market_data/daily_bar.py": {
+      "status": "new"
+    },
     "domain/models.py": {
       "status": "unchanged",
       "source_path": "domain/models.py",
@@ -112,6 +115,15 @@
       "status": "unchanged",
       "source_path": "infra/broker/mock_broker.py",
       "source_sha256": "3c642b71a181c736fe30570ffdb937afc726c7b38f72f755448ff030e558e3a3"
+    },
+    "infra/market_data/daily_bar_repository.py": {
+      "status": "new"
+    },
+    "infra/market_data/daily_bar_source.py": {
+      "status": "new"
+    },
+    "infra/market_data/daily_bar_store.py": {
+      "status": "new"
     },
     "infra/notify/kakao_notifier.py": {
       "status": "modified",
@@ -187,6 +199,9 @@
       "source_path": "test_cost_model.py",
       "source_sha256": "2b5d0fcd2faa0a76356c768742b8f2614f3820d03a484e9ba35a52dc932f5bc1"
     },
+    "test_daily_bars.py": {
+      "status": "new"
+    },
     "test_fill_ledger.py": {
       "status": "new"
     },
@@ -256,6 +271,9 @@
       "status": "new"
     },
     "tools/probe_market_data.py": {
+      "status": "new"
+    },
+    "tools/update_daily_bars.py": {
       "status": "new"
     },
     "utils/time_utils.py": {

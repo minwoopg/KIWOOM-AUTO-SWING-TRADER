@@ -10,7 +10,7 @@ Trading/Strategy/Risk/MarketRegime/EntryWatch/WebSocket/Experimental은
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +93,27 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class MarketDataConfig:
+    """일봉 수집 설정 (5라운드).
+
+    실측(2026-09-28): 0.5초 간격 5번째 호출에서 HTTP 429 → 기본 간격 1초.
+    한 페이지 600행(약 2.4년) → backfill_pages=3이면 약 7년.
+    """
+
+    daily_bars_dir: str = "data/daily_bars"
+    min_call_interval_sec: float = 1.0
+    retry_backoff_sec: tuple = (2.0, 5.0, 10.0, 20.0)
+    backfill_pages: int = 3
+
+    def __post_init__(self) -> None:
+        if self.min_call_interval_sec < 0.5:
+            raise ValueError("min_call_interval_sec는 0.5 이상 (실측상 0.5초 간격에서도 429 발생)")
+        if self.backfill_pages < 1:
+            raise ValueError("backfill_pages는 1 이상")
+        object.__setattr__(self, "retry_backoff_sec", tuple(float(x) for x in self.retry_backoff_sec))
+
+
+@dataclass(frozen=True)
 class Settings:
     """프로그램 전체 설정을 한 번에 담는 최상위 객체입니다."""
 
@@ -100,6 +121,7 @@ class Settings:
     broker: BrokerConfig
     storage: StorageConfig
     kakao: KakaoConfig = None
+    market_data: MarketDataConfig = field(default_factory=MarketDataConfig)
 
 
 def _substitute_env(value: Any) -> Any:
@@ -124,4 +146,5 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
         broker=BrokerConfig(**raw["broker"]),
         storage=StorageConfig(**raw["storage"]),
         kakao=KakaoConfig(**kakao_raw) if kakao_raw else KakaoConfig(),
+        market_data=MarketDataConfig(**(raw.get("market_data") or {})),
     )

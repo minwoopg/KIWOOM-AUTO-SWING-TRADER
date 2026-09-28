@@ -98,8 +98,8 @@ raw = yaml.safe_load(Path("config/settings.yaml").read_text(encoding="utf-8"))
 day_sections = {"trading", "strategy", "market_regime", "risk", "entry_watch",
                 "websocket", "experimental", "targets"}
 check("3-1) settings.yaml에 단타 전용 섹션이 없음", not (day_sections & set(raw)))
-check("3-2) Settings 필드는 app/broker/storage/kakao뿐",
-      set(Settings.__dataclass_fields__) == {"app", "broker", "storage", "kakao"})
+check("3-2) Settings 필드는 app/broker/storage/kakao/market_data뿐",
+      set(Settings.__dataclass_fields__) == {"app", "broker", "storage", "kakao", "market_data"})
 s = load_settings()
 check("3-3) 실제 settings.yaml이 로드됨", s.app.name == "swing-auto-trader")
 check("3-4) 계좌 라벨이 설정됨(단타 계좌 라벨 'acct-a'와 다름)",

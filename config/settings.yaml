@@ -41,6 +41,14 @@ storage:
   order_status_observation_log_file: logs/order_status_observations.jsonl
   fill_ledger_file: data/fill_ledger.jsonl
 
+# 일봉 수집 (tools/update_daily_bars.py)
+# 실측: 0.5초 간격 5번째 호출에서 429 → 1초 간격. 600행/페이지.
+market_data:
+  daily_bars_dir: data/daily_bars
+  min_call_interval_sec: 1.0
+  retry_backoff_sec: [2, 5, 10, 20]
+  backfill_pages: 3
+
 # ── 카카오톡 알림 ──────────────────────────────────────────
 # .env 파일에 아래 키를 입력하세요 (.gitignore로 보호됨)
 kakao:
