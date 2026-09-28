@@ -131,4 +131,51 @@
 ### 전달 파일
 - 패치 0001 (캘린더·프로브·테스트), 0002 (CHANGELOG/README)
 
+---
+
+## 2026-09-28 — 4라운드: 스윙 상태 모델 + 여러 날 보유 원장
+
+### 배경
+- 뼈대 작업 3·4번. 매매 로직(손절가를 어떻게 정하는지 등)은 다루지 않음 — 담을 그릇만 만듦.
+- 단타 `RuntimeState`는 당일 기준 필드뿐이라 여러 날 보유를 담지 못함.
+- 단타 `pnl_calculator`는 이월 매도를 종목당 1회만 인정 → 스윙 분할 청산 시 계산 거부·신규매수 차단. 입력도 주문가 기준.
+- 실측 프로브 1회차(장중) 결과는 프로젝트 문서 `2026-09-28-probe-result-1-intraday.md` — 당일 미완성 봉 포함, 600행/페이지, 연속조회 가능, 0.5초 간격 5회째 429, 2026-01~09 캘린더 일치.
+
+### 변경 내용
+- **한 사실은 한 곳에만** 원칙으로 역할 분리
+
+| 사실 | 원천 |
+|---|---|
+| 보유 수량·매입단가·진입 거래일 | 체결 원장 `data/fill_ledger.jsonl` |
+| 주문 진행 상태 | PSM(메모리) + 주문 저널 |
+| 재시작 시 "보냈는지 모르는 주문" | `SwingState.unresolved_order_intents` |
+| 전략 ID·손절가 등 메타 | `SwingState.positions` (`PositionMeta`) — 수량·가격은 저장하지 않음 |
+
+- `domain/position/swing_state.py`: `SwingState`, `PositionMeta` (origin ORDER/ADOPTED, needs_review, meta dict). 형식 검증 엄격(알 수 없는 필드·잘못된 손절가 거부).
+- `infra/storage/swing_state_store.py`: 원자적 저장, schema_version 검사, 손상·단타 형식 파일은 `SwingStateCorruptError` (단타 저장소는 검증 없이 읽었음). `OrderExecutor`와 호출 형태 호환.
+- `domain/position/fill_event.py` + `infra/storage/fill_ledger.py`: append-only 체결 원장. 가격 출처 필수(BROKER_FILL / BROKER_AVG / ORDER_ESTIMATE). 같은 사건 재기록은 무시, 같은 id·다른 내용은 예외. 쓰다가 끊긴 마지막 줄만 격리하고 그 외 손상은 예외.
+- `domain/service/lot_ledger.py`: 원장 전체를 시간순 FIFO 적용 — 분할 청산 허용, 매도 > 보유면 `LotMatchError`(fail-close 유지), 추정가 포함 여부 표시, 평가손익, 비용 시나리오별 순손익.
+- `domain/position/position_book.py`: 원장·잔고·메타 대조 **보고만** (QTY_MISMATCH / UNTRACKED_HOLDING / LEDGER_ONLY는 blocking, 주문 진행 중이면 참고로 강등). 기존 보유분 인수용 `opening_events_from_balance()` 도우미(자동 적용 안 함).
+- `app/main.py` 기동 점검: 상태 파일을 `SwingStateStore`로 읽고, 체결 원장 로드 + 장부 대조 결과를 로그·화면에 표시. 실전투자에서 원장 손상·단타 형식 state.json이면 시작 중단.
+- `config`: `storage.fill_ledger_file` 추가. `testing_helpers.py`: `ScriptedBroker`를 여러 테스트가 공유하도록 이동.
+- `tools/equivalence/runner.py`: 새 구현 쪽 상태 저장소를 `SwingStateStore`로 교체.
+
+### 테스트 및 검증
+- 신규: `test_swing_state.py` 27건(OrderExecutor와 함께 재시작 복원 포함), `test_fill_ledger.py` 37건, `test_position_book.py` 14건, `test_app_startup.py` 16→24건.
+- `run_regression_tests.py`: 19개 파일 중 18개 통과 (실패 1개는 기존과 동일 — 실측 fixture 없음).
+- 동등성 비교: SwingStateStore로 바꾼 뒤에도 18/18 동일.
+- `python -m app.main`(MockBroker): 정상 종료, "장부 대조: 일치".
+
+### 변경하지 않은 것
+- `domain/models.py`의 `RuntimeState`, `infra/storage/state_store.py`는 원본 그대로 남김(동등성 도구의 원본 쪽·기존 테스트가 사용). 새 코드는 쓰지 않음.
+- 원장 자동 기록(체결 확인 → FillEvent 추가)은 아직 연결하지 않음 — 매매 루프 연결 라운드에서 `OrderExecutor` 훅·잔고 변화·체결조회 증거로 기록.
+- 원장과 잔고가 어긋나도 자동으로 메우지 않음 (의도).
+
+### 다음 작업
+- 5라운드: 일봉 데이터 계층 (완성 봉만 제공, 1초 간격 + 429 백오프, 수정주가 변경 감지 시 재수집).
+- 남은 실측: 장 마감 후 당일 봉 확정, 장 시작 전 체결조회 범위.
+
+### 전달 파일
+- 패치 0001 (상태·원장·대조·기동 점검·테스트), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
