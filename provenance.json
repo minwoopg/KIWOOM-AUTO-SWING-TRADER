@@ -13,6 +13,9 @@
       "source_path": "app/main.py",
       "source_sha256": "8d843b564659c02846e0746f85e25729d5cf887f36fafc17a3c36cd42ea4b536"
     },
+    "app/session_runner.py": {
+      "status": "new"
+    },
     "config/krx_calendar.yaml": {
       "status": "new"
     },
@@ -68,6 +71,12 @@
     "domain/position/swing_state.py": {
       "status": "new"
     },
+    "domain/risk/account_guard.py": {
+      "status": "new"
+    },
+    "domain/service/fill_recorder.py": {
+      "status": "new"
+    },
     "domain/service/lot_ledger.py": {
       "status": "new"
     },
@@ -85,6 +94,9 @@
       "status": "unchanged",
       "source_path": "domain/strategy/exit_calc.py",
       "source_sha256": "a2ca755e5eddca6cb99e922050bc9a6f0a8844d5fae3a04baa0fa83ea02de9b7"
+    },
+    "domain/strategy/interface.py": {
+      "status": "new"
     },
     "infra/broker/base.py": {
       "status": "unchanged",
@@ -176,6 +188,9 @@
       "source_path": "run_regression_tests.py",
       "source_sha256": "d344189892eba3ecfe9a29642daa632da31d0d97be9965a4c7819fef3bb4a3ca"
     },
+    "test_account_guard.py": {
+      "status": "new"
+    },
     "test_app_startup.py": {
       "status": "new"
     },
@@ -203,6 +218,9 @@
       "status": "new"
     },
     "test_fill_ledger.py": {
+      "status": "new"
+    },
+    "test_fill_recorder.py": {
       "status": "new"
     },
     "test_kakao_notifier_token_lifecycle.py": {
@@ -243,6 +261,9 @@
       "status": "modified",
       "source_path": "test_run_baseline.py",
       "source_sha256": "cb02270a65a42eb795d1c56915309435e164f82e476d2c5c5e1ba83713461dd3"
+    },
+    "test_session_runner.py": {
+      "status": "new"
     },
     "test_swing_state.py": {
       "status": "new"

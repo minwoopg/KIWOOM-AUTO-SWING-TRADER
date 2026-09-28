@@ -114,6 +114,29 @@ class MarketDataConfig:
 
 
 @dataclass(frozen=True)
+class SessionSettings:
+    """하루 수명주기 (6라운드) — app/session_runner.SessionConfig로 변환."""
+
+    poll_interval_sec: float = 60.0
+    close_reconcile_until: str = "15:45"
+    watch_symbols: tuple = ()
+    update_daily_bars_after_close: bool = False
+
+
+@dataclass(frozen=True)
+class GuardSettings:
+    """계좌 안전 한도 (6라운드) — domain/risk/account_guard.GuardConfig로 변환."""
+
+    max_positions: int = 5
+    max_order_amount: int = 2_000_000
+    max_total_exposure: int = 10_000_000
+    min_cash_buffer: int = 100_000
+    new_orders_start: str = "09:05"
+    new_orders_end: str = "15:15"
+    allowed_symbols: tuple = ()
+
+
+@dataclass(frozen=True)
 class Settings:
     """프로그램 전체 설정을 한 번에 담는 최상위 객체입니다."""
 
@@ -122,6 +145,8 @@ class Settings:
     storage: StorageConfig
     kakao: KakaoConfig = None
     market_data: MarketDataConfig = field(default_factory=MarketDataConfig)
+    session: SessionSettings = field(default_factory=SessionSettings)
+    guard: GuardSettings = field(default_factory=GuardSettings)
 
 
 def _substitute_env(value: Any) -> Any:
@@ -147,4 +172,8 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
         storage=StorageConfig(**raw["storage"]),
         kakao=KakaoConfig(**kakao_raw) if kakao_raw else KakaoConfig(),
         market_data=MarketDataConfig(**(raw.get("market_data") or {})),
+        session=SessionSettings(**{k: (tuple(v) if isinstance(v, list) else v)
+                                   for k, v in (raw.get("session") or {}).items()}),
+        guard=GuardSettings(**{k: (tuple(v) if isinstance(v, list) else v)
+                               for k, v in (raw.get("guard") or {}).items()}),
     )

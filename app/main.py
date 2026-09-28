@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-"""스윙 자동매매 진입점 — 1라운드: 기반 점검 모드 (2026-09-28).
+"""스윙 자동매매 진입점 (2026-09-28, 6라운드: 하루 수명주기 연결).
 
 운영 방식(민우님 확정): 장 시작 전에 켜고 장 마감 후 끈다.
 
-이 라운드에는 매매 루프가 없습니다. 단타 레포 `app/main.py`(bdde6c2)의
-기동 순서 중 매매 로직과 무관한 부분만 옮겨, 아래를 한 번 실행하고
-종료합니다.
+    python -m app.main                 # 기동 점검 → 하루 수명주기(app/session_runner.py) → 마감 후 종료
+    python -m app.main --check-only    # 기동 점검만 하고 종료 (이전 라운드 동작)
+
+전략 자리는 비어 있습니다(NullStrategy — 주문을 내지 않음).
+
+기동 점검 순서 (단타 레포 `app/main.py`(bdde6c2)에서 매매 로직과 무관한 부분):
 
 1. .env / settings.yaml 로드
 2. 단일 인스턴스 락 (상태 파일 기준 — 단타 레포와 경로가 달라 서로 막지 않음)
@@ -18,8 +21,7 @@ from __future__ import annotations
    — 읽기만 하고 아무것도 자동 해소하지 않습니다.
 6-1. 체결 원장 ↔ 잔고 ↔ 포지션 메타 대조 보고 (4라운드, 읽기 전용)
 7. 카카오 시작 알림 (백그라운드, 실패해도 무시)
-
-주문 실행부(OrderExecutor)와 스윙 매매 루프는 다음 라운드에서 연결합니다.
+8. (--check-only가 아니면) OrderExecutor·체결 기록기·안전 한도를 묶어 하루 수명주기 실행
 """
 
 import asyncio
@@ -191,21 +193,21 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
     return report
 
 
-async def async_main() -> None:
+async def async_main(check_only: bool = False) -> None:
     load_dotenv()
     settings = load_settings()
     with single_instance_lock(Path(settings.storage.state_file).with_suffix(".lock")):
-        await _run_application(settings)
+        await _run_application(settings, check_only=check_only)
 
 
-async def _run_application(settings: Settings) -> None:
+async def _run_application(settings: Settings, check_only: bool = False) -> None:
     # 단타 레포와 동일: 구버전 .pyc 캐시로 인한 AttributeError 방지
     for cache_dir in Path(".").rglob("__pycache__"):
         shutil.rmtree(cache_dir, ignore_errors=True)
 
     app_logger = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
     print("=" * 50)
-    print("  스윙 자동매매 — 기반 점검 모드 (매매 루프 없음)")
+    print("  스윙 자동매매 — " + ("기반 점검 모드" if check_only else "하루 수명주기 (전략: NullStrategy)"))
     print(f"  app.log: {settings.storage.app_log_file}")
     print("=" * 50)
 
@@ -219,7 +221,7 @@ async def _run_application(settings: Settings) -> None:
     send_startup_notification_async(
         notifier, app_logger, report.mode, now_local().strftime("%H:%M"), None,
         title=STARTUP_TITLE,
-        watch_line="기반 점검 모드(매매 루프 없음)",
+        watch_line="기반 점검 모드" if check_only else "하루 수명주기 시작 (전략 없음)",
     )
 
     # 매매 루프가 없어 곧바로 종료되므로, 백그라운드 알림 스레드(daemon)가
@@ -240,14 +242,106 @@ async def _run_application(settings: Settings) -> None:
     elif report.reconcile is not None:
         print(f"  장부 대조: {'일치' if report.reconcile.ok else '불일치 — app.log [STARTUP_RECONCILE] 확인'}"
               f" (어긋남 {len(report.reconcile.issues)}건)")
-    app_logger.info("[STARTUP] 기반 점검 완료 — 매매 루프 없이 종료합니다(매매 루프 미연결).")
+    if check_only:
+        app_logger.info("[STARTUP] 기반 점검 완료 — --check-only로 종료합니다.")
+        return
+    summary = run_session(settings, broker, app_logger)
+    print("-" * 50)
+    for line in summary.lines():
+        print(f"  {line}")
+
+
+def build_guard_config(g) -> "GuardConfig":
+    from datetime import time as _time
+    from domain.risk.account_guard import GuardConfig
+
+    def hm(v: str) -> _time:
+        hh, mm = str(v).split(":")
+        return _time(int(hh), int(mm))
+
+    return GuardConfig(
+        max_positions=int(g.max_positions), max_order_amount=int(g.max_order_amount),
+        max_total_exposure=int(g.max_total_exposure), min_cash_buffer=int(g.min_cash_buffer),
+        new_orders_start=hm(g.new_orders_start), new_orders_end=hm(g.new_orders_end),
+        allowed_symbols=tuple(str(x) for x in g.allowed_symbols),
+    )
+
+
+def build_session_config(s) -> "SessionConfig":
+    from datetime import time as _time
+    from app.session_runner import SessionConfig
+
+    hh, mm = str(s.close_reconcile_until).split(":")
+    return SessionConfig(
+        poll_interval_sec=float(s.poll_interval_sec), close_reconcile_until=_time(int(hh), int(mm)),
+        watch_symbols=tuple(str(x) for x in s.watch_symbols),
+    )
+
+
+def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
+                should_stop=None):
+    """하루 수명주기 실행. 테스트에서 clock/sleep/should_stop을 주입할 수 있음."""
+    import time as _time_mod
+
+    from app.session_runner import SessionRunner
+    from domain.service.fill_recorder import FillRecorder
+    from domain.service.order_executor import OrderExecutor
+    from domain.strategy.interface import NullStrategy
+    from infra.storage.logger import PositionLifecycleLogger, TradeCsvLogger
+    from utils.trading_calendar import TradingCalendar
+
+    calendar = TradingCalendar.load()
+    state_store = SwingStateStore(settings.storage.state_file)
+    state, hp = state_store.load()      # 손상 시 예외 → 주문 경로를 만들지 않음
+    ledger_store = FillLedgerStore(settings.storage.fill_ledger_file)
+    executor = OrderExecutor(
+        settings=settings, broker=broker, state=state, highest_price=hp, state_store=state_store,
+        app_logger=app_logger, trade_logger=TradeCsvLogger(settings.storage.trade_log_file),
+        position_lifecycle_logger=PositionLifecycleLogger(settings.storage.position_lifecycle_log_file),
+    )
+    after_close = None
+    if settings.session.update_daily_bars_after_close and isinstance(broker, KiwoomBroker):
+        after_close = _make_daily_bar_updater(settings, broker, calendar, state, ledger_store, app_logger)
+    runner = SessionRunner(
+        broker=broker, executor=executor, state=state, ledger_store=ledger_store,
+        recorder=FillRecorder(ledger_store, logger=app_logger), calendar=calendar,
+        strategy=strategy or NullStrategy(), guard_config=build_guard_config(settings.guard),
+        session_config=build_session_config(settings.session), logger=app_logger,
+        clock=clock or now_local, sleep=sleep or _time_mod.sleep, should_stop=should_stop or (lambda: False),
+        after_close=after_close,
+    )
+    try:
+        return runner.run()
+    finally:
+        executor.shutdown()
+
+
+def _make_daily_bar_updater(settings, broker, calendar, state, ledger_store, app_logger):
+    def update(_trade_date):
+        from infra.market_data.daily_bar_repository import DailyBarRepository
+        from infra.market_data.daily_bar_source import KiwoomDailyBarSource, PacedFetcher
+        from infra.market_data.daily_bar_store import DailyBarStore
+
+        md = settings.market_data
+        repo = DailyBarRepository(
+            DailyBarStore(md.daily_bars_dir),
+            PacedFetcher(KiwoomDailyBarSource(broker), min_interval_sec=md.min_call_interval_sec,
+                         retry_backoff_sec=md.retry_backoff_sec, logger=app_logger),
+            calendar, backfill_pages=md.backfill_pages, logger=app_logger)
+        held = set(apply_events(ledger_store.load()).positions())
+        symbols = sorted(set(settings.session.watch_symbols) | held | set(state.positions))
+        now = now_local()
+        for sym in symbols:
+            app_logger.info(f"[DAILY_BARS] {repo.update(sym, now).line()}")
+    return update
 
 
 def main() -> int:
     """단타 레포 app/main.py의 main()과 동일한 종료 코드 규칙."""
     exit_code = 0
+    check_only = "--check-only" in sys.argv[1:]
     try:
-        asyncio.run(async_main())
+        asyncio.run(async_main(check_only=check_only))
     except KeyboardInterrupt:
         print("\n[종료] Ctrl+C 감지 — 정상 종료 처리 중...")
     except Exception as exc:

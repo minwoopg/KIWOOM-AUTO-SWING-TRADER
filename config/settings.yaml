@@ -49,6 +49,23 @@ market_data:
   retry_backoff_sec: [2, 5, 10, 20]
   backfill_pages: 3
 
+# 하루 수명주기 (python -m app.main) — 장 시작 전 기동, 마감 후 자동 종료
+session:
+  poll_interval_sec: 60            # 장중 폴링 간격(10초 이상)
+  close_reconcile_until: "15:45"   # 마감 후 미해결 주문 대조를 기다리는 한계 시각
+  watch_symbols: []                # 보유가 없어도 대조·전략에 넘길 종목
+  update_daily_bars_after_close: false
+
+# 계좌 안전 한도 — 전략과 무관한 절대 한도 (전략 주문 의도가 여기서 막히면 전송 안 함)
+guard:
+  max_positions: 5
+  max_order_amount: 2000000        # 1회 주문 금액 상한(원)
+  max_total_exposure: 10000000     # 보유 평가액 + 이번 주문 상한(원)
+  min_cash_buffer: 100000          # 주문 후 남겨둘 현금(원)
+  new_orders_start: "09:05"        # 신규 주문 허용 시작 (강제 매도는 예외)
+  new_orders_end: "15:15"          # 신규 주문 허용 끝
+  allowed_symbols: []              # 비우면 제한 없음
+
 # ── 카카오톡 알림 ──────────────────────────────────────────
 # .env 파일에 아래 키를 입력하세요 (.gitignore로 보호됨)
 kakao:
