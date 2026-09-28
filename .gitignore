@@ -29,3 +29,7 @@ diagnostics/
 # IDE
 .vscode/
 .idea/
+
+# 스윙: 일일 리포트·번들 (손익 등 개인 기록)
+reports/
+exports/

@@ -1,0 +1,35 @@
+# 회귀 테스트 — main 푸시·PR마다 실행 (스윙 분리 7라운드)
+#
+# - Windows(실제 운영 환경)와 Ubuntu 둘 다 실행
+# - test_broker_order_status.py는 실측 fixture(tests/fixtures/order_reconciliation/)가
+#   저장소에 없어 건너뜀 — 로컬에서 fixture를 복사한 환경에서만 실행
+# - PYTHONUTF8=1: 테스트 출력(한글)을 러너가 UTF-8로 주고받게 함 (Windows 기본 코드페이지 회피)
+name: regression
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # test_run_baseline이 실제 git SHA를 확인함
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install -r requirements.txt
+      - name: Regression
+        run: python run_regression_tests.py --skip test_broker_order_status.py

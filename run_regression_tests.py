@@ -62,10 +62,18 @@ def main() -> int:
         "--pattern", default="test_*.py",
         help="실행할 테스트 파일 패턴 (기본: test_*.py, 프로젝트 루트만 대상)",
     )
+    # 2026-09-28 (스윙 분리 7라운드): CI처럼 실측 fixture가 없는 환경에서
+    # 특정 파일을 명시적으로 건너뛰기 위한 옵션. 건너뛴 파일은 결과에 표시됩니다.
+    parser.add_argument(
+        "--skip", action="append", default=[], metavar="FILE",
+        help="건너뛸 테스트 파일 이름 (여러 번 지정 가능)",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).parent
-    test_files = find_test_files(root, args.pattern)
+    test_files = [f for f in find_test_files(root, args.pattern) if f.name not in set(args.skip)]
+    if args.skip:
+        print("[스킵 — 명시적 지정]", ", ".join(sorted(args.skip)), "\n")
 
     if not test_files:
         print(f"[오류] 패턴 '{args.pattern}'에 맞는 테스트 파일을 찾지 못했습니다.")

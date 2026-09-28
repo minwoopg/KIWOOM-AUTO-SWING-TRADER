@@ -311,9 +311,18 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
         after_close=after_close,
     )
     try:
-        return runner.run()
+        summary = runner.run()
     finally:
         executor.shutdown()
+    if summary.status != "CLOSED_DAY":
+        try:
+            from app.reports import generate_daily_report
+            generate_daily_report(settings, summary.trade_date, balance=runner.last_balance,
+                                  reconcile_report=runner.last_reconcile, session_lines=summary.lines(),
+                                  calendar=calendar, logger=app_logger)
+        except Exception as exc:
+            app_logger.error(f"[REPORT] 일일 리포트 생성 실패(매매 결과에는 영향 없음): {type(exc).__name__}: {exc}")
+    return summary
 
 
 def _make_daily_bar_updater(settings, broker, calendar, state, ledger_store, app_logger):

@@ -119,6 +119,7 @@ class SessionRunner:
         self._consecutive_balance_failures = 0
         self._halted_reason = ""
         self._last_report: ReconcileReport | None = None
+        self.last_balance: AccountBalance | None = None
 
     # ── 진입점 ──────────────────────────────────────────────
 
@@ -159,6 +160,7 @@ class SessionRunner:
         try:
             balance = self.broker.get_account_balance()
             self._consecutive_balance_failures = 0
+            self.last_balance = balance
             return balance
         except Exception as exc:
             self._consecutive_balance_failures += 1
@@ -311,6 +313,10 @@ class SessionRunner:
                 self.after_close(self.clock().date())
             except Exception as exc:
                 self.log.error(f"[SESSION] 마감 후 작업 실패(매매 결과에는 영향 없음): {type(exc).__name__}: {exc}")
+
+    @property
+    def last_reconcile(self) -> ReconcileReport | None:
+        return self._last_report
 
     def _finish(self, status: str) -> SessionSummary:
         self.summary.status = status

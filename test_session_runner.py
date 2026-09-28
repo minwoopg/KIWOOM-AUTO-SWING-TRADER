@@ -141,6 +141,7 @@ def logs(logger, level="info"):
 # ── 1. 휴장일 ────────────────────────────────────────────────
 s, st, br, lg, _ = day(datetime(2026, 10, 5, 8, 50))
 check("1-1) 휴장일(10/5) → CLOSED_DAY, 브로커 조회 없음", s.status == "CLOSED_DAY" and br.place_calls == [] and s.ticks == 0)
+check("1-2) 휴장일에는 리포트를 만들지 않음", not Path(st.storage.reports_dir).exists())
 
 # ── 2. 전략 없는 하루 ─────────────────────────────────────────
 s, st, br, lg, clk = day(datetime(2026, 9, 28, 8, 50))
@@ -175,6 +176,10 @@ check("3-6) 청산 후 포지션 메타 정리, 주문 의도 없음",
 check("3-7) 전략 시작·종료 훅 각 1회", strat.started == 1 and strat.ended == 1)
 rows = Path(st.storage.trade_log_file).read_text(encoding="utf-8")
 check("3-8) 거래 로그에 전략 ID 기록", "script" in rows)
+rep = Path(st.storage.reports_dir) / "daily_report_2026-09-28.md"
+check("3-9) 하루 끝에 일일 리포트 생성(실현손익·세션 요약 포함)", rep.exists()
+      and "| 당일 실현손익 (비용 전) | +10,000 ⚠추정가 포함 |" in rep.read_text(encoding="utf-8")
+      and "### 세션 요약" in rep.read_text(encoding="utf-8"))
 
 # ── 4. 매수 보유 중 메타 생성 ────────────────────────────────
 strat = ScriptStrategy([(time(10, 0), OrderIntent("000660", "BUY", 5, 180_000, reason="hold"))])

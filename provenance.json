@@ -3,8 +3,11 @@
   "source_commit": "bdde6c228f66375717f3c1a9843dfbb9cadcd871",
   "source_commit_date": "2026-09-28",
   "files": {
+    ".github/workflows/regression.yml": {
+      "status": "new"
+    },
     ".gitignore": {
-      "status": "unchanged",
+      "status": "modified",
       "source_path": ".gitignore",
       "source_sha256": "056bb38fef8883ea3b579003b1598a29561c3adeac70c5b9d4e598d3b4e1767e"
     },
@@ -12,6 +15,9 @@
       "status": "rewritten",
       "source_path": "app/main.py",
       "source_sha256": "8d843b564659c02846e0746f85e25729d5cf887f36fafc17a3c36cd42ea4b536"
+    },
+    "app/reports.py": {
+      "status": "new"
     },
     "app/session_runner.py": {
       "status": "new"
@@ -142,6 +148,14 @@
       "source_path": "infra/notify/kakao_notifier.py",
       "source_sha256": "7020d7705595c934d300ec15a88f1699689aee150109f10e7e2ee6049c5d90da"
     },
+    "infra/reporting/daily_report.py": {
+      "status": "new"
+    },
+    "infra/reporting/masking.py": {
+      "status": "derived",
+      "source_path": "export_daily_bundle.py",
+      "source_sha256": "b302c3b4cce061e3fdc7df7e2e3d4c094fa736037bec6d71c287a579999cb733"
+    },
     "infra/storage/fill_ledger.py": {
       "status": "new"
     },
@@ -184,9 +198,18 @@
       "source_sha256": "9ed2e8cbaa45b66fc1ace0e828ccd91b3a5d17c565ceb655bd5602c67a960078"
     },
     "run_regression_tests.py": {
-      "status": "unchanged",
+      "status": "modified",
       "source_path": "run_regression_tests.py",
       "source_sha256": "d344189892eba3ecfe9a29642daa632da31d0d97be9965a4c7819fef3bb4a3ca"
+    },
+    "scripts/register_task.ps1": {
+      "status": "new"
+    },
+    "scripts/run_swing.ps1": {
+      "status": "new"
+    },
+    "scripts/unregister_task.ps1": {
+      "status": "new"
     },
     "test_account_guard.py": {
       "status": "new"
@@ -215,6 +238,9 @@
       "source_sha256": "2b5d0fcd2faa0a76356c768742b8f2614f3820d03a484e9ba35a52dc932f5bc1"
     },
     "test_daily_bars.py": {
+      "status": "new"
+    },
+    "test_daily_report.py": {
       "status": "new"
     },
     "test_fill_ledger.py": {
@@ -279,6 +305,9 @@
     "testing_helpers.py": {
       "status": "new"
     },
+    "tools/daily_report.py": {
+      "status": "new"
+    },
     "tools/equivalence/common.py": {
       "status": "new"
     },
@@ -289,6 +318,9 @@
       "status": "new"
     },
     "tools/equivalence/scenarios.py": {
+      "status": "new"
+    },
+    "tools/export_bundle.py": {
       "status": "new"
     },
     "tools/probe_market_data.py": {

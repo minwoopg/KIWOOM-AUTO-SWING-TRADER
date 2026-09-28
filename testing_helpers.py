@@ -22,7 +22,7 @@ sys.path.insert(0, ".")
 
 from datetime import datetime
 
-from config.settings import AppConfig, BrokerConfig, KakaoConfig, Settings, StorageConfig
+from config.settings import AppConfig, BrokerConfig, KakaoConfig, MarketDataConfig, Settings, StorageConfig
 from domain.models import (
     AccountBalance, BrokerOrder, BrokerOrderStatus, MarketPrice, OrderResult,
     OrderStatusEvidence, Position,
@@ -47,8 +47,10 @@ def build_minimal_settings(tmpdir: str) -> Settings:
             run_baseline_log_file=f"{tmpdir}/run_baseline.csv",
             order_status_observation_log_file=f"{tmpdir}/order_status_observations.jsonl",
             fill_ledger_file=f"{tmpdir}/fill_ledger.jsonl",
+            reports_dir=f"{tmpdir}/reports",
         ),
         kakao=KakaoConfig(token_state_file=f"{tmpdir}/kakao_token_state.json"),
+        market_data=MarketDataConfig(daily_bars_dir=f"{tmpdir}/daily_bars"),
     )
 
 
