@@ -129,12 +129,18 @@ if sub.block_code: ...                                # 주문 안전 게이트�
   **주문 조회가 그 주문번호를 FILLED로 확인할 때만** 주문이 종료되고 포지션은 OPEN으로 남습니다(청산 훅 없음).
   주문 조회가 OPEN·UNKNOWN·오류면 목표 잔고여도 차단 유지 → 타임아웃 후 orphan(FILLED 확인 또는
   `ack_orphan`으로만 해제). 목표보다 더 줄면 ERROR. 전량매도(목표 0)는 원본과 같이 잔고 0으로 확정합니다.
-- 복구 명령 파일을 보관 폴더로 옮기지 못하면(8-E) 지우지 않고 `<이름>.json.<시각>.hold`로 바꿔 보존하고
-  재실행하지 않습니다. 실행 결과와 보관 결과는 로그에 따로 남습니다.
 - 사람 확인이 필요한 상태(ERROR / orphan)는 `commands/ack_error_{종목}.json`,
-  `commands/ack_orphan_{종목}.json` 파일로만 해제됩니다.
-  처리된 파일은 `commands/processed/`, 실패한 파일은 사유(`.error.txt`)와 함께
-  `commands/failed/`로 옮겨집니다(BOM 있는 UTF-8도 허용).
+  `commands/ack_orphan_{종목}.json` 파일로만 해제됩니다. **명령에는 현재 복구 사건 ID(`recovery_id`)가
+  있어야 합니다(8-F)** — ID는 app.log `[RECOVERY_REQUIRED]`와 `commands/recovery_required.json`(명령 템플릿 포함)에
+  나옵니다. 재시작하면 복원된 ERROR에 새 ID가 붙으므로, 이전 사건·재시작 전에 쓴 명령은 적용되지 않습니다.
+
+  ```powershell
+  $body = @{ recovery_id = "ERROR-005930-1a2b3c4d"; broker_quantity = 10; note = "HTS 확인" } | ConvertTo-Json
+  $body | Out-File -Encoding utf8 commands\ack_error_005930.json
+  ```
+- 명령은 실행 **전에** `commands/processing/`으로 옮겨 확보하고(못 옮기면 실행 안 함), 실행 후 `commands/processed/`
+  또는 사유(`.error.txt`)와 함께 `commands/failed/`로 옮깁니다. 보관에 실패하면 원문은 `processing/`에 그대로 남으며
+  다시 실행되지 않습니다(재시작 포함). 실행 결과와 보관 결과는 로그에 따로 남습니다. BOM 있는 UTF-8도 허용.
 
 동작이 단타 레포와 같은지 확인:
 

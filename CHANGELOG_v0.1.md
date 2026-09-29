@@ -481,4 +481,34 @@ GPT 재검토(`08c6eab` 기준, F1·F3·F4·F6·F8 해결 확인)에서 잔여 4
 ### 전달 파일
 - 패치 0001 (fix), 0002 (CHANGELOG/README)
 
+## 2026-09-29 — 8-F: 복구 명령 재시작 안전 (GPT 재검토 `4ae3e0a` R4 잔여, P1)
+
+### 배경
+- GPT 재검토: R1~R3 해결, R4는 같은 프로세스 내 재실행 방지만 해결. 보관·`.hold` 이름 변경이 모두 실패하면 처리한
+  명령을 메모리에만 기록 → 재시작 후 남아 있던 **옛 `ack_error` 명령이 새 주문의 복원된 ERROR를 해제**, 저널 정리·추가 매수 허용 재현.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `domain/service/order_executor.py` | **실행 전 확보**: 명령을 `commands/processing/`으로 원자적 이동한 뒤에만 실행(이동 실패 시 실행 안 함, CRITICAL 1회). 실행 후 `processed/`·`failed/`로 이동, 실패하면 `processing/`에 보존(실행 대상 아님 → 재시작해도 재실행 없음). `.hold`·메모리 목록 방식 제거. **복구 사건 ID**: ERROR·orphan마다 프로세스별 새 `recovery_id` 발급(재시작 복원 시에도 새 ID), `[RECOVERY_REQUIRED]` CRITICAL + `commands/recovery_required.json`(명령 템플릿). 명령의 `recovery_id`가 현재 사건과 다르면 거부 |
+| `tools/equivalence/runner.py` | 새 구현 쪽 명령에 현재 `recovery_id` 포함(원본 쪽은 그대로) |
+| `infra/reporting/daily_report.py`, `README.md` | 명령 작성법 안내 |
+| `test_order_executor.py` | 기존 명령 테스트에 `recovery_id`, 21절 재작성 133→140(재시작 재현 21-4, 옛 ID 거부 21-5, 목록 파일 21-6, 현재 ID 적용 21-7, ID 없음 거부 21-8) |
+
+### 테스트 및 검증
+- 완료 기준(21-4): 옛 ERROR 해제 → 보관 실패 → 새 매수 미체결 → 재시작 → ERROR·저널 유지, 추가 주문 0회.
+- `run_regression_tests.py --skip test_broker_order_status.py`: 24개 전부 통과. 단타 원본 동등성 18/18.
+
+### 운영 변경
+- 복구 명령에 `recovery_id` 필수. 재시작하면 ID가 바뀌므로 `commands/recovery_required.json`에서 현재 ID를 확인해 작성.
+
+### 변경하지 않은 것
+- ERROR·orphan 해제 조건 자체, 매매 로직.
+
+### 다음 작업
+- 9: 전략 없는 다일 장애 통합 검증.
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
