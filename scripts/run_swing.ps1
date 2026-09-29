@@ -28,5 +28,5 @@ if ($CheckOnly) { $ArgsList += "--check-only" }
 $ErrorActionPreference = "Continue"
 & $Python @ArgsList 2>&1 | ForEach-Object { "$_" } | Out-File -FilePath $Log -Encoding utf8 -Append
 $Code = $LASTEXITCODE
-"[$(Get-Date -Format s)] 종료 코드: $Code" | Out-File -FilePath $Log -Encoding utf8 -Append
+"[$(Get-Date -Format s)] 종료 코드: $Code (0 정상 / 1 비정상 종료 / 2 마감 검증 NEEDS_REVIEW — reports\session_status_<날짜>.json 확인)" | Out-File -FilePath $Log -Encoding utf8 -Append
 exit $Code

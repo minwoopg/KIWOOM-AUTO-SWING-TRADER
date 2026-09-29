@@ -14,6 +14,12 @@ from __future__ import annotations
     POST_CLOSE  → 미해결 주문이 없어질 때까지(최대 close_reconcile_until) 대조만,
                   마지막 장부 대조·요약 → (선택) 일봉 갱신 → 종료
 
+마감 검증 (8-D, F5): 프로세스가 끝까지 돈 것(status=COMPLETED)과 마감 검증이
+성공한 것(close_check=VERIFIED)을 구분합니다. 마감 이후 잔고 조회가 한 번도
+성공하지 못하면 제한 횟수만큼 재시도하고, 그래도 실패하거나 최종 대조가 마감
+이후의 것이 아니거나, 불일치·미해결 주문·신규 주문 중단·일봉 갱신 실패가 있으면
+NEEDS_REVIEW입니다. 이전 폴링의 대조 결과를 최종 결과로 쓰지 않습니다.
+
 매매 판단은 `Strategy`에만 있고 기본값 `NullStrategy`는 아무 주문도 내지 않습니다.
 이 모듈은 순서와 안전장치만 담당합니다.
 
@@ -44,10 +50,14 @@ class SessionConfig:
     close_reconcile_until: time = time(15, 45)
     max_consecutive_balance_failures_warn: int = 5
     watch_symbols: tuple[str, ...] = ()
+    close_balance_retries: int = 3          # 마감 후 잔고 조회 실패 시 추가 시도 횟수
+    close_balance_retry_sec: float = 15.0
 
     def __post_init__(self) -> None:
         if self.poll_interval_sec < 10:
             raise ValueError("poll_interval_sec는 10초 이상 (잔고·체결 조회 한도 보호)")
+        if self.close_balance_retries < 0 or self.close_balance_retry_sec < 0:
+            raise ValueError("close_balance_retries / close_balance_retry_sec는 0 이상")
 
 
 @dataclass
@@ -65,6 +75,33 @@ class SessionSummary:
     unresolved_at_end: bool = False
     final_reconcile: ReconcileReport | None = None
     denied_codes: dict[str, int] = field(default_factory=dict)
+    # 8-D (F5): 마감 검증
+    close_check: str = ""                # "" (휴장일) / VERIFIED / NEEDS_REVIEW / NOT_RUN (마감 전 중지)
+    close_issues: list[str] = field(default_factory=list)
+    final_balance_at: datetime | None = None
+    final_reconcile_at: datetime | None = None
+    daily_bars: str = "SKIPPED"          # SKIPPED / OK / FAILED: ...
+    report: str = ""                     # OK / FAILED: ... (run_session이 채움)
+
+    def add_close_issue(self, issue: str) -> None:
+        if issue not in self.close_issues:
+            self.close_issues.append(issue)
+        if self.close_check in ("VERIFIED", ""):
+            self.close_check = "NEEDS_REVIEW"
+
+    def to_status_dict(self) -> dict:
+        iso = lambda v: v.isoformat(timespec="seconds") if v else None
+        return {
+            "trade_date": self.trade_date.isoformat() if self.trade_date else None,
+            "status": self.status, "close_check": self.close_check, "close_issues": list(self.close_issues),
+            "final_balance_at": iso(self.final_balance_at), "final_reconcile_at": iso(self.final_reconcile_at),
+            "final_reconcile_ok": None if self.final_reconcile is None else self.final_reconcile.ok,
+            "unresolved_at_end": self.unresolved_at_end, "halted_reason": self.halted_reason,
+            "daily_bars": self.daily_bars, "report": self.report,
+            "ticks": self.ticks, "balance_failures": self.balance_failures,
+            "orders_sent": self.orders_sent, "orders_accepted": self.orders_accepted,
+            "fills_recorded": self.fills_recorded,
+        }
 
     def lines(self) -> list[str]:
         out = [
@@ -81,6 +118,10 @@ class SessionSummary:
         if self.final_reconcile is not None:
             out.append("장부 대조: " + ("일치" if self.final_reconcile.ok else "불일치")
                        + f" (어긋남 {len(self.final_reconcile.issues)}건)")
+        if self.close_check:
+            out.append(f"마감 검증: {self.close_check}"
+                       + (f" — {', '.join(self.close_issues)}" if self.close_issues else "")
+                       + f" | 일봉 갱신 {self.daily_bars}")
         return out
 
 
@@ -120,6 +161,8 @@ class SessionRunner:
         self.after_close = after_close
         self.quote_source = quote_source   # None이면 보유 종목이 있을 때 신규 매수 불가(PRICE_UNKNOWN)
         self._tick_prices: dict[str, int] | None = None
+        self._last_balance_ok_at: datetime | None = None
+        self._last_reconcile_at: datetime | None = None
         self._unreconciled: frozenset[str] = frozenset()
         self.summary = SessionSummary()
         self._consecutive_balance_failures = 0
@@ -167,6 +210,7 @@ class SessionRunner:
             balance = self.broker.get_account_balance()
             self._consecutive_balance_failures = 0
             self.last_balance = balance
+            self._last_balance_ok_at = self.clock()
             return balance
         except Exception as exc:
             self._consecutive_balance_failures += 1
@@ -207,6 +251,7 @@ class SessionRunner:
             for line in report.lines():
                 (self.log.critical if line.startswith("[BLOCK]") else self.log.info)(f"[SESSION_RECONCILE] {line}")
         self._last_report = report
+        self._last_reconcile_at = now
         for sym in report.symbols_with(META_ORPHAN):
             if sym not in in_flight:
                 self.state.remove_position_meta(sym)
@@ -336,7 +381,8 @@ class SessionRunner:
 
     def _close_routine(self) -> None:
         self.log.info("[SESSION] 정규장 종료 — 미해결 주문 대조")
-        deadline = datetime.combine(self.clock().date(), self.cfg.close_reconcile_until)
+        close_started = self.clock()
+        deadline = datetime.combine(close_started.date(), self.cfg.close_reconcile_until)
         ctx = None
         while not self.should_stop():
             ctx = self._tick(allow_orders=False) or ctx
@@ -345,19 +391,59 @@ class SessionRunner:
                 break
             if not self._sleep_interval():
                 break
+        # 8-D (F5): 마감 이후 잔고·대조가 한 번도 성공하지 못했으면 제한 횟수 재시도
+        attempt = 0
+        while (not self._fresh(self._last_reconcile_at, close_started)
+               and attempt < self.cfg.close_balance_retries and not self.should_stop()):
+            attempt += 1
+            self.log.warning(f"[SESSION_CLOSE] 마감 후 잔고·대조 미확보 — 재시도 {attempt}/{self.cfg.close_balance_retries}")
+            if not self._sleep_seconds(self.cfg.close_balance_retry_sec):
+                break
+            ctx = self._tick(allow_orders=False) or ctx
         self.summary.unresolved_at_end = self.executor.has_unresolved_orders() or bool(self.recorder.tracked)
         for sym, order in self.recorder.tracked.items():
             self.log.critical(f"[SESSION] {sym} 주문 {order.order_id} 마감 후에도 추적 중 — 체결 "
                               f"{order.filled_quantity}/{order.requested_quantity}주, 원장·HTS 확인 필요")
-        self.summary.final_reconcile = self._last_report
+        fresh_reconcile = self._fresh(self._last_reconcile_at, close_started)
+        self.summary.final_reconcile = self._last_report if fresh_reconcile else None
+        self.summary.final_reconcile_at = self._last_reconcile_at if fresh_reconcile else None
+        self.summary.final_balance_at = (self._last_balance_ok_at
+                                         if self._fresh(self._last_balance_ok_at, close_started) else None)
         if ctx is not None:
             self._safe_strategy_call("on_session_end", ctx)
         self.executor.save_state()
         if self.after_close is not None:
             try:
-                self.after_close(self.clock().date())
+                result = self.after_close(self.clock().date())
+                self.summary.daily_bars = f"FAILED: {result}" if isinstance(result, str) and result else "OK"
             except Exception as exc:
+                self.summary.daily_bars = f"FAILED: {type(exc).__name__}: {exc}"
                 self.log.error(f"[SESSION] 마감 후 작업 실패(매매 결과에는 영향 없음): {type(exc).__name__}: {exc}")
+        self._judge_close()
+
+    @staticmethod
+    def _fresh(at: datetime | None, since: datetime) -> bool:
+        return at is not None and at >= since
+
+    def _judge_close(self) -> None:
+        s = self.summary
+        s.close_check = "VERIFIED"
+        if s.final_balance_at is None:
+            s.add_close_issue("FINAL_BALANCE_FAILED")
+        if s.final_reconcile is None:
+            s.add_close_issue("FINAL_RECONCILE_MISSING")
+        elif not s.final_reconcile.ok:
+            s.add_close_issue("RECONCILE_MISMATCH")
+        if s.unresolved_at_end:
+            s.add_close_issue("UNRESOLVED_ORDERS")
+        if s.halted_reason:
+            s.add_close_issue("HALTED")
+        if s.daily_bars.startswith("FAILED"):
+            s.add_close_issue("DAILY_BARS_FAILED")
+        if s.close_check == "VERIFIED":
+            self.log.info("[SESSION_CLOSE] 마감 검증 VERIFIED — 마감 후 잔고·장부 대조 일치, 미해결 주문 없음")
+        else:
+            self.log.critical(f"[SESSION_CLOSE] 마감 검증 NEEDS_REVIEW — {', '.join(s.close_issues)}")
 
     @property
     def last_reconcile(self) -> ReconcileReport | None:
@@ -365,6 +451,8 @@ class SessionRunner:
 
     def _finish(self, status: str) -> SessionSummary:
         self.summary.status = status
+        if status == "STOPPED" and not self.summary.close_check:
+            self.summary.close_check = "NOT_RUN"
         self.executor.save_state()
         for line in self.summary.lines():
             self.log.info(f"[SESSION_SUMMARY] {line}")
@@ -375,6 +463,14 @@ class SessionRunner:
     def _sleep_interval(self) -> bool:
         """poll_interval 동안 1초 단위로 쉬며 중지 요청 확인. 중지되면 False."""
         end = self.clock() + timedelta(seconds=self.cfg.poll_interval_sec)
+        while self.clock() < end:
+            if self.should_stop():
+                return False
+            self.sleep(min(1.0, (end - self.clock()).total_seconds()))
+        return not self.should_stop()
+
+    def _sleep_seconds(self, seconds: float) -> bool:
+        end = self.clock() + timedelta(seconds=seconds)
         while self.clock() < end:
             if self.should_stop():
                 return False

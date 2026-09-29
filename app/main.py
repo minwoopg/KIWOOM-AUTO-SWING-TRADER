@@ -194,14 +194,14 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
     return report
 
 
-async def async_main(check_only: bool = False) -> None:
+async def async_main(check_only: bool = False):
     load_dotenv()
     settings = load_settings()
     with single_instance_lock(Path(settings.storage.state_file).with_suffix(".lock")):
-        await _run_application(settings, check_only=check_only)
+        return await _run_application(settings, check_only=check_only)
 
 
-async def _run_application(settings: Settings, check_only: bool = False) -> None:
+async def _run_application(settings: Settings, check_only: bool = False):
     # 단타 레포와 동일: 구버전 .pyc 캐시로 인한 AttributeError 방지
     for cache_dir in Path(".").rglob("__pycache__"):
         shutil.rmtree(cache_dir, ignore_errors=True)
@@ -250,6 +250,7 @@ async def _run_application(settings: Settings, check_only: bool = False) -> None
     print("-" * 50)
     for line in summary.lines():
         print(f"  {line}")
+    return summary
 
 
 def build_guard_config(g) -> "GuardConfig":
@@ -323,11 +324,42 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
         try:
             from app.reports import generate_daily_report
             generate_daily_report(settings, summary.trade_date, balance=runner.last_balance,
-                                  reconcile_report=runner.last_reconcile, session_lines=summary.lines(),
-                                  calendar=calendar, logger=app_logger)
+                                  reconcile_report=summary.final_reconcile, session_lines=summary.lines(),
+                                  calendar=calendar, logger=app_logger, today=summary.trade_date)
+            summary.report = "OK"
         except Exception as exc:
+            summary.report = f"FAILED: {type(exc).__name__}: {exc}"
             app_logger.error(f"[REPORT] 일일 리포트 생성 실패(매매 결과에는 영향 없음): {type(exc).__name__}: {exc}")
+            if summary.close_check == "VERIFIED":
+                summary.add_close_issue("REPORT_FAILED")
+                app_logger.critical("[SESSION_CLOSE] 마감 검증 NEEDS_REVIEW — REPORT_FAILED")
+        write_session_status(settings, summary, app_logger)
     return summary
+
+
+def write_session_status(settings, summary, app_logger) -> Path | None:
+    """reports/session_status_<날짜>.json — 종료 상태와 마감 검증 결과 (8-D, F5).
+
+    리포트 파일이 있다는 것만으로 하루가 정상이었다고 판단하지 않도록, 판정
+    결과를 기계가 읽을 수 있는 형태로 따로 남깁니다(원자적 쓰기)."""
+    import json as _json
+    import os as _os
+    import tempfile as _tempfile
+    try:
+        d = Path(settings.storage.reports_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"session_status_{summary.trade_date.isoformat()}.json"
+        with _tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=d, prefix=path.name + ".",
+                                          suffix=".tmp", delete=False) as fh:
+            tmp = Path(fh.name)
+            _json.dump(summary.to_status_dict(), fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            _os.fsync(fh.fileno())
+        _os.replace(tmp, path)
+        return path
+    except Exception as exc:
+        app_logger.error(f"[SESSION_STATUS] 상태 파일 저장 실패: {type(exc).__name__}: {exc}")
+        return None
 
 
 def _make_daily_bar_updater(settings, broker, calendar, state, ledger_store, app_logger):
@@ -344,18 +376,27 @@ def _make_daily_bar_updater(settings, broker, calendar, state, ledger_store, app
             calendar, backfill_pages=md.backfill_pages, logger=app_logger)
         held = set(apply_events(ledger_store.load()).positions())
         symbols = sorted(set(settings.session.watch_symbols) | held | set(state.positions))
+        from infra.market_data.daily_bar_repository import FAILED
         now = now_local()
+        failed = []
         for sym in symbols:
-            app_logger.info(f"[DAILY_BARS] {repo.update(sym, now).line()}")
+            res = repo.update(sym, now)
+            app_logger.info(f"[DAILY_BARS] {res.line()}")
+            if res.action == FAILED:
+                failed.append(sym)
+        return f"{len(failed)}/{len(symbols)}종목 실패 {failed}" if failed else ""
     return update
 
 
 def main() -> int:
-    """단타 레포 app/main.py의 main()과 동일한 종료 코드 규칙."""
+    """종료 코드: 0 정상 / 1 비정상 종료(예외) / 2 끝까지 돌았지만 마감 검증 NEEDS_REVIEW (8-D)."""
     exit_code = 0
     check_only = "--check-only" in sys.argv[1:]
     try:
-        asyncio.run(async_main(check_only=check_only))
+        summary = asyncio.run(async_main(check_only=check_only))
+        if getattr(summary, "close_check", "") == "NEEDS_REVIEW":
+            print(f"\n[주의] 마감 검증 NEEDS_REVIEW — {', '.join(summary.close_issues)} (app.log [SESSION_CLOSE])")
+            exit_code = 2
     except KeyboardInterrupt:
         print("\n[종료] Ctrl+C 감지 — 정상 종료 처리 중...")
     except Exception as exc:

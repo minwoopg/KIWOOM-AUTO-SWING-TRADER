@@ -13,6 +13,12 @@ from __future__ import annotations
   확인할 수 있게 합니다.
 
 `build_daily_report()`는 순수 함수(입력 → 문자열)입니다.
+
+기준일 원칙 (8-D, F6): 보유·누적 손익은 **기준일까지의 체결 사건만**으로
+재구성합니다. 이후 매매를 추가해도 과거 리포트의 수치는 바뀌지 않습니다.
+과거 날짜를 다시 만들 때(`historical=True`) 포지션 메타·미해결 주문·장부 대조는
+그날의 기록이 남아 있지 않으므로 표시하지 않습니다(생성 시점 값을 그날 값처럼
+보이지 않게 하기 위함).
 """
 
 import os
@@ -42,6 +48,7 @@ class ReportInputs:
     balance_available: bool = True
     session_lines: list[str] = field(default_factory=list)
     generated_at: datetime | None = None
+    historical: bool = False     # 과거 날짜 재생성 — 생성 시점 상태(메타·주문·대조) 표시 안 함
 
 
 def _won(v: float | int | None) -> str:
@@ -54,13 +61,20 @@ def _signed(v: float | int | None) -> str:
 
 def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_model=None) -> str:
     d = inp.trade_date
-    ledger = apply_events(inp.events)
+    events = [e for e in inp.events if e.trade_date <= d]
+    excluded_after = len(inp.events) - len(events)
+    ledger = apply_events(events)
     positions = ledger.positions()
+    metas = {} if inp.historical else inp.metas
     L: list[str] = []
     L.append(f"# 스윙 일일 리포트 — {d.isoformat()} ({WEEKDAYS_KO[d.weekday()]})")
     L.append("")
     gen = (inp.generated_at or datetime.now()).isoformat(timespec="seconds")
-    L.append(f"생성 {gen} · 원천: 체결 원장(`fill_ledger.jsonl`)")
+    L.append(f"생성 {gen} · 원천: 체결 원장(`fill_ledger.jsonl`, {d.isoformat()}까지의 사건만)")
+    if inp.historical:
+        L.append("")
+        L.append("> 과거 날짜 재생성 — 보유·손익은 기준일까지의 원장으로 재구성했습니다. "
+                 "포지션 메타(손절가·전략)·미해결 주문·장부 대조는 그날 기록이 없어 표시하지 않습니다.")
     L.append("")
 
     # ── 요약 ──
@@ -95,6 +109,8 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
     L.append(f"| 누적 실현손익 (비용 전) | {_signed(realized_all)} |")
     L.append("")
     notes = []
+    if excluded_after:
+        notes.append(f"기준일 이후 체결 사건 {excluded_after}건은 반영하지 않음")
     if missing_eval:
         notes.append(f"평가 제외(완성 일봉 없음): {', '.join(missing_eval)} — `tools/update_daily_bars.py`로 갱신")
     if est_hold:
@@ -115,7 +131,7 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
         L.append("| 종목 | 수량 | 평균단가 | 첫 진입일 | 보유 거래일 | 종가(기준일) | 평가손익 | 손절가 | 전략 | 비고 |")
         L.append("|---|---:|---:|---|---:|---:|---:|---:|---|---|")
         for sym, p in positions.items():
-            m = inp.metas.get(sym)
+            m = metas.get(sym)
             c = inp.closes.get(sym)
             try:
                 held_days = calendar.trading_days_between(p.first_entry_date, d)
@@ -126,7 +142,8 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
             if p.includes_estimate:
                 flags.append("추정가")
             if m is None:
-                flags.append("메타 없음")
+                if not inp.historical:
+                    flags.append("메타 없음")
             elif m.needs_review:
                 flags.append("검토 필요")
             L.append(
@@ -138,7 +155,7 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
     L.append("")
 
     # ── 당일 체결 ──
-    todays = [e for e in inp.events if e.trade_date == d]
+    todays = [e for e in events if e.trade_date == d]
     L.append("## 당일 체결 (원장)")
     L.append("")
     if not todays:
@@ -171,12 +188,16 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
     # ── 운영 상태 ──
     L.append("## 운영 상태")
     L.append("")
-    if inp.unresolved_intents or inp.journal_symbols:
+    if inp.historical:
+        L.append("- 과거 날짜 재생성 — 미해결 주문·장부 대조는 표시하지 않음(그날 세션 로그 확인)")
+    elif inp.unresolved_intents or inp.journal_symbols:
         L.append(f"- ⚠ 미해결 주문: 주문 의도 {inp.unresolved_intents or '없음'} / 저널 {inp.journal_symbols or '없음'}"
                  " — 다음 기동 시 ERROR로 복원됨, HTS 확인 후 `commands/ack_error_<종목>.json`")
     else:
         L.append("- 미해결 주문 없음")
-    if not inp.balance_available:
+    if inp.historical:
+        pass
+    elif not inp.balance_available:
         L.append("- 잔고 없이 생성 — 장부 대조 생략")
     elif inp.reconcile is None:
         L.append("- 장부 대조 결과 없음")

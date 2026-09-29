@@ -103,11 +103,11 @@ DailyBarStore(settings.market_data.daily_bars_dir).save(
                DailyBar(D, 70_500, 71_500, 70_000, 71_000, 100)],
     adjusted=True, source="t", fetched_at="t", completed_through=D)
 path = generate_daily_report(settings, D, balance=AccountBalance(1, 1, [Position("005930", 6, 70_000),
-                                                                     Position("000660", 5, 180_000)]))
+                                                                     Position("000660", 5, 180_000)]), today=D)
 body = path.read_text(encoding="utf-8")
 check("3-1) 원장·상태·일봉에서 리포트 생성", "| 005930 | 6 | 70,000 |" in body and "71,000 (2026-09-28)" in body)
 check("3-2) 잔고를 주면 장부 대조 포함(일치 — 참고 사항만)", "장부 대조" in body and "QTY_MISMATCH" not in body)
-past = generate_daily_report(settings, date(2026, 9, 23)).read_text(encoding="utf-8")
+past = generate_daily_report(settings, date(2026, 9, 23), today=D).read_text(encoding="utf-8")
 check("3-3) 지난 날짜는 그날 이하 완성 종가로 평가", "70,500 (2026-09-23)" in past)
 
 # ── 4. 마스킹 ────────────────────────────────────────────────
@@ -140,6 +140,40 @@ check("5-5) manifest에 날짜·해시·빈 파일 표시", man["trade_date"] ==
       and all("sha256" in v for v in man["files"].values()) and man["files"]["tracked_order_journal.json"]["empty"])
 check("5-6) 원장은 JSON 구조 유지", all(json.loads(l) for l in z.read("fill_ledger.jsonl").decode().splitlines()))
 check("5-7) 임시 zip 없음", not list((Path(tmp) / "exports").glob("*.tmp")))
+
+# ── 6. 8-D (F6): 과거 리포트는 기준일까지의 원장만 ───────────────
+F6_EVENTS = [ev("fb", "BUY", "005930", 10, 70_000, "2026-09-28", src="BROKER_AVG"),
+             ev("fs", "SELL", "005930", 10, 71_000, "2026-09-29", src="ORDER_ESTIMATE")]
+r = build_daily_report(ReportInputs(trade_date=D, events=F6_EVENTS, closes={"005930": (D, 70_500)},
+                                    balance_available=False, historical=True,
+                                    generated_at=datetime(2026, 9, 30, 9, 0)), calendar=cal)
+check("6-1) [F6 재현] 9/29 매도 후 9/28 재생성 → 9/28 보유 10주 유지",
+      "| 005930 | 10 | 70,000 | 2026-09-28 |" in r and "| 보유 종목 | 1 |" in r)
+check("6-2) 누적 실현손익에 이후 매도 미반영(0)", "| 누적 실현손익 (비용 전) | +0 |" in r)
+check("6-3) 이후 사건 제외 안내·과거 재생성 표시", "기준일 이후 체결 사건 1건은 반영하지 않음" in r and "과거 날짜 재생성" in r)
+r_meta = build_daily_report(ReportInputs(trade_date=D, events=F6_EVENTS, historical=True,
+                                         metas={"005930": PositionMeta("005930", strategy_id="now", stop_price=1)},
+                                         unresolved_intents=["005930"], balance_available=False), calendar=cal)
+check("6-4) 과거 재생성에는 생성 시점 메타·미해결 주문을 그날 값처럼 넣지 않음",
+      "| now |" not in r_meta and "⚠ 미해결 주문" not in r_meta)
+r29 = build_daily_report(ReportInputs(trade_date=date(2026, 9, 29), events=F6_EVENTS,
+                                      balance_available=False), calendar=cal)
+check("6-5) 9/29 리포트는 청산 반영(보유 없음, 실현 +10,000)", "보유 없음" in r29
+      and "| 누적 실현손익 (비용 전) | +10,000 |" in r29)
+tmp6 = tempfile.mkdtemp()
+s6 = build_minimal_settings(tmp6)
+st6 = FillLedgerStore(s6.storage.fill_ledger_file)
+for e in F6_EVENTS:
+    st6.append(e)
+before = generate_daily_report(s6, D, today=date(2026, 9, 30)).read_text(encoding="utf-8")
+st6.append(ev("fb2", "BUY", "000660", 1, 100_000, "2026-09-30", src="BROKER_AVG"))
+after = generate_daily_report(s6, D, today=date(2026, 9, 30)).read_text(encoding="utf-8")
+strip = lambda t: "\n".join(l for l in t.splitlines() if not l.startswith("생성 ") and "기준일 이후" not in l)
+check("6-6) 이후 매매를 추가해도 과거 리포트의 보유·손익 수치는 동일",
+      strip(before) == strip(after) and "| 005930 | 10 |" in after)
+check("6-7) 과거 재생성은 잔고를 줘도 장부 대조를 넣지 않음",
+      "LEDGER_ONLY" not in generate_daily_report(s6, D, balance=AccountBalance(1, 1, []),
+                                                 today=date(2026, 9, 30)).read_text(encoding="utf-8"))
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

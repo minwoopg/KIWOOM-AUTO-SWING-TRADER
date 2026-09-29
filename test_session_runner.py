@@ -62,6 +62,7 @@ class SimBroker(ScriptedBroker):
         self.pending: list[tuple] = []
         self.fill_ratio = 1.0
         self.fail_balance_until: datetime | None = None
+        self.fail_balance_windows: list[tuple[datetime, datetime]] = []
         self.clock = None
 
     def place_order(self, order):
@@ -72,6 +73,8 @@ class SimBroker(ScriptedBroker):
 
     def get_account_balance(self):
         if self.fail_balance_until and self.clock and self.clock() < self.fail_balance_until:
+            raise RuntimeError("kiwoom request failed: http=500")
+        if self.fail_balance_windows and self.clock and any(a <= self.clock() < b for a, b in self.fail_balance_windows):
             raise RuntimeError("kiwoom request failed: http=500")
         still = []
         for sym, side, qty in self.pending:
@@ -345,6 +348,103 @@ saved = SwingStateStore(st.storage.state_file).load()[0]
 check("13-3) 보유 메타 유지(분할청산은 청산 아님)", "005930" in saved.positions)
 check("13-4) 체결 event_id에 계좌범위·거래일·방향·종목 포함",
       all(e.event_id.count("|") == 5 and "|20260928|" in e.event_id and "|005930|" in e.event_id for e in events))
+
+# ── 14. 8-D (F5): 마감 검증 ─────────────────────────────────────
+import app.main as app_main  # noqa: E402
+
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 15, 10))
+status = json.loads((Path(st.storage.reports_dir) / "session_status_2026-09-28.json").read_text(encoding="utf-8"))
+check("14-1) 정상 하루 → COMPLETED + VERIFIED, 마감 후 잔고 시각 기록, 상태 파일",
+      s.status == "COMPLETED" and s.close_check == "VERIFIED" and s.final_balance_at >= datetime(2026, 9, 28, 15, 30)
+      and status["close_check"] == "VERIFIED" and status["report"] == "OK" and status["final_reconcile_ok"] is True)
+
+br = SimBroker()
+br.fail_balance_windows = [(datetime(2026, 9, 28, 15, 30), datetime(2026, 9, 28, 17, 0))]
+s, st, br, lg, clk = day(datetime(2026, 9, 28, 15, 10), broker=br)
+check("14-2) [F5 재현] 장중 대조는 성공, 마감 후 잔고 실패 → COMPLETED지만 NEEDS_REVIEW",
+      s.status == "COMPLETED" and s.close_check == "NEEDS_REVIEW"
+      and "FINAL_BALANCE_FAILED" in s.close_issues and "FINAL_RECONCILE_MISSING" in s.close_issues)
+check("14-3) 장중의 이전 대조를 최종 결과로 쓰지 않음", s.final_reconcile is None and s.final_reconcile_at is None)
+check("14-4) 제한 횟수(3회) 재시도 후 종료", sum("[SESSION_CLOSE] 마감 후 잔고·대조 미확보" in m
+                                              for m in logs(lg, "warning")) == 3)
+check("14-5) NEEDS_REVIEW는 CRITICAL, 요약·상태 파일에 반영",
+      any("마감 검증 NEEDS_REVIEW" in m for m in logs(lg, "critical"))
+      and any(l.startswith("마감 검증: NEEDS_REVIEW") for l in s.lines())
+      and json.loads((Path(st.storage.reports_dir) / "session_status_2026-09-28.json")
+                     .read_text(encoding="utf-8"))["close_check"] == "NEEDS_REVIEW")
+
+br = SimBroker()
+br.fail_balance_windows = [(datetime(2026, 9, 28, 15, 30), datetime(2026, 9, 28, 15, 30, 20))]
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 15, 29), broker=br)
+check("14-6) 마감 직후 일시 실패 → 재시도에서 회복하면 VERIFIED", s.close_check == "VERIFIED"
+      and s.final_balance_at is not None)
+
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 9, 58), stop_at=datetime(2026, 9, 28, 11, 0))
+check("14-7) 마감 전 중지 → STOPPED + NOT_RUN(검증 성공으로 보이지 않음)",
+      s.status == "STOPPED" and s.close_check == "NOT_RUN")
+
+br = SimBroker()
+br.positions["000660"] = 3
+br.avg["000660"] = 180_000
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 15, 10), broker=br)
+check("14-8) 마감 대조 불일치 → NEEDS_REVIEW(RECONCILE_MISMATCH)", s.close_check == "NEEDS_REVIEW"
+      and s.close_issues == ["RECONCILE_MISMATCH"])
+
+orig_kb, orig_mk = app_main.KiwoomBroker, app_main._make_daily_bar_updater
+try:
+    app_main.KiwoomBroker = SimBroker
+    app_main._make_daily_bar_updater = lambda *a, **k: (lambda d: "1/1종목 실패 ['005930']")
+
+    def bars_on(settings):
+        import dataclasses
+        return dataclasses.replace(settings, session=dataclasses.replace(settings.session,
+                                                                         update_daily_bars_after_close=True))
+    s, st, br, lg, _ = day(datetime(2026, 9, 28, 15, 10), settings_fn=bars_on)
+    check("14-9) 일봉 갱신 실패 → NEEDS_REVIEW(DAILY_BARS_FAILED), 결과 문구 기록",
+          s.close_check == "NEEDS_REVIEW" and s.close_issues == ["DAILY_BARS_FAILED"] and "005930" in s.daily_bars)
+    app_main._make_daily_bar_updater = lambda *a, **k: (lambda d: "")
+    s, *_ = day(datetime(2026, 9, 28, 15, 10), settings_fn=bars_on)
+    check("14-10) 일봉 갱신 성공 → OK, VERIFIED", s.daily_bars == "OK" and s.close_check == "VERIFIED")
+finally:
+    app_main.KiwoomBroker, app_main._make_daily_bar_updater = orig_kb, orig_mk
+
+import app.reports as app_reports  # noqa: E402
+orig_gen = app_reports.generate_daily_report
+try:
+    def boom(*a, **k):
+        raise OSError("disk full")
+    app_reports.generate_daily_report = boom
+    s, st, *_ = day(datetime(2026, 9, 28, 15, 10))
+    check("14-11) 리포트 생성 실패 → NEEDS_REVIEW(REPORT_FAILED), 상태 파일은 남음",
+          s.report.startswith("FAILED") and s.close_issues == ["REPORT_FAILED"]
+          and json.loads((Path(st.storage.reports_dir) / "session_status_2026-09-28.json")
+                         .read_text(encoding="utf-8"))["close_check"] == "NEEDS_REVIEW")
+finally:
+    app_reports.generate_daily_report = orig_gen
+
+s, *_ = day(datetime(2026, 9, 27, 9, 0))
+check("14-12) 휴장일은 마감 검증 대상 아님", s.status == "CLOSED_DAY" and s.close_check == "")
+
+# 종료 코드 (마지막에 — main()이 logging.shutdown을 부름)
+orig_am = app_main.async_main
+try:
+    from types import SimpleNamespace
+
+    async def fake_review(check_only=False):
+        return SimpleNamespace(close_check="NEEDS_REVIEW", close_issues=["FINAL_BALANCE_FAILED"])
+
+    async def fake_ok(check_only=False):
+        return SimpleNamespace(close_check="VERIFIED", close_issues=[])
+
+    async def fake_crash(check_only=False):
+        raise RuntimeError("boom")
+    codes = []
+    for fn in (fake_ok, fake_review, fake_crash):
+        app_main.async_main = fn
+        codes.append(app_main.main())
+    check("14-13) 종료 코드: VERIFIED 0 / NEEDS_REVIEW 2 / 예외 1", codes == [0, 2, 1])
+finally:
+    app_main.async_main = orig_am
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

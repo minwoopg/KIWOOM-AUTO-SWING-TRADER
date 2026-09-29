@@ -35,19 +35,25 @@ def generate_daily_report(
     session_lines: list[str] | None = None,
     calendar: TradingCalendar | None = None,
     logger=None,
+    today: date | None = None,
 ) -> Path:
+    """trade_date가 오늘(today, 기본 date.today())보다 이전이면 과거 재생성:
+    기준일까지의 원장만 쓰고, 현재 잔고·메타·주문 상태는 쓰지 않습니다 (8-D, F6)."""
     calendar = calendar or TradingCalendar.load()
+    historical = trade_date < (today or date.today())
     events = FillLedgerStore(settings.storage.fill_ledger_file).load()
     state, _ = SwingStateStore(settings.storage.state_file).load()
     try:
         journal = sorted(TrackedOrderJournalStore(settings.storage.tracked_order_journal_file).load_all())
     except Exception as exc:
         journal = [f"(저널 읽기 실패: {type(exc).__name__})"]
-    ledger = apply_events(events)
+    ledger = apply_events([e for e in events if e.trade_date <= trade_date])
     symbols = sorted(set(ledger.positions()) | {e.symbol for e in events if e.trade_date == trade_date})
     closes = latest_closes(DailyBarStore(settings.market_data.daily_bars_dir), symbols, trade_date)
-    if reconcile_report is None and balance is not None:
-        reconcile_report = reconcile(ledger, balance, state.positions,
+    if historical:
+        balance, reconcile_report = None, None
+    elif reconcile_report is None and balance is not None:
+        reconcile_report = reconcile(apply_events(events), balance, state.positions,
                                      in_flight_symbols=set(state.unresolved_order_intents) | {j for j in journal if not j.startswith("(")})
     cost_model = None
     try:
@@ -60,7 +66,7 @@ def generate_daily_report(
         trade_date=trade_date, events=events, metas=state.positions, closes=closes,
         unresolved_intents=sorted(state.unresolved_order_intents), journal_symbols=journal,
         reconcile=reconcile_report, balance_available=balance is not None or reconcile_report is not None,
-        session_lines=session_lines or [], generated_at=datetime.now(),
+        session_lines=session_lines or [], generated_at=datetime.now(), historical=historical,
     ), calendar=calendar, cost_model=cost_model)
     path = write_report(settings.storage.reports_dir, trade_date, text)
     if logger is not None:
@@ -138,6 +144,8 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
         if rb.exists() else ""
     rep = Path(st.reports_dir) / f"daily_report_{day.isoformat()}.md"
     files[rep.name] = rep.read_text(encoding="utf-8") if rep.exists() else ""
+    ss = Path(st.reports_dir) / f"session_status_{day.isoformat()}.json"   # 8-D 마감 검증 결과
+    files[ss.name] = ss.read_text(encoding="utf-8") if ss.exists() else ""
 
     manifest = {
         "trade_date": day.isoformat(), "created_at": datetime.now().isoformat(timespec="seconds"),
