@@ -286,7 +286,8 @@ class SessionRunner:
             return
         self.summary.orders_accepted += 1
         self.recorder.track(intent.symbol, intent.side, sub.result.order_id, intent.quantity,
-                            intent.reference_price, base_quantity=base_qty, base_cost=base_cost)
+                            intent.reference_price, base_quantity=base_qty, base_cost=base_cost,
+                            order_date=ctx.trade_date)
         if intent.side == "BUY" and intent.symbol not in self.state.positions:
             self.state.upsert_position_meta(PositionMeta(
                 intent.symbol, strategy_id=getattr(self.strategy, "strategy_id", ""), origin="ORDER"))

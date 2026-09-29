@@ -306,7 +306,8 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
         after_close = _make_daily_bar_updater(settings, broker, calendar, state, ledger_store, app_logger)
     runner = SessionRunner(
         broker=broker, executor=executor, state=state, ledger_store=ledger_store,
-        recorder=FillRecorder(ledger_store, logger=app_logger), calendar=calendar,
+        recorder=FillRecorder(ledger_store, logger=app_logger,
+                              scope=settings.broker.account_scope_id.strip() or "unscoped"), calendar=calendar,
         strategy=strategy or NullStrategy(), guard_config=build_guard_config(settings.guard),
         session_config=build_session_config(settings.session), logger=app_logger,
         clock=clock or now_local, sleep=sleep or _time_mod.sleep, should_stop=should_stop or (lambda: False),

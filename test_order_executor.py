@@ -496,6 +496,83 @@ e.sync()
 check("18-10) 보관된 실패 명령은 다시 처리되지 않음(같은 폴링 반복에도 ERROR 유지)",
       e.st("005930").lifecycle == L.ERROR and len(list((e.cmd_dir / "failed").glob("*.json"))) == 1)
 
+# ── 19. 분할청산: 주문 종료 ≠ 전량 청산 (8-C, F2) ───────────────
+def held100():
+    e = Env()
+    e.broker.positions["005930"] = 100
+    e.sync()
+    return e
+
+e = held100()
+check("19-0) 준비: 100주 OPEN", e.st("005930").lifecycle == L.OPEN)
+e.ex.submit_sell("005930", 30, 70_000)
+check("19-1) 매도 30주 요청 → 목표 잔고 70 고정, 저널에도 70",
+      e.st("005930").expected_final_quantity == 70 and e.journal()["005930"].target_quantity_after_order == 70
+      and e.journal()["005930"].base_quantity_before_order == 100)
+e.broker.positions["005930"] = 70
+e.sync()
+check("19-2) [F2 재현] 30주 전부 체결(잔고 70) → OPEN, 미해결 주문 없음",
+      e.st("005930").lifecycle == L.OPEN and not e.ex.has_unresolved_orders()
+      and e.st("005930").pending_order_id is None and e.st("005930").known_quantity == 70)
+check("19-3) 저널·주문 의도 정리", "005930" not in e.journal() and "005930" not in e.ex.state.unresolved_order_intents)
+check("19-4) 분할청산은 청산 훅을 부르지 않고 보류 컨텍스트만 정리",
+      e.closes == [] and "005930" not in e.ex._pending_sell_side_effects)
+sub = e.ex.submit_sell("005930", 70, 70_000)
+e.broker.positions["005930"] = 0
+e.sync()
+check("19-5) 이어서 남은 70주 전량 매도 → FLAT, 청산 훅 1회",
+      sub.accepted and e.st("005930").lifecycle == L.FLAT and len(e.closes) == 1)
+
+e = held100()
+e.ex.submit_sell("005930", 30, 70_000)
+e.broker.positions["005930"] = 90
+e.sync()
+check("19-6) 30주 중 10주만 체결(잔고 90) → SELL_PENDING 유지(차단)",
+      e.st("005930").lifecycle == L.SELL_PENDING and e.ex.has_unresolved_orders()
+      and e.ex.submit_sell("005930", 10, 70_000).block_code != "")
+e.age("005930", 120)
+e.sync()
+check("19-7) 타임아웃 → OPEN이지만 orphan으로 계속 차단(원 주문 잔여 20주가 살아 있을 수 있음)",
+      e.st("005930").lifecycle == L.OPEN and e.ex.position_state_machine.has_orphan_order("005930"))
+e.broker.positions["005930"] = 80
+e.sync()
+check("19-8) 목표(70) 미도달 변화는 orphan 유지", e.ex.position_state_machine.has_orphan_order("005930"))
+e.broker.positions["005930"] = 70
+e.sync()
+check("19-9) 목표 잔고 70 도달 → orphan 해제", not e.ex.position_state_machine.has_orphan_order("005930")
+      and not e.ex.has_unresolved_orders())
+
+e = held100()
+e.ex.submit_sell("005930", 100, 70_000)
+e.broker.positions["005930"] = 0
+e.sync()
+check("19-10) 전량 매도(100→0)는 기존과 같이 FLAT", e.st("005930").lifecycle == L.FLAT and len(e.closes) == 1)
+
+e = held100()
+e.ex.submit_sell("005930", 30, 70_000)
+e.broker.positions["005930"] = 60
+e.sync()
+check("19-11) 요청보다 더 줄어듦(100→60, 목표 70) → ERROR (HTS 매도 겹침 등)",
+      e.st("005930").lifecycle == L.ERROR and e.st("005930").last_error == "UNEXPECTED_QUANTITY_DECREASE")
+
+e = held100()
+e.ex.submit_sell("005930", 30, 70_000)
+e.age("005930", 31)
+e.broker.status["0000001"] = BrokerOrderStatus.FILLED
+e.broker.positions["005930"] = 90
+e.sync()
+check("19-12) 체결조회 FILLED여도 잔고(90)가 목표(70)와 다르면 확정 안 함",
+      e.st("005930").lifecycle == L.SELL_PENDING)
+
+e = held100()
+e.ex.submit_sell("005930", 30, 70_000)
+tmp = e.tmp
+e2 = Env(tmpdir=tmp)
+e2.broker.positions["005930"] = 70
+e2.ex.restore_order_recovery_blocks()
+check("19-13) 분할청산 도중 재시작 → 저널 목표 70 보존, 자동 확정 없이 ERROR 복원(사람 확인)",
+      e2.journal()["005930"].target_quantity_after_order == 70 and e2.st("005930").lifecycle == L.ERROR)
+
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:

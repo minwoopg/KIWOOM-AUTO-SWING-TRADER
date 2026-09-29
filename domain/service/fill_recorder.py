@@ -18,8 +18,12 @@ from __future__ import annotations
     역산 값이 0 이하이거나 요청 수량을 넘는 변화가 섞이면 주문가 추정(ORDER_ESTIMATE).
   - 매도: 잔고로는 체결가를 알 수 없어 주문 직전 시세(ORDER_ESTIMATE).
     체결조회 증거로 실제 체결가를 붙이는 것은 이후 과제.
-- event_id = "{주문번호}:{누적 체결수량}" → 재시작·재폴링해도 같은 체결이 두 번
-  기록되지 않음(원장이 같은 id를 무시).
+- event_id = "{계좌범위}|{주문 거래일}|{매수/매도}|{종목}|{주문번호}|{누적 체결수량}"
+  → 같은 주문의 재폴링은 같은 id라 두 번 기록되지 않고(원장이 같은 id를 무시),
+  다른 날·다른 계좌에서 같은 주문번호가 다시 나와도 다른 사건으로 구분됨
+  (8-C, F4 — 이전 형식 "{주문번호}:{누적수량}"은 거래일·계좌 범위가 없었음.
+  이미 기록된 이전 형식 사건은 그대로 유효하며 새 형식과 겹치지 않음).
+  계좌범위는 설정의 `broker.account_scope_id`(계좌번호 아님).
 - 추적 정보는 메모리에만 있습니다. 주문 도중 재시작하면 `OrderExecutor`가 그
   종목을 ERROR로 복원하고, 원장·잔고 불일치는 기동 점검에서 보고됩니다 —
   사람이 확인한 뒤 사건을 추가하는 것이 원칙입니다.
@@ -41,6 +45,7 @@ class TrackedOrder:
     base_quantity: int         # 접수 직전 잔고 수량
     base_cost: int             # 접수 직전 잔고 원가(평균단가 × 수량) — 매수 원가 역산용
     reference_price: int
+    order_date: date | None = None   # 주문 접수 거래일 (event_id 범위)
     filled_quantity: int = 0
     recorded_cost: int = 0     # 이 주문으로 기록한 매수 원가 합계
 
@@ -50,9 +55,13 @@ class TrackedOrder:
 
 
 class FillRecorder:
-    def __init__(self, ledger_store, logger=None) -> None:
+    def __init__(self, ledger_store, logger=None, *, scope: str = "default") -> None:
+        scope = str(scope or "").strip()
+        if not scope or any(c in scope for c in "|\r\n"):
+            raise ValueError(f"체결 원장 계좌 범위(scope)가 비었거나 '|'·줄바꿈 포함: {scope!r}")
         self.ledger_store = ledger_store
         self.logger = logger
+        self.scope = scope
         self._orders: dict[str, TrackedOrder] = {}
 
     @property
@@ -60,7 +69,8 @@ class FillRecorder:
         return dict(self._orders)
 
     def track(self, symbol: str, side: str, order_id: str, requested_quantity: int,
-              reference_price: int, *, base_quantity: int, base_cost: int) -> None:
+              reference_price: int, *, base_quantity: int, base_cost: int,
+              order_date: date | None = None) -> None:
         """접수(accepted)된 주문을 추적 대상으로 등록. 주문번호가 없으면 등록하지 않음
         (event_id를 만들 수 없음 — 사람 확인 대상)."""
         if not str(order_id or "").strip():
@@ -71,7 +81,12 @@ class FillRecorder:
             if self.logger is not None:
                 self.logger.critical(f"[FILL_RECORDER] {symbol} 이미 추적 중인 주문 위에 새 주문 — 이전 추적 종료")
         self._orders[symbol] = TrackedOrder(symbol, side, str(order_id).strip(), requested_quantity,
-                                            base_quantity, base_cost, reference_price)
+                                            base_quantity, base_cost, reference_price, order_date=order_date)
+
+    def event_id(self, order: TrackedOrder, filled_now: int, trade_date: date) -> str:
+        order_date = order.order_date or trade_date
+        return (f"{self.scope}|{order_date:%Y%m%d}|{order.side}|{order.symbol}|"
+                f"{order.order_id}|{filled_now}")
 
     def stop_tracking(self, symbol: str) -> TrackedOrder | None:
         return self._orders.pop(symbol, None)
@@ -99,7 +114,7 @@ class FillRecorder:
                 if broker_qty == prev_qty + delta and derived > 0:
                     price, source = int(round(derived)), "BROKER_AVG"
             ev = FillEvent(
-                event_id=f"{order.order_id}:{filled_now}", kind=order.side, symbol=sym,
+                event_id=self.event_id(order, filled_now, trade_date), kind=order.side, symbol=sym,
                 quantity=delta, price=price, price_source=source, trade_date=trade_date,
                 occurred_at=now, order_id=order.order_id,
                 note=f"잔고 변화 기록 ({order.base_quantity}→{broker_qty}주)",

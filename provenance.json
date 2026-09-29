@@ -67,9 +67,10 @@
       "status": "new"
     },
     "domain/position/lifecycle.py": {
-      "status": "unchanged",
+      "status": "modified",
       "source_path": "domain/position/lifecycle.py",
-      "source_sha256": "f7d56b78191e2752880e1d5c52956b5716984739faf72399b8191bd8f526f8b6"
+      "source_sha256": "f7d56b78191e2752880e1d5c52956b5716984739faf72399b8191bd8f526f8b6",
+      "note": "8-C: 매도 주문 목표 잔고(분할청산) — 전량매도 판정은 원본과 동일"
     },
     "domain/position/position_book.py": {
       "status": "new"

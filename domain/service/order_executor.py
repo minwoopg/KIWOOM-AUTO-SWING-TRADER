@@ -292,9 +292,8 @@ class OrderExecutor:
                 side=side,
                 order_id=str(order_id).strip(),
                 base_quantity_before_order=state.base_quantity_before_order,
-                target_quantity_after_order=(
-                    state.expected_final_quantity if side == "BUY" else 0
-                ),
+                # 스윙 8-C (F2): SELL도 주문별 목표 잔고(분할청산이면 >0) 기록.
+                target_quantity_after_order=state.expected_final_quantity,
                 accepted_at=datetime.now(),
                 lifecycle_kind="BUY_PENDING" if side == "BUY" else "SELL_PENDING",
             )
@@ -675,6 +674,18 @@ class OrderExecutor:
                     and _lifecycle_before_sync != PositionLifecycle.FLAT
                     and symbol in self._pending_sell_side_effects):
                 self._apply_sell_closed(symbol)
+            # 스윙 8-C (F2): 분할청산 주문 종료(SELL_PENDING → OPEN, 주문 정보 정리됨)
+            # — 청산 훅은 전량 청산에만 쓰므로 호출하지 않고 보류 컨텍스트만 정리.
+            _st = psm.get(symbol)
+            if (_lifecycle_before_sync == PositionLifecycle.SELL_PENDING
+                    and _st.lifecycle == PositionLifecycle.OPEN
+                    and not _st.pending_order_id and not _st.orphan_order_id
+                    and symbol in self._pending_sell_side_effects):
+                ctx = self._pending_sell_side_effects.pop(symbol)
+                self.app_logger.info(
+                    f"[ORDER] {symbol} | 분할청산 주문 종료 확인 | 주문번호 {ctx.get('order_id')} | "
+                    f"남은 보유 {_st.known_quantity}주"
+                )
 
             # 첫 실체결(수량이 주문 전보다 늘어남) 시점에만 매수 부작용 실행
             _psm_state_now = psm.get(symbol)
@@ -997,21 +1008,23 @@ class OrderExecutor:
                     f"잔고 API 반영 지연일 수 있음, 상태 유지"
                 )
         elif kind == "SELL_PENDING":
-            if broker_qty == 0:
+            # 스윙 8-C (F2): 주문 FILLED 증거 + 잔고가 이 주문의 목표 잔고와 일치할 때만
+            # 확정 (전량매도면 0 — 원본과 동일, 분할청산이면 남은 수량).
+            expected = state.expected_final_quantity
+            if broker_qty == expected:
                 self._position_state_machine.on_sell_result(
-                    symbol, accepted=True, broker_quantity=0)
+                    symbol, accepted=True, broker_quantity=broker_qty)
             else:
                 self.app_logger.warning(
                     f"[ORDER_STATUS_BALANCE_MISMATCH] {symbol} | kind=SELL_PENDING | "
                     f"order_id={order_id} | order_status=FILLED | "
-                    f"broker_qty={broker_qty} | expected=0 — "
+                    f"broker_qty={broker_qty} | expected={expected} — "
                     f"잔고 API 반영 지연일 수 있음, 상태 유지"
                 )
         elif kind == "ORPHAN":
-            target = (0 if state.orphan_expected_delta < 0
-                      else state.expected_final_quantity)
+            target = state.expected_final_quantity   # 8-C: SELL도 주문별 목표 잔고
             matched = (
-                (state.orphan_expected_delta < 0 and broker_qty == 0)
+                (state.orphan_expected_delta < 0 and broker_qty == state.expected_final_quantity)
                 or (state.orphan_expected_delta > 0
                     and broker_qty == state.expected_final_quantity)
             )

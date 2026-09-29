@@ -20,6 +20,14 @@ order_executor.py를 고친 뒤 원본과 어긋나지 않았는지 확인할 �
 - 원본 첫 체결/청산 부작용(진입시각·손실카운트·알림)은 컨텍스트 pop +
   호출 기록으로 대체 (내용은 단타 규칙이라 비교 대상 아님)
 - 원본 강제 매도는 사유 문자열("강제청산 테스트")로, 새 구현은 forced=True로 지정
+
+의도적 차이 (스윙 8-C, F2 분할청산):
+- 새 구현은 매도 요청 시 PSM의 base_quantity_before_order / requested_quantity /
+  expected_final_quantity를 매도 주문 기준(목표 잔고 = 보유 − 요청)으로 기록하고,
+  저널의 SELL 기록에도 주문 직전 보유 수량을 남깁니다. 원본은 이 값들을 매수 때
+  값 그대로 두었습니다(매도 경로에서 읽지 않음). 그래서 한 종목에 매도를 요청한
+  단계부터 다음 매수 요청 전까지 이 세 필드와 저널 SELL 기록의 base 값은 비교에서
+  제외합니다. 판정 결과(lifecycle·pending·목표 0 등)는 그대로 비교합니다.
 """
 import argparse
 import json
@@ -41,6 +49,32 @@ def run(mode, repo, name):
     return json.loads(r.stdout.strip().splitlines()[-1]), None
 
 
+SELL_FIELDS = ("base_quantity_before_order", "requested_quantity", "expected_final_quantity")
+
+
+def mask_sell_fields(snaps):
+    """매도 요청 이후(다음 매수 요청 전까지) 해당 종목의 매도 기준 필드를 가립니다."""
+    after_sell: set[str] = set()
+    out = []
+    for snap in snaps:
+        step = snap["step"]
+        if step and step[0] == "sell":
+            after_sell.add(step[1])
+        elif step and step[0] == "buy":
+            after_sell.discard(step[1])
+        snap = json.loads(json.dumps(snap))
+        for sym in after_sell:
+            st = (snap.get("psm") or {}).get(sym)
+            if isinstance(st, dict):
+                for f in SELL_FIELDS:
+                    st.pop(f, None)
+            rec = (snap.get("journal") or {}).get(sym)
+            if isinstance(rec, list) and rec and rec[0] == "SELL" and len(rec) > 2:
+                rec[2] = "*"
+        out.append(snap)
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--orig", default=os.path.join(HERE, "..", "..", "..", "KIWOOM-AUTO-TRADER"),
@@ -56,6 +90,7 @@ def main() -> int:
             print("ERROR", name, eo or en)
             bad += 1
             continue
+        o, n = mask_sell_fields(o), mask_sell_fields(n)
         diffs = [(i, a["step"], k, a[k], b[k])
                  for i, (a, b) in enumerate(zip(o, n)) for k in a
                  if k != "res" and a[k] != b[k]]

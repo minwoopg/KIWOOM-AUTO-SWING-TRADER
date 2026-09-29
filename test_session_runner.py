@@ -330,6 +330,22 @@ s, st, br, lg, _ = day(datetime(2026, 9, 28, 9, 58), strategy=buy_b(), broker=he
 check("12-3) 원가 150만이지만 현재가 평가 210만 → 한도 200만 초과로 차단",
       s.denied_codes.get("TOTAL_EXPOSURE_LIMIT") == 1 and br.place_calls == [])
 
+# ── 13. 8-C: 분할청산 하루 + 체결 식별자 ─────────────────────────
+strat = ScriptStrategy([(time(10, 0), OrderIntent("005930", "BUY", 20, 70_000, reason="entry")),
+                        (time(11, 0), OrderIntent("005930", "SELL", 6, 71_000, reason="partial exit"))])
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 9, 58), strategy=strat,
+                       quote_source=StaticQuoteSource({"005930": 70_000}))
+events = FillLedgerStore(st.storage.fill_ledger_file).load()
+led = apply_events(events)
+check("13-1) 20주 매수 → 6주 분할청산: 원장 보유 14주, 실현 6주, 주문 2건 전송",
+      led.position("005930") is not None and led.position("005930").quantity == 14
+      and sum(r.quantity for r in led.realized) == 6 and len(br.place_calls) == 2)
+check("13-2) 마감 시 미해결 주문 없음, 장부 대조 일치", not s.unresolved_at_end and s.final_reconcile.ok)
+saved = SwingStateStore(st.storage.state_file).load()[0]
+check("13-3) 보유 메타 유지(분할청산은 청산 아님)", "005930" in saved.positions)
+check("13-4) 체결 event_id에 계좌범위·거래일·방향·종목 포함",
+      all(e.event_id.count("|") == 5 and "|20260928|" in e.event_id and "|005930|" in e.event_id for e in events))
+
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:

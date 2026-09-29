@@ -457,6 +457,13 @@ class PositionStateMachine:
         state.partial_fill_since = None
         state.sell_base_quantity = state.known_quantity
         state.observed_quantity = state.known_quantity
+        # 스윙 8-C (F2): 분할청산을 위해 매도 주문의 목표 잔고를 고정합니다.
+        # 원본(단타)은 항상 전량매도라 목표가 암묵적으로 0이었고, 이 값은
+        # 매수 때의 값이 그대로 남아 있었습니다(매도 경로에서 읽지 않음).
+        # 전량매도면 target=0으로 원본과 같은 판정이 됩니다.
+        state.base_quantity_before_order = state.known_quantity
+        state.requested_quantity = quantity
+        state.expected_final_quantity = max(state.known_quantity - quantity, 0)
         detail = f"qty={quantity}"
         if was_error:
             detail += " (직전 ERROR 상태에서 매도 시도 — 이상치 정리 시도로 추정)"
@@ -488,15 +495,36 @@ class PositionStateMachine:
 
         sell_base = state.sell_base_quantity or state.known_quantity
         state.observed_quantity = broker_quantity
+        # 스윙 8-C (F2): 주문 목표 잔고. 전량매도면 0 (원본과 동일 판정).
+        target = min(max(state.expected_final_quantity, 0), sell_base)
 
-        if broker_quantity == 0:
+        if broker_quantity == 0 and target == 0:
             # 전량 체결 — 여기서만 FLAT
             state.lifecycle = PositionLifecycle.FLAT
             state.known_quantity = 0
             state.sell_base_quantity = 0
             self._reset_transient_block_state(state)
             detail = "FILLED_FULL"
-        elif 0 < broker_quantity < sell_base:
+        elif broker_quantity == target and target > 0:
+            # 스윙 8-C (F2): 분할청산 주문이 요청 수량만큼 모두 체결 —
+            # 주문은 종료, 포지션은 남은 수량으로 OPEN 유지.
+            state.lifecycle = PositionLifecycle.OPEN
+            state.known_quantity = broker_quantity
+            state.sell_base_quantity = 0
+            detail = f"FILLED_PARTIAL_EXIT(sell_base={sell_base}, remaining={broker_quantity})"
+        elif 0 <= broker_quantity < target:
+            # 스윙 8-C (F2): 요청보다 더 많이 줄어듦 — 다른 매도(HTS 등)가
+            # 겹쳤거나 데이터 이상. 자동 확정하지 않고 ERROR.
+            state.lifecycle = PositionLifecycle.ERROR
+            state.known_quantity = broker_quantity
+            state.last_error = "UNEXPECTED_QUANTITY_DECREASE"
+            state.error_since = datetime.now()
+            self._log_event(
+                symbol, "SELL_RESULT", prev, state.lifecycle, broker_quantity,
+                f"UNEXPECTED_QUANTITY_DECREASE(sell_base={sell_base}, target={target}, actual={broker_quantity})",
+            )
+            return
+        elif target < broker_quantity < sell_base:
             # 2026-08-10 (1P0.2, 재현 확인): 기존엔 부분체결을 OPEN으로
             # 되돌리고 pending 정보를 지웠습니다. 그러면 원 SELL 주문의
             # 나머지가 아직 살아 있는데도 "새 포지션"으로 보여 추가 SELL을
@@ -772,8 +800,10 @@ class PositionStateMachine:
         추가로 체결된 것뿐일 수 있고, 원 주문의 나머지 300주는 여전히
         브로커에 살아있을 수 있습니다. 부분 변화는 증거가 아닙니다.
 
-        이 시스템은 항상 전량매도만 하므로(설계 불변), SELL orphan의
-        유일한 확실한 종료 증거는 **잔고 0 도달**입니다. BUY orphan은
+        (원본) 이 시스템은 항상 전량매도만 하므로(설계 불변), SELL orphan의
+        유일한 확실한 종료 증거는 **잔고 0 도달**입니다.
+        (스윙 8-C) 분할청산을 허용하므로 SELL orphan의 종료 증거는 **주문 시
+        고정한 목표 잔고(expected_final_quantity) 도달**입니다 — 전량매도면 0. BUY orphan은
         `expected_final_quantity`(주문 시작 시 고정된 목표)에 정확히
         도달했을 때만 확정합니다. 그 외의 모든 변화는 진단 로그만
         남기고 orphan을 유지합니다 — 필요하면 `acknowledge_orphan()`
@@ -782,9 +812,11 @@ class PositionStateMachine:
         state = self.get(symbol)
         if not state.orphan_order_id:
             return None
-        if state.orphan_expected_delta < 0 and broker_quantity == 0:
-            note = "잔고 0 도달 (SELL orphan 완전 체결 확인)"
-            self.clear_orphan(symbol, note, terminal_quantity=0)
+        if state.orphan_expected_delta < 0 and broker_quantity == state.expected_final_quantity:
+            # 스윙 8-C (F2): 분할청산이면 목표 잔고(>0), 전량매도면 0 (원본과 동일).
+            note = (f"목표수량({broker_quantity}) 도달 (SELL orphan 완전 체결 확인)"
+                    if broker_quantity else "잔고 0 도달 (SELL orphan 완전 체결 확인)")
+            self.clear_orphan(symbol, note, terminal_quantity=broker_quantity)
             return note
         if state.orphan_expected_delta > 0 and broker_quantity == state.expected_final_quantity:
             note = f"목표수량({state.expected_final_quantity}) 도달 (BUY orphan 완전 체결 확인)"
@@ -877,7 +909,9 @@ class PositionStateMachine:
                 # block으로 이관해 새 SELL을 계속 막습니다(아래).
                 state.lifecycle = PositionLifecycle.OPEN
                 state.known_quantity = broker_quantity
-            if broker_quantity > 0 and state.pending_order_id:
+            # 스윙 8-C (F2): 목표 잔고(분할청산이면 >0)보다 많이 남았을 때만
+            # 원 주문이 살아 있을 수 있음 → orphan. 전량매도면 원본과 동일.
+            if broker_quantity > max(state.expected_final_quantity, 0) and state.pending_order_id:
                 state.orphan_order_id = state.pending_order_id
                 state.orphan_since = datetime.now()
                 state.orphan_expected_delta = -broker_quantity
