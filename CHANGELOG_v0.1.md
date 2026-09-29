@@ -511,4 +511,36 @@ GPT 재검토(`08c6eab` 기준, F1·F3·F4·F6·F8 해결 확인)에서 잔여 4
 ### 전달 파일
 - 패치 0001 (fix), 0002 (CHANGELOG/README)
 
+## 2026-09-30 — 8-G: 명령 확보 재시도, 테스트의 운영 폴더 격리 (GPT 재검토 `c9cbfa9` P2 2건)
+
+### 배경
+- GPT 재검토: 8-F의 P1(재시작 후 옛 명령) 해결 확인, Actions 4환경 성공. P2 2건:
+  1. `_claim_failed`가 로그 억제뿐 아니라 **실행 재시도까지** 막아, 일시적 잠금이 풀려도 파일을 고치거나 재시작하기 전까지 ERROR 유지.
+  2. `run_session()`이 `commands_dir`를 넘기지 않아 기본 `commands/` 사용 → 회귀 테스트가 저장소의 `commands/recovery_required.json`을 수정.
+     실행 산출물인 이 파일이 git에 커밋돼 있었음.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `domain/service/order_executor.py` | `_claim_failed`를 시그니처 → 마지막 실패 시각으로 바꿔 **로그 1회 + 30초(`CLAIM_RETRY_SEC`) 간격 재확보**. 재확보 성공 시 WARNING 후 실행(확보 뒤 `recovery_id` 검사는 그대로). 기동 시 복구 대상이 없어도 목록 파일을 빈 목록으로 갱신 |
+| `config/settings.py/.yaml` | `storage.commands_dir: commands` |
+| `app/main.py` | 실행기에 `settings.storage.commands_dir` 전달 |
+| `testing_helpers.py` | 테스트 설정의 `commands_dir`를 임시 폴더로 |
+| `.gitignore`, `commands/recovery_required.json` | `commands/` 제외, 커밋된 목록 파일 삭제(기동 시 재생성) |
+| 테스트 | `test_order_executor` 140→144(21-3b·c 재시도, 21-9 확보 실패+재시작 한 시나리오, 21-10 빈 목록), `test_session_runner` 62→64(16절: 임시 commands 사용, 저장소 `commands/` 전후 동일) |
+
+### 테스트 및 검증
+- 완료 기준 1: 일시 확보 실패 → 권한 복구 → 파일 수정·재시작 없이 정확히 1회 처리(21-3c).
+- 완료 기준 2: 회귀 전후 `git status` 동일, 저장소 `commands/`에 파일 생성·변경 없음(16-2 + 수동 확인).
+- `run_regression_tests.py --skip test_broker_order_status.py`: 24개 전부 통과. 단타 원본 동등성 18/18.
+
+### 운영 참고
+- 패치 적용 시 추적 중이던 `commands/recovery_required.json`이 삭제되지만, 다음 기동 때 현재 상태로 다시 만들어집니다.
+
+### 다음 작업
+- 9: 전략 없는 다일 장애 통합 검증.
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

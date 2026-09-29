@@ -133,12 +133,13 @@ if sub.block_code: ...                                # 주문 안전 게이트�
   `commands/ack_orphan_{종목}.json` 파일로만 해제됩니다. **명령에는 현재 복구 사건 ID(`recovery_id`)가
   있어야 합니다(8-F)** — ID는 app.log `[RECOVERY_REQUIRED]`와 `commands/recovery_required.json`(명령 템플릿 포함)에
   나옵니다. 재시작하면 복원된 ERROR에 새 ID가 붙으므로, 이전 사건·재시작 전에 쓴 명령은 적용되지 않습니다.
+  폴더는 `storage.commands_dir`(기본 `commands`)이며 실행 산출물이라 git에서 제외합니다. 목록 파일은 기동할 때마다 새로 씁니다.
 
   ```powershell
   $body = @{ recovery_id = "ERROR-005930-1a2b3c4d"; broker_quantity = 10; note = "HTS 확인" } | ConvertTo-Json
   $body | Out-File -Encoding utf8 commands\ack_error_005930.json
   ```
-- 명령은 실행 **전에** `commands/processing/`으로 옮겨 확보하고(못 옮기면 실행 안 함), 실행 후 `commands/processed/`
+- 명령은 실행 **전에** `commands/processing/`으로 옮겨 확보하고(못 옮기면 이번에는 실행 안 하고 30초 간격으로 재확보 시도), 실행 후 `commands/processed/`
   또는 사유(`.error.txt`)와 함께 `commands/failed/`로 옮깁니다. 보관에 실패하면 원문은 `processing/`에 그대로 남으며
   다시 실행되지 않습니다(재시작 포함). 실행 결과와 보관 결과는 로그에 따로 남습니다. BOM 있는 UTF-8도 허용.
 
