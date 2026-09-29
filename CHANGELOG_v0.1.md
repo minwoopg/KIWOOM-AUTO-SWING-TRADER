@@ -331,4 +331,39 @@
 ### 전달 파일
 - 패치 0001 (fix), 0002 (CHANGELOG/README)
 
+## 2026-09-29 — 8-B: 장부 대조 종목 단위화, 계좌 전체 노출 한도 (GPT 기반 검토 F1·F3)
+
+### 배경
+- F1: `reconcile(orders_in_flight=bool)`이 계좌 전체 하나의 값이라, B종목 주문이 미해결이면
+  A종목 수량 불일치도 BLOCK에서 빠짐. 원장 100주·잔고 10주인 A의 100주 매도가 브로커까지 도달.
+- F3: 총 노출을 원장 보유만 합산하고, 현재가는 주문 종목 하나만 넘겨 다른 보유는 원가로 평가.
+  원장 밖 보유가 노출에서 빠지고, 보유 종목이 오르면 노출을 과소평가.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `domain/position/position_book.py` | `reconcile(in_flight_symbols=...)` — 미해결 주문이 걸린 **그 종목**의 수량 차이만 INFO. `ReconcileReport.blocking_symbols`, `orders_in_flight`는 속성으로 유지 |
+| `domain/service/order_executor.py` | `unresolved_symbols()` 추가 (의도 기록 ∪ PENDING ∪ orphan 종목). 기존 동작 변경 없음 |
+| `domain/risk/account_guard.py` | 매도: 원장 수량과 **잔고 수량** 모두 확인(`SELL_EXCEEDS_BROKER`). 매수: 계좌 불일치 있으면 전 종목 보류(`ACCOUNT_RECONCILE_BLOCKED`), 금액 모르는 미해결 주문 있으면 보류(`PENDING_AMOUNT_UNKNOWN`), 보유 종목 현재가 누락 시 보류(`PRICE_UNKNOWN`), 노출 = Σ max(원장, 잔고) × 현재가 + 미체결 매수 예약금 + 주문×(1+여유%). `buy_price_buffer_pct`(기본 1%) 추가 |
+| `infra/market_data/quote_source.py` (신규) | `KiwoomQuoteSource`(ka10001, 1초 간격, 실패 종목은 빠짐), `StaticQuoteSource`(테스트용) |
+| `app/session_runner.py` | 대조를 종목 단위로, 매수 의도 시 보유 종목 현재가를 폴링당 1회 조회, 미체결 매수 예약금 계산, 불일치 종목 메타는 미해결 주문 종목만 정리 보류. `TickContext.in_flight_symbols` 추가 |
+| `app/main.py`, `app/reports.py` | 시작·리포트 대조도 종목 단위. KiwoomBroker면 `KiwoomQuoteSource` 연결(모의 브로커는 없음 → 보유 중 매수 보류) |
+| `config/settings.py/.yaml` | `guard.buy_price_buffer_pct: 1.0` |
+| 테스트 | `test_account_guard` 26→39, `test_position_book` 14→16, `test_session_runner` 32→38, `test_quote_source` 6(신규) |
+
+### 테스트 및 검증
+- 재현 고정: 7-1·11-2(F1: B 미체결 중 A 불일치 매도 전송 0회), 7-6·12-3(F3: 원장 밖 보유·현재가 급등 차단), 7-7·12-1(현재가 누락 보류).
+- `run_regression_tests.py --skip test_broker_order_status.py`: 24개 전부 통과. 단타 원본 동등성 18/18.
+
+### 변경하지 않은 것
+- `OrderExecutor`의 주문 게이트·상태 전이(원본 동등성 유지), 매매 로직.
+- 매도에는 금액·종목 수 한도를 적용하지 않음(기존과 같음).
+- 대기 중인 매도 주문의 수량 예약(동시 매도 중복)은 `OrderExecutor`의 PENDING 차단에 맡김.
+
+### 다음 작업
+- 8-C: F2 분할청산(주문 완료 ≠ 전량 청산), F4 체결 event_id 범위.
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
