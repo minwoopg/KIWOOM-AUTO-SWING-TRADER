@@ -20,7 +20,9 @@ from app.main import run_session
 from domain.models import AccountBalance, OrderResult, Position
 from domain.position.lifecycle import PositionLifecycle as L
 from domain.service.lot_ledger import apply_events
+from domain.position.position_book import opening_events_from_balance
 from domain.strategy.interface import OrderIntent
+from infra.market_data.quote_source import StaticQuoteSource
 from infra.storage.fill_ledger import FillLedgerStore
 from infra.storage.swing_state_store import SwingStateStore
 from testing_helpers import ScriptedBroker, build_minimal_settings
@@ -120,7 +122,7 @@ class ScriptStrategy:
         self.ended += 1
 
 
-def day(start, strategy=None, broker=None, stop_at=None, settings_fn=None):
+def day(start, strategy=None, broker=None, stop_at=None, settings_fn=None, quote_source=None):
     tmp = tempfile.mkdtemp()
     settings = build_minimal_settings(tmp)
     if settings_fn:
@@ -130,7 +132,8 @@ def day(start, strategy=None, broker=None, stop_at=None, settings_fn=None):
     broker.clock = clock
     logger = Mock()
     summary = run_session(settings, broker, logger, strategy=strategy, clock=clock, sleep=clock.sleep,
-                          should_stop=(lambda: stop_at is not None and clock.now >= stop_at))
+                          should_stop=(lambda: stop_at is not None and clock.now >= stop_at),
+                          quote_source=quote_source)
     return summary, settings, broker, logger, clock
 
 
@@ -256,6 +259,76 @@ check("10-1) 원장 손상 감지 → 신규 주문 중단 (프로세스 중단 
       and s.status == "COMPLETED")
 check("10-2) 중단 후 전략 주문은 전송되지 않음", ("005930", "BUY", 1) not in br.place_calls[1:]
       and len(br.place_calls) <= 1)
+
+# ── 11. 8-B F1: 다른 종목 미해결 주문 중에도 불일치 종목 매도 차단 ──
+class DriftBroker(SimBroker):
+    """10:10부터 005930 잔고가 10주로 줄어듦 (HTS 수동 매도 흉내)."""
+
+    def get_account_balance(self):
+        if self.clock and self.clock() >= datetime(2026, 9, 28, 10, 10):
+            self.positions["005930"] = 10
+        return super().get_account_balance()
+
+
+def seed_005930_100(settings):
+    FillLedgerStore(settings.storage.fill_ledger_file).append(opening_events_from_balance(
+        AccountBalance(0, 0, [Position("005930", 100, 70_000)]), ["005930"],
+        datetime(2026, 9, 25).date(), note="test")[0])
+    return settings
+
+
+br = DriftBroker()
+br.positions["005930"] = 100
+br.avg["005930"] = 70_000
+br.fill_ratio = 0.0                  # 000660 매수는 체결되지 않고 미해결로 남음
+strat = ScriptStrategy([(time(10, 0), OrderIntent("000660", "BUY", 1, 180_000, reason="pending B")),
+                        (time(10, 20), OrderIntent("005930", "SELL", 100, 70_000, reason="sell A"))])
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 9, 58), strategy=strat, broker=br, settings_fn=seed_005930_100,
+                       quote_source=StaticQuoteSource({"005930": 70_000}))
+check("11-1) 준비: 000660 매수 전송(미체결)", br.place_calls[:1] == [("000660", "BUY", 1)])
+check("11-2) [F1 재현] 원장 100·잔고 10인 005930 100주 매도는 전송 0회",
+      ("005930", "SELL", 100) not in br.place_calls and s.denied_codes.get("SYMBOL_BLOCKED") == 1)
+check("11-3) 005930 불일치는 BLOCK으로 기록",
+      any("[BLOCK] QTY_MISMATCH 005930" in m for m in logs(lg, "critical")))
+
+# ── 12. 8-B F3: 보유 종목 현재가로 노출 평가 ─────────────────────
+def seed_005930_30(settings):
+    FillLedgerStore(settings.storage.fill_ledger_file).append(opening_events_from_balance(
+        AccountBalance(0, 0, [Position("005930", 30, 50_000)]), ["005930"],
+        datetime(2026, 9, 25).date(), note="test")[0])
+    return settings
+
+
+def held_broker():
+    b = SimBroker()
+    b.positions["005930"] = 30
+    b.avg["005930"] = 50_000
+    return b
+
+
+buy_b = lambda: ScriptStrategy([(time(10, 0), OrderIntent("000660", "BUY", 1, 180_000, reason="B"))])
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 9, 58), strategy=buy_b(), broker=held_broker(),
+                       settings_fn=seed_005930_30)
+check("12-1) 현재가 조회 수단 없음 + 보유 있음 → PRICE_UNKNOWN, 전송 0회",
+      s.denied_codes.get("PRICE_UNKNOWN") == 1 and br.place_calls == [])
+qs = StaticQuoteSource({"005930": 70_000})
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 9, 58), strategy=buy_b(), broker=held_broker(),
+                       settings_fn=seed_005930_30, quote_source=qs)
+check("12-2) 현재가 있으면 허용, 보유 종목만 한 번 조회", br.place_calls == [("000660", "BUY", 1)]
+      and qs.requests == [("005930",)])
+
+
+def low_limit(settings):
+    import dataclasses
+    seed_005930_30(settings)
+    return dataclasses.replace(settings, guard=dataclasses.replace(settings.guard, max_total_exposure=2_000_000,
+                                                                   max_order_amount=1_000_000))
+
+
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 9, 58), strategy=buy_b(), broker=held_broker(),
+                       settings_fn=low_limit, quote_source=StaticQuoteSource({"005930": 70_000}))
+check("12-3) 원가 150만이지만 현재가 평가 210만 → 한도 200만 초과로 차단",
+      s.denied_codes.get("TOTAL_EXPOSURE_LIMIT") == 1 and br.place_calls == [])
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

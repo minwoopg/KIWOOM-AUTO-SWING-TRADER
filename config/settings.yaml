@@ -61,11 +61,12 @@ session:
 guard:
   max_positions: 5
   max_order_amount: 2000000        # 1회 주문 금액 상한(원)
-  max_total_exposure: 10000000     # 보유 평가액 + 이번 주문 상한(원)
+  max_total_exposure: 10000000     # 계좌 전체 보유 평가액 + 미체결 매수 + 이번 주문 상한(원)
   min_cash_buffer: 100000          # 주문 후 남겨둘 현금(원)
   new_orders_start: "09:05"        # 신규 주문 허용 시작 (강제 매도는 예외)
   new_orders_end: "15:15"          # 신규 주문 허용 끝
   allowed_symbols: []              # 비우면 제한 없음
+  buy_price_buffer_pct: 1.0        # 매수 금액에 더하는 시장가 변동 여유(%) — 금액 한도·현금 버퍼에 적용
 
 # ── 카카오톡 알림 ──────────────────────────────────────────
 # .env 파일에 아래 키를 입력하세요 (.gitignore로 보호됨)

@@ -9,7 +9,8 @@ from __future__ import annotations
     REGULAR / CLOSING_AUCTION
                 → poll_interval_sec마다 tick():
                   잔고 조회 → 주문 대조(OrderExecutor) → 체결 원장 기록(FillRecorder)
-                  → 장부 대조(원장·잔고·메타) → 전략 on_tick → 안전 한도 → 주문
+                  → 장부 대조(원장·잔고·메타, 미해결 주문 종목만 수량 차이 보류)
+                  → 전략 on_tick → (매수 의도 시 보유 종목 현재가 조회) → 안전 한도 → 주문
     POST_CLOSE  → 미해결 주문이 없어질 때까지(최대 close_reconcile_until) 대조만,
                   마지막 장부 대조·요약 → (선택) 일봉 갱신 → 종료
 
@@ -32,6 +33,7 @@ from domain.risk.account_guard import GuardConfig, check_intent
 from domain.service.fill_recorder import FillRecorder
 from domain.service.lot_ledger import LotMatchError, apply_events
 from domain.strategy.interface import OrderIntent, TickContext
+from infra.market_data.quote_source import QuoteSource
 from infra.storage.fill_ledger import FillLedgerCorruptError
 from utils.trading_calendar import MarketPhase, TradingCalendar
 
@@ -100,6 +102,7 @@ class SessionRunner:
         sleep: Callable[[float], None] = _time.sleep,
         should_stop: Callable[[], bool] = lambda: False,
         after_close: Callable[[date], None] | None = None,
+        quote_source: QuoteSource | None = None,
     ) -> None:
         self.broker = broker
         self.executor = executor
@@ -115,6 +118,9 @@ class SessionRunner:
         self.sleep = sleep
         self.should_stop = should_stop
         self.after_close = after_close
+        self.quote_source = quote_source   # None이면 보유 종목이 있을 때 신규 매수 불가(PRICE_UNKNOWN)
+        self._tick_prices: dict[str, int] | None = None
+        self._unreconciled: frozenset[str] = frozenset()
         self.summary = SessionSummary()
         self._consecutive_balance_failures = 0
         self._halted_reason = ""
@@ -195,20 +201,24 @@ class SessionRunner:
         except (FillLedgerCorruptError, LotMatchError) as exc:
             self._halt(f"체결 원장 오류 — {type(exc).__name__}: {exc}")
             return None, None
-        in_flight = self.executor.has_unresolved_orders() or bool(self.recorder.tracked)
-        report = reconcile(ledger, balance, self.state.positions, orders_in_flight=in_flight)
+        in_flight = self._in_flight_symbols()
+        report = reconcile(ledger, balance, self.state.positions, in_flight_symbols=in_flight)
         if self._last_report is None or report.lines() != self._last_report.lines():
             for line in report.lines():
                 (self.log.critical if line.startswith("[BLOCK]") else self.log.info)(f"[SESSION_RECONCILE] {line}")
         self._last_report = report
-        if not in_flight:
-            for sym in report.symbols_with(META_ORPHAN):
+        for sym in report.symbols_with(META_ORPHAN):
+            if sym not in in_flight:
                 self.state.remove_position_meta(sym)
                 self.log.info(f"[SESSION] {sym} 청산 완료 — 포지션 메타 정리")
         return ledger, report
 
+    def _in_flight_symbols(self) -> frozenset[str]:
+        return self.executor.unresolved_symbols() | frozenset(self.recorder.tracked)
+
     def _tick(self, *, allow_orders: bool, call_strategy_start: bool = False) -> TickContext | None:
         now = self.clock()
+        self._tick_prices = None
         self.summary.ticks += 1
         balance = self._fetch_balance()
         if balance is None:
@@ -217,13 +227,16 @@ class SessionRunner:
         if ledger is None:
             self.executor.save_state()
             return None
-        blocked = {i.symbol for i in report.issues if i.blocking}
+        blocked = set(report.blocking_symbols)
         blocked |= {s for s, m in self.state.positions.items() if m.needs_review}
+        self._unreconciled = report.blocking_symbols
+        in_flight = self._in_flight_symbols()
         ctx = TickContext(
             now=now, phase=self.calendar.phase(now), trade_date=now.date(), balance=balance,
             positions=ledger.positions(), metas=dict(self.state.positions),
             blocked_symbols=frozenset(blocked),
-            orders_in_flight=self.executor.has_unresolved_orders() or bool(self.recorder.tracked),
+            orders_in_flight=bool(in_flight) or self.executor.has_unresolved_orders(),
+            in_flight_symbols=in_flight,
         )
         if call_strategy_start:
             self._safe_strategy_call("on_session_start", ctx)
@@ -240,9 +253,15 @@ class SessionRunner:
             self.log.critical(f"[SESSION] 전략이 OrderIntent가 아닌 값을 반환 — 무시: {intent!r}")
             self.summary.intents_denied += 1
             return
-        prices = {intent.symbol: intent.reference_price}
+        prices: dict[str, int] = {}
+        reserve, unknown_pending = 0, False
+        if intent.side == "BUY":
+            prices = self._held_prices(ctx)
+            reserve, unknown_pending = self._pending_buy_reserve()
         decision = check_intent(intent, config=self.guard, now=ctx.now, phase=ctx.phase, balance=ctx.balance,
-                                positions=ctx.positions, prices=prices, blocked_symbols=ctx.blocked_symbols)
+                                positions=ctx.positions, prices=prices, blocked_symbols=ctx.blocked_symbols,
+                                unreconciled_symbols=self._unreconciled, pending_buy_reserve=reserve,
+                                unknown_pending_orders=unknown_pending)
         if not decision.allowed:
             self.summary.intents_denied += 1
             self.summary.denied_codes[decision.code] = self.summary.denied_codes.get(decision.code, 0) + 1
@@ -271,6 +290,31 @@ class SessionRunner:
         if intent.side == "BUY" and intent.symbol not in self.state.positions:
             self.state.upsert_position_meta(PositionMeta(
                 intent.symbol, strategy_id=getattr(self.strategy, "strategy_id", ""), origin="ORDER"))
+
+    def _held_prices(self, ctx: TickContext) -> dict[str, int]:
+        """계좌 전체 보유(원장 ∪ 잔고) 현재가. 한 폴링에 한 번만 조회."""
+        if self._tick_prices is None:
+            held = {s for s, p in ctx.positions.items() if p.quantity > 0} | {
+                p.symbol for p in ctx.balance.positions if p.quantity > 0}
+            if not held:
+                self._tick_prices = {}
+            elif self.quote_source is None:
+                self._tick_prices = {}
+            else:
+                try:
+                    self._tick_prices = dict(self.quote_source.get_prices(held))
+                except Exception as exc:
+                    self.log.warning(f"[SESSION] 현재가 조회 실패 — 이번 폴링 신규 매수 보류: {type(exc).__name__}: {exc}")
+                    self._tick_prices = {}
+        return self._tick_prices
+
+    def _pending_buy_reserve(self) -> tuple[int, bool]:
+        """(미체결 매수 예상 금액, 금액을 알 수 없는 미해결 주문 존재 여부)."""
+        buf = 1 + self.guard.buy_price_buffer_pct / 100
+        reserve = sum(int(max(o.requested_quantity - o.filled_quantity, 0) * o.reference_price * buf)
+                      for o in self.recorder.tracked.values() if o.side == "BUY")
+        unknown = bool(self.executor.unresolved_symbols() - frozenset(self.recorder.tracked))
+        return reserve, unknown
 
     def _safe_strategy_call(self, name: str, ctx: TickContext):
         try:

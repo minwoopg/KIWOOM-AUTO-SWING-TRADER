@@ -136,6 +136,7 @@ class GuardSettings:
     new_orders_start: str = "09:05"
     new_orders_end: str = "15:15"
     allowed_symbols: tuple = ()
+    buy_price_buffer_pct: float = 1.0    # 시장가 매수 체결가 변동 여유 (8-B)
 
 
 @dataclass(frozen=True)

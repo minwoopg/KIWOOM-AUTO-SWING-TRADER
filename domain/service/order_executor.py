@@ -201,6 +201,14 @@ class OrderExecutor:
             for state in self._position_state_machine._states.values()
         )
 
+    def unresolved_symbols(self) -> frozenset[str]:
+        """미해결 주문이 걸린 종목들 (8-B, F1 — 장부 대조 범위를 종목 단위로)."""
+        return frozenset(self.state.unresolved_order_intents) | frozenset(
+            sym for sym, state in self._position_state_machine._states.items()
+            if state.lifecycle in (PositionLifecycle.BUY_PENDING, PositionLifecycle.SELL_PENDING)
+            or state.orphan_order_id
+        )
+
     def last_order_attempt(self, symbol: str) -> OrderResult | None:
         return self._last_order_attempt_by_symbol.get(symbol)
 

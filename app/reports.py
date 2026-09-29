@@ -48,7 +48,7 @@ def generate_daily_report(
     closes = latest_closes(DailyBarStore(settings.market_data.daily_bars_dir), symbols, trade_date)
     if reconcile_report is None and balance is not None:
         reconcile_report = reconcile(ledger, balance, state.positions,
-                                     orders_in_flight=bool(state.unresolved_order_intents or journal))
+                                     in_flight_symbols=set(state.unresolved_order_intents) | {j for j in journal if not j.startswith("(")})
     cost_model = None
     try:
         from domain.cost_model import load_cost_model

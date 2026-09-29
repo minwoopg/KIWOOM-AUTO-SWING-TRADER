@@ -12,9 +12,10 @@ from __future__ import annotations
 확인한 뒤 명시적으로 사건을 추가하도록 `opening_events_from_balance()` 같은
 도우미만 제공합니다.
 
-주문이 진행 중이면(`OrderExecutor.has_unresolved_orders()`) 잔고와 원장이
-잠시 다를 수 있습니다 — 호출부가 `orders_in_flight=True`를 넘기면 수량 불일치를
-경고가 아닌 참고로 표시합니다.
+주문이 진행 중인 종목은 잔고와 원장이 잠시 다를 수 있습니다 — 호출부가 그
+종목을 `in_flight_symbols`로 넘기면 **그 종목의** 수량 불일치만 참고(INFO)로
+표시합니다. 다른 종목의 불일치는 계속 차단(BLOCK)입니다(8-B, F1: 이전에는
+계좌 전체 bool 하나라 B종목 주문 중에 A종목 불일치도 풀렸음).
 """
 
 from dataclasses import dataclass, field
@@ -47,7 +48,15 @@ class ReconcileIssue:
 @dataclass
 class ReconcileReport:
     issues: list[ReconcileIssue] = field(default_factory=list)
-    orders_in_flight: bool = False
+    in_flight_symbols: frozenset[str] = frozenset()
+
+    @property
+    def orders_in_flight(self) -> bool:
+        return bool(self.in_flight_symbols)
+
+    @property
+    def blocking_symbols(self) -> frozenset[str]:
+        return frozenset(i.symbol for i in self.issues if i.blocking)
 
     @property
     def ok(self) -> bool:
@@ -66,22 +75,23 @@ def reconcile(
     balance: AccountBalance,
     metas: dict[str, PositionMeta],
     *,
-    orders_in_flight: bool = False,
+    in_flight_symbols: frozenset[str] | set[str] = frozenset(),
     avg_price_tolerance_pct: float = 0.5,
 ) -> ReconcileReport:
     """원장·잔고·메타를 대조한 보고서. 아무것도 수정하지 않습니다.
 
     blocking=True인 어긋남이 있으면 호출부는 해당 종목(또는 전체) 자동 매매를
-    멈추고 사람 확인을 요청해야 합니다. 단, orders_in_flight면 수량 관련
-    어긋남은 blocking=False(체결 반영 지연일 수 있음).
+    멈추고 사람 확인을 요청해야 합니다. 단, in_flight_symbols에 든 종목의 수량
+    관련 어긋남은 blocking=False(그 종목 주문의 체결 반영 지연일 수 있음).
     """
-    report = ReconcileReport(orders_in_flight=orders_in_flight)
+    in_flight = frozenset(in_flight_symbols)
+    report = ReconcileReport(in_flight_symbols=in_flight)
     positions = ledger.positions()
     broker = {p.symbol: p for p in balance.positions if p.quantity > 0}
-    qty_blocking = not orders_in_flight
 
     for sym in sorted(set(positions) | set(broker)):
         lp, bp = positions.get(sym), broker.get(sym)
+        qty_blocking = sym not in in_flight
         if lp and not bp:
             report.issues.append(ReconcileIssue(
                 LEDGER_ONLY, sym, f"원장 {lp.quantity}주, 잔고 없음", qty_blocking))

@@ -36,6 +36,7 @@ from config.settings import Settings, load_settings
 from domain.models import AccountBalance
 from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.broker.mock_broker import MockBroker
+from infra.market_data.quote_source import KiwoomQuoteSource
 from infra.storage.logger import build_app_logger
 from infra.storage.process_lock import single_instance_lock
 from infra.storage.run_baseline import perform_run_baseline_startup
@@ -183,7 +184,7 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
     if report.balance is not None and state is not None:
         report.reconcile = reconcile(
             ledger, report.balance, state.positions,
-            orders_in_flight=report.has_unresolved_orders,
+            in_flight_symbols=set(report.unresolved_intent_symbols) | set(report.journal_symbols),
         )
         for line in report.reconcile.lines():
             (app_logger.critical if line.startswith("[BLOCK]") else app_logger.info)(
@@ -264,6 +265,7 @@ def build_guard_config(g) -> "GuardConfig":
         max_total_exposure=int(g.max_total_exposure), min_cash_buffer=int(g.min_cash_buffer),
         new_orders_start=hm(g.new_orders_start), new_orders_end=hm(g.new_orders_end),
         allowed_symbols=tuple(str(x) for x in g.allowed_symbols),
+        buy_price_buffer_pct=float(g.buy_price_buffer_pct),
     )
 
 
@@ -279,7 +281,7 @@ def build_session_config(s) -> "SessionConfig":
 
 
 def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
-                should_stop=None):
+                should_stop=None, quote_source=None):
     """하루 수명주기 실행. 테스트에서 clock/sleep/should_stop을 주입할 수 있음."""
     import time as _time_mod
 
@@ -309,6 +311,8 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
         session_config=build_session_config(settings.session), logger=app_logger,
         clock=clock or now_local, sleep=sleep or _time_mod.sleep, should_stop=should_stop or (lambda: False),
         after_close=after_close,
+        quote_source=quote_source if quote_source is not None else (
+            KiwoomQuoteSource(broker, logger=app_logger) if isinstance(broker, KiwoomBroker) else None),
     )
     try:
         summary = runner.run()

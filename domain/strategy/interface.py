@@ -72,6 +72,7 @@ class TickContext:
     metas: dict[str, PositionMeta]
     blocked_symbols: frozenset[str]        # 장부 불일치·검토 필요 등으로 자동 매매 금지
     orders_in_flight: bool
+    in_flight_symbols: frozenset[str] = frozenset()  # 미해결 주문이 걸린 종목 (8-B)
 
 
 class Strategy(Protocol):

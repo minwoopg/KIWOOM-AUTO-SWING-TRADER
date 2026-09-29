@@ -143,6 +143,9 @@
     "infra/market_data/daily_bar_store.py": {
       "status": "new"
     },
+    "infra/market_data/quote_source.py": {
+      "status": "new"
+    },
     "infra/notify/kakao_notifier.py": {
       "status": "modified",
       "source_path": "infra/notify/kakao_notifier.py",
@@ -281,6 +284,9 @@
       "source_sha256": "65c7de011329e3e72f9c2e8105d3c923427fc73eefc9236aa97977cedf5c43a2"
     },
     "test_probe_market_data.py": {
+      "status": "new"
+    },
+    "test_quote_source.py": {
       "status": "new"
     },
     "test_run_baseline.py": {

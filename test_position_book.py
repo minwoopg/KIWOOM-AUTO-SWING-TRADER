@@ -52,8 +52,17 @@ check("2-2) 원장만 보유 → LEDGER_ONLY, blocking", r.symbols_with(LEDGER_O
 r = reconcile(apply_events([]), bal(("000660", 5, 180000)), {})
 check("2-3) 잔고만 보유(HTS 수동매매 등) → UNTRACKED_HOLDING, blocking",
       r.symbols_with(UNTRACKED_HOLDING) == ["000660"] and not r.ok)
-r = reconcile(ledger, bal(("005930", 7, 70000)), {"005930": PositionMeta("005930")}, orders_in_flight=True)
-check("2-4) 주문 진행 중이면 수량 불일치는 참고(blocking 아님)", r.symbols_with(QTY_MISMATCH) == ["005930"] and r.ok)
+r = reconcile(ledger, bal(("005930", 7, 70000)), {"005930": PositionMeta("005930")}, in_flight_symbols={"005930"})
+check("2-4) 그 종목에 주문 진행 중이면 수량 불일치는 참고(blocking 아님)",
+      r.symbols_with(QTY_MISMATCH) == ["005930"] and r.ok and r.orders_in_flight)
+# 8-B (F1): 다른 종목의 미해결 주문은 이 종목 불일치를 풀지 않음
+r = reconcile(ledger, bal(("005930", 7, 70000)), {"005930": PositionMeta("005930")}, in_flight_symbols={"000660"})
+check("2-5) [F1 재현] 다른 종목(000660) 주문 중이어도 005930 불일치는 계속 blocking",
+      r.symbols_with(QTY_MISMATCH) == ["005930"] and not r.ok and r.blocking_symbols == {"005930"})
+r = reconcile(ledger, bal(("005930", 7, 70000), ("000660", 5, 180000)), {"005930": PositionMeta("005930")},
+              in_flight_symbols={"000660"})
+check("2-6) 주문 중 종목(000660)의 잔고만 보유는 참고, 다른 종목 불일치는 blocking",
+      r.blocking_symbols == {"005930"} and r.symbols_with(UNTRACKED_HOLDING) == ["000660"])
 
 # ── 3. 참고 항목 ─────────────────────────────────────────────
 r = reconcile(ledger, bal(("005930", 10, 70000)), {})
