@@ -366,4 +366,43 @@
 ### 전달 파일
 - 패치 0001 (fix), 0002 (CHANGELOG/README)
 
+## 2026-09-29 — 8-C: 분할청산(주문 종료 ≠ 전량 청산), 체결 식별자 범위 (GPT 기반 검토 F2·F4)
+
+### 배경
+- F2: 단타 원본은 항상 전량매도라 "매도 주문 종료 = 잔고 0"으로 판정. 100주 중 30주 매도가
+  전부 체결돼 잔고 70이 되어도 SELL_PENDING·미해결 주문으로 남고, 저널 SELL 목표는 0 고정.
+- F4: 체결 원장 event_id `{주문번호}:{누적수량}`에 거래일·계좌·종목 범위가 없어, 다른 날 같은
+  주문번호·누적수량이 나오면 두 번째 체결이 `FillLedgerCorruptError`로 거부됨.
+  (키움 주문번호의 유일성 범위는 실측 미확인 — 보수적으로 거래일·계좌 범위를 붙임.)
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `domain/position/lifecycle.py` (**unchanged → modified**) | 매도 요청 시 `base_quantity_before_order`·`requested_quantity`·`expected_final_quantity = 보유 − 요청` 고정. `on_sell_result`: 잔고 = 목표(>0) → OPEN(FILLED_PARTIAL_EXIT), 목표 < 잔고 < 기준 → 대기 유지, 잔고 < 목표 → ERROR(UNEXPECTED_QUANTITY_DECREASE). SELL orphan 해제 기준·타임아웃 orphan 조건도 목표 잔고 기준. **목표 0(전량매도)이면 원본과 같은 판정** |
+| `domain/service/order_executor.py` | 저널 SELL 목표 = 주문별 목표 잔고, 체결조회 FILLED 확정도 잔고 = 목표일 때만, 분할청산 종료 시 청산 훅 없이 보류 컨텍스트만 정리 |
+| `domain/service/fill_recorder.py` | event_id = `{범위}|{주문 거래일}|{방향}|{종목}|{주문번호}|{누적수량}`, `scope` 필수(빈 값·`|` 거부), `track(order_date=)` |
+| `app/main.py`, `app/session_runner.py` | 범위 = `broker.account_scope_id`(비면 "unscoped"), 주문 거래일 전달 |
+| `tools/equivalence/compare.py` | 의도적 차이 명시: 매도 요청 후 다음 매수 전까지 PSM 매도 기준 3필드·저널 SELL base 값은 비교 제외 |
+| `provenance.json` | lifecycle.py status → modified (note 포함) |
+| 테스트 | `test_order_executor` 109→123(19절), `test_fill_recorder` 14→20(8절), `test_session_runner` 38→42(13절) |
+
+### 테스트 및 검증
+- F2 완료 기준: 100→70 정상 분할청산 OPEN·미해결 없음(19-2), 100→90 미완료 차단 유지·타임아웃 후 orphan(19-6~9),
+  100→0 FLAT(19-10), 재시작 중단점에서 저널 목표 70 보존·ERROR 복원(19-13). 세션 하루(20주 매수 → 6주 분할청산) 대조 일치(13절).
+- F4 완료 기준: 같은 거래 재조회 중복 0(8-2), 다른 거래일 같은 번호는 다른 사건(8-1), 같은 id 다른 내용은 차단(8-3), 계좌 범위 구분(8-4).
+- `run_regression_tests.py --skip test_broker_order_status.py`: 24개 전부 통과.
+- 단타 원본 동등성 18/18 (위 의도적 차이 제외 규칙 적용 후).
+
+### 변경하지 않은 것
+- 이미 기록된 이전 형식 event_id — 그대로 유효(새 형식과 겹치지 않음), 이관 불필요.
+- FillRecorder 추적은 여전히 메모리 전용. 주문 도중 재시작 시 ERROR 복원 후 사람 확인(자동 복구 아님).
+  재시작 후 같은 체결을 다른 시각으로 다시 기록하려 하면 내용이 달라 원장이 거부하는 동작도 그대로.
+- 부분 매도 체결가는 여전히 주문 직전 시세 추정(ORDER_ESTIMATE).
+
+### 다음 작업
+- 8-D: F5 마감 검증 상태(종료 성공 ≠ 마감 검증 성공), F6 과거 리포트는 기준일까지의 원장만.
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (CHANGELOG/README) — 8-B 패치 위에 적용
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

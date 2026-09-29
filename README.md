@@ -125,6 +125,9 @@ if sub.block_code: ...                                # 주문 안전 게이트�
 
 - 진입 조건·리스크 한도는 호출부가 먼저 판단합니다. `OrderExecutor`는 주문 안전 게이트만 봅니다.
 - 첫 체결과 완전 청산은 훅으로 알려줍니다(접수 시점이 아님).
+- 분할청산(8-C): 매도 주문마다 목표 잔고(보유 − 요청)를 고정합니다. 목표에 정확히 도달하면
+  주문만 종료되고 포지션은 OPEN으로 남습니다(청산 훅 없음). 목표보다 덜 줄면 대기·타임아웃 후 orphan으로
+  계속 차단, 더 줄면 ERROR. 전량매도(목표 0)는 원본과 같은 판정입니다.
 - 사람 확인이 필요한 상태(ERROR / orphan)는 `commands/ack_error_{종목}.json`,
   `commands/ack_orphan_{종목}.json` 파일로만 해제됩니다.
   처리된 파일은 `commands/processed/`, 실패한 파일은 사유(`.error.txt`)와 함께
@@ -154,6 +157,10 @@ powershell -ExecutionPolicy Bypass -File scripts\unregister_task.ps1            
 - 공유용 번들(민감정보 가림): `python tools/export_bundle.py --date 2026-09-28` → `exports\swing_bundle_<날짜>.zip`
 
 ## 상태와 원장 — 한 사실은 한 곳에만
+
+체결 사건 id(8-C): `{account_scope_id}|{주문 거래일}|{BUY/SELL}|{종목}|{주문번호}|{누적 체결수량}` —
+같은 주문 재조회는 중복 기록되지 않고, 다른 날·다른 계좌의 같은 주문번호는 다른 사건입니다.
+`broker.account_scope_id`(계좌번호 아님)는 계좌를 바꾸면 반드시 다른 값으로 바꾸세요.
 
 | 사실 | 저장 위치 |
 |---|---|
