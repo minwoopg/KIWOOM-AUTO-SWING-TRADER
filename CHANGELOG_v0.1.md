@@ -439,4 +439,46 @@
 ### 전달 파일
 - 패치 0001 (fix), 0002 (CHANGELOG/README)
 
+## 2026-09-29 — 8-E: GPT 재검토 잔여 4건 (R1 주문 종료 증거, R2 마감 보고서, R3 상태 저장 실패, R4 명령 보관 실패)
+
+### 배경
+GPT 재검토(`08c6eab` 기준, F1·F3·F4·F6·F8 해결 확인)에서 잔여 4건 재현:
+- R1 (P1): 30주 분할매도 후 잔고 70·주문 조회 OPEN/UNKNOWN/오류여도 일반 잔고 대조가 목표 잔고 도달만으로
+  주문 종료를 확정 → 저널·차단 해제, 추가 70주 매도가 브로커까지 전달. timeout orphan도 목표 잔고로 해제.
+- R2: 마감 후 잔고 실패(NEEDS_REVIEW)인데 보고서가 마지막 성공 잔고로 다시 대조해 "일치" 표시.
+- R3: 상태 파일 교체 실패 시에도 VERIFIED·종료 코드 0, 이전 실행 파일이 남을 수 있음.
+- R4: 보관 폴더 이동 실패 시 명령 원문 삭제(fallback), 사유 파일도 없음.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `domain/position/lifecycle.py` | `on_sell_result(order_filled=)`·`observe_for_orphan(order_filled=)`: 분할청산(목표 > 0)은 FILLED 증거가 있어야 종료/해제, 목표 도달만이면 `TARGET_REACHED_AWAITING_FILL_EVIDENCE`로 대기. 분할청산 timeout은 잔고와 무관하게 orphan. **전량매도(목표 0)는 원본과 동일**. 시계 주입(`clock=`) |
+| `domain/service/order_executor.py` | 주문 조회 FILLED+목표 잔고일 때만 `order_filled=True` 전달(일반·timeout·orphan 경로 같은 기준). 시계 주입. 명령 보관: 삭제 fallback 제거 → `.hold`로 보존·사유 파일, 이름 변경도 실패하면 원문 유지 + 같은 내용 재실행 금지, 실행 결과와 보관 결과를 구분해 CRITICAL |
+| `app/main.py` | 세션 clock을 executor에 전달(운영은 None → datetime.now). 마감 보고서는 최종 대조만(`final_only`), 없으면 사유·마지막 잔고 시각 표시. `run_id`, 상태 파일 저장 실패 → `STATUS_WRITE_FAILED`·이전 파일 제거·임시 파일 정리. REPORT_FAILED는 판정과 무관하게 누적. 종료 코드 2 = NEEDS_REVIEW **또는 기록된 문제가 있음** |
+| `app/reports.py`, `infra/reporting/daily_report.py` | `final_only`·`reconcile_missing_reason`·마감 검증 표시 |
+| `app/session_runner.py` | `run_id`, `generated_at`, `needs_attention`, `last_balance_at` |
+| 테스트 | `test_order_executor` 123→133(19절 기대값 변경, 20·21절), `test_session_runner` 55→62(15절, 13절은 FILLED 증거로 종료) |
+
+### 의도적 변경 (기존 기대값)
+- 19-2·19-9: "목표 잔고 도달 → 해제"를 성공으로 보던 기대값을 "FILLED 증거 전에는 유지, FILLED 후 해제"로 변경.
+- 세션 테스트의 SimBroker가 주문 완전 체결 시 주문 조회 FILLED를 돌려주도록 변경.
+
+### 테스트 및 검증
+- R1: OPEN·UNKNOWN·조회 오류 각각 추가 SELL 전송 0회·저널 유지(20절), FILLED+90은 대조 계속(20-4), 목표 도달 후 timeout → orphan 유지(20-5), orphan은 FILLED로만 해제(19-9b).
+- R2: 15:29 성공·마감 실패 → 보고서에 "일치" 없음, "마감 최종 대조 미확보"·15:29:00·"마감 검증에 사용 불가"(15-1).
+- R3: 상태 파일 교체 실패 → STATUS_WRITE_FAILED·이전 파일 제거·tmp 없음(15-4~6), 종료 코드 규칙(14-13).
+- R4: failed/·processed/ 경로 충돌·이동/이름 변경 모두 실패 각각 원문 보존·재실행 없음(21절).
+- `run_regression_tests.py --skip test_broker_order_status.py`: 24개 전부 통과. 단타 원본 동등성 18/18(전량매도 경로 동일).
+
+### 변경하지 않은 것
+- 주문 조회가 취소·거부 등 FILLED 외 종결 상태를 돌려주면 여전히 "미지원 상태, 유지"(차단 유지 → HTS 확인 후 `ack_orphan`). 체결 수량 대조 규칙은 후속.
+- 매수(BUY_PENDING)의 목표 잔고 확정 규칙은 원본 그대로.
+- F4 후속: 계좌/환경 혼용 방지 기동 검증, F1 후속: 같은 종목 진행 중 주문의 수량 범위 검증, FillRecorder 메모리 전용 — 모두 별도 과제.
+
+### 다음 작업
+- 9: 전략 없는 다일 장애 통합 검증(이번 시계 주입으로 PSM 타임아웃·주문 조회 경과도 가짜 시계로 검증 가능).
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
