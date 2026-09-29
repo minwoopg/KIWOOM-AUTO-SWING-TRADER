@@ -405,4 +405,38 @@
 ### 전달 파일
 - 패치 0001 (fix), 0002 (CHANGELOG/README) — 8-B 패치 위에 적용
 
+## 2026-09-29 — 8-D: 마감 검증 상태 분리, 과거 리포트 기준일 원장 (GPT 기반 검토 F5·F6)
+
+### 배경
+- F5: 마감 후 잔고 조회가 실패해도 세션이 `COMPLETED`·종료 코드 0으로 끝났고, 장중 마지막 대조 결과가
+  최종 결과처럼 남을 수 있었음. 리포트 파일 생성만으로는 하루가 정상이었는지 판단할 수 없음.
+- F6: 리포트의 보유·누적 손익이 원장 전체를 사용 — 9/29 전량 매도 후 9/28 리포트를 다시 만들면 9/28 보유가 사라짐.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `app/session_runner.py` | `SessionSummary.close_check`(VERIFIED / NEEDS_REVIEW / NOT_RUN), `close_issues`, `final_balance_at`, `final_reconcile_at`, `daily_bars`, `report`. 마감 이후 잔고·대조가 없으면 `close_balance_retries`(3)회 × `close_balance_retry_sec`(15초) 재시도. 최종 대조는 **마감 시작 이후 것만** 인정. 판정 항목: FINAL_BALANCE_FAILED, FINAL_RECONCILE_MISSING, RECONCILE_MISMATCH, UNRESOLVED_ORDERS, HALTED, DAILY_BARS_FAILED (+ REPORT_FAILED) |
+| `app/main.py` | 리포트 결과 기록, `reports/session_status_<날짜>.json`(원자적 쓰기), 종료 코드 0/1/**2(NEEDS_REVIEW)**, 일봉 갱신 실패 종목을 결과로 반환, 리포트는 최종(마감 후) 대조를 사용 |
+| `infra/reporting/daily_report.py` | 기준일까지의 사건만으로 원장 재구성, 이후 사건 제외 건수 안내, `historical=True`면 메타·미해결 주문·장부 대조 미표시 |
+| `app/reports.py` | `generate_daily_report(today=)` — 기준일 < 오늘이면 과거 재생성(현재 잔고·메타 미사용). 번들에 상태 파일 포함 |
+| `scripts/run_swing.ps1` | 로그에 종료 코드 의미 표시 (UTF-8 BOM 유지) |
+| 테스트 | `test_session_runner` 42→55(14절), `test_daily_report` 27→34(6절) |
+
+### 테스트 및 검증
+- F5 완료 기준: 마감 후 잔고 실패 → COMPLETED + NEEDS_REVIEW, 이전 대조를 최종으로 쓰지 않음, 3회 재시도(14-2~5),
+  일시 실패 회복 시 VERIFIED(14-6), 마감 전 중지 NOT_RUN(14-7), 대조 불일치·일봉 실패·리포트 실패 각각 구분(14-8~11), 종료 코드 0/2/1(14-13).
+- F6 완료 기준: 9/28 매수·9/29 매도 후 9/28 재생성 시 보유 10주·누적 0(6-1~2), 이후 매매 추가해도 과거 수치 동일(6-6).
+- `run_regression_tests.py --skip test_broker_order_status.py`: 24개 전부 통과. 단타 원본 동등성 18/18.
+
+### 변경하지 않은 것
+- 관측 오류가 있어도 장중 감시·대조 루프는 계속 돔(마감 판정만 NEEDS_REVIEW).
+- 당일 포지션 메타 스냅샷 저장(과거 리포트에 그날 손절가 표시)은 하지 않음 — 필요 시 후속.
+- 같은 날 여러 번 실행하면 리포트·상태 파일은 마지막 실행 기준으로 덮어씀.
+
+### 다음 작업
+- 9: 전략 없이 여러 거래일·장애·재시작 통합 검증(정상 3거래일 + 장중 재시작 + 부분체결 + API 장애 + 저장 실패).
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (CHANGELOG/README)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

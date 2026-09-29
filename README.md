@@ -150,10 +150,23 @@ powershell -ExecutionPolicy Bypass -File scripts\unregister_task.ps1            
 
 공휴일은 프로그램이 캘린더로 판단해 바로 종료합니다. 실행 출력: `logs\scheduler\run_<시각>.log`.
 
+하루가 제대로 끝났는지는 **리포트 파일이 아니라** `reports\session_status_<날짜>.json`의 `close_check`로 봅니다(8-D).
+
+| close_check | 뜻 | 종료 코드 |
+|---|---|---|
+| `VERIFIED` | 마감 후 잔고 조회·장부 대조 성공, 불일치·미해결 주문·신규 주문 중단·일봉/리포트 실패 없음 | 0 |
+| `NEEDS_REVIEW` | 위 중 하나라도 실패 — `close_issues`와 app.log `[SESSION_CLOSE]` 확인 | 2 |
+| `NOT_RUN` | 마감 전에 중지됨 | 0 |
+| (없음) | 휴장일 | 0 |
+
+예외로 비정상 종료하면 종료 코드 1. 작업 스케줄러의 "마지막 실행 결과"에 그대로 나타납니다.
+
 ## 리포트·번들
 
 - 하루가 끝나면 `reports\daily_report_<날짜>.md`가 자동 생성됩니다(평가는 완성 일봉 종가 기준).
 - 다시 만들기: `python tools/daily_report.py --date 2026-09-28`
+  지난 날짜는 **그날까지의 체결 원장만**으로 보유·손익을 다시 계산합니다(이후 매매가 섞이지 않음).
+  그날의 포지션 메타·미해결 주문·장부 대조는 기록이 없어 표시하지 않습니다.
 - 공유용 번들(민감정보 가림): `python tools/export_bundle.py --date 2026-09-28` → `exports\swing_bundle_<날짜>.zip`
 
 ## 상태와 원장 — 한 사실은 한 곳에만
