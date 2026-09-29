@@ -30,6 +30,18 @@ from testing_helpers import ScriptedBroker, build_minimal_settings
 passed = 0
 failed = 0
 
+REPO_COMMANDS = Path(__file__).resolve().parent / "commands"
+
+
+def _snapshot_repo_commands():
+    if not REPO_COMMANDS.exists():
+        return None
+    return sorted((str(p.relative_to(REPO_COMMANDS)), p.read_bytes() if p.is_file() else b"")
+                  for p in REPO_COMMANDS.rglob("*"))
+
+
+_REPO_COMMANDS_BEFORE = _snapshot_repo_commands()
+
 
 def check(label: str, condition: bool) -> None:
     global passed, failed
@@ -481,6 +493,13 @@ finally:
     app_reports.generate_daily_report = orig_gen
 check("15-7) 마감 전 중지(NOT_RUN)에서도 리포트 실패는 사유에 누적 → 종료 코드 2 대상",
       s.close_check == "NOT_RUN" and "REPORT_FAILED" in s.close_issues and s.needs_attention)
+
+
+# ── 16. 8-G: 테스트가 운영용 commands/를 건드리지 않음 ─────────────
+s, st, *_ = day(datetime(2026, 9, 28, 15, 10))
+check("16-1) 세션은 설정의 commands_dir(임시 폴더)를 사용, 기동 시 빈 복구 목록 기록",
+      json.loads((Path(st.storage.commands_dir) / "recovery_required.json").read_text(encoding="utf-8"))["items"] == [])
+check("16-2) 테스트 전후 저장소의 commands/ 내용 동일", _snapshot_repo_commands() == _REPO_COMMANDS_BEFORE)
 
 
 # 종료 코드 (마지막에 — main()이 logging.shutdown을 부름)

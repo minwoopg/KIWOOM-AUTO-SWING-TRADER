@@ -660,6 +660,16 @@ with patch("pathlib.Path.replace", side_effect=PermissionError("locked")):
 check("21-3) 확보(processing/ 이동) 실패 → 실행하지 않음, 원문 그대로, CRITICAL 1회",
       calls == [] and e.st("005930").lifecycle == L.ERROR and (e.cmd_dir / "ack_error_005930.json").exists()
       and e.critical_text().count("명령 확보 실패") == 1)
+e.sync()
+check("21-3b) 잠금 해제 직후(재시도 간격 30초 전)에는 아직 대기", calls == [] and e.st("005930").lifecycle == L.ERROR)
+for k in list(e.ex._claim_failed):
+    e.ex._claim_failed[k] -= timedelta(seconds=31)
+e.sync()
+e.sync()
+check("21-3c) [8-G 재현] 일시적 확보 실패 → 권한 복구 → 파일 수정·재시작 없이 정확히 한 번 처리",
+      len(calls) == 1 and e.st("005930").lifecycle != L.ERROR
+      and len(list((e.cmd_dir / "processed").glob("ack_error_005930.*.json"))) == 1
+      and not (e.cmd_dir / "ack_error_005930.json").exists())
 
 # 21-4: GPT 재현 — 옛 명령 + 새 주문 + 재시작
 e = held100_env = Env()
@@ -707,6 +717,23 @@ e = _error_env()
 (e.cmd_dir / "ack_error_005930.json").write_text(json.dumps({"broker_quantity": 0, "note": "HTS"}), encoding="utf-8")
 e.sync()
 check("21-8) recovery_id 없는 명령 거부", e.st("005930").lifecycle == L.ERROR)
+
+# 21-9: 확보 실패 → 권한 복구 전에 재시작 → 옛 ID 명령은 확보 후 거부 (한 시나리오)
+e = _error_env()
+(e.cmd_dir / "ack_error_005930.json").write_text(ack_payload(e), encoding="utf-8")
+with patch("pathlib.Path.replace", side_effect=PermissionError("locked")):
+    e.sync()
+e2 = Env(tmpdir=e.tmp)
+e2.broker = e.broker
+e2.ex.broker = e.broker
+e2.ex.restore_order_recovery_blocks()
+e2.sync()
+check("21-9) 확보 실패·재시작·권한 복구 → 재시작 전 ID 명령은 확보 후 불일치로 거부, 새 사건 ERROR 유지",
+      e2.st("005930").lifecycle == L.ERROR and len(list((e2.cmd_dir / "failed").glob("ack_error_005930.*.json"))) == 1
+      and not (e2.cmd_dir / "ack_error_005930.json").exists())
+e3 = Env()
+rec = json.loads((e3.cmd_dir / "recovery_required.json").read_text(encoding="utf-8"))
+check("21-10) 복구 대상이 없어도 기동 시 목록 파일을 빈 목록으로 갱신", rec["items"] == [])
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

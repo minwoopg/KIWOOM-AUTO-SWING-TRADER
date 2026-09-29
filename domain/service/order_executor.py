@@ -144,8 +144,9 @@ class OrderExecutor:
         self.app_logger = app_logger
         self.trade_logger = trade_logger
         self._commands_dir = Path(commands_dir)
-        # 8-F: 확보(processing/ 이동)에 실패한 명령 — 로그 반복 방지용(실행은 원래 안 함)
-        self._claim_failed: set[tuple[str, int, int]] = set()
+        # 8-G: 확보(processing/ 이동)에 실패한 명령 → 마지막 시도 시각. 로그 반복 억제와
+        # 재시도 간격에만 씀(실행을 막지 않음 — 간격이 지나면 다시 확보 시도)
+        self._claim_failed: dict[tuple[str, int, int], datetime] = {}
         # 8-F: (종목, ERROR|ORPHAN) → 현재 복구 사건
         self._recovery_ids: dict[tuple[str, str], dict] = {}
         self._on_first_fill_buy = on_first_fill_buy
@@ -267,6 +268,7 @@ class OrderExecutor:
                 f"[STARTUP_ORDER_RECOVERY] {symbol} | 미확인 주문 복원 — 주문·잔고 대조 필요"
             )
         self._refresh_recovery_ids()   # 8-F: 복원된 ERROR에 이번 프로세스의 새 복구 사건 ID
+        self._write_recovery_file()    # 8-G: 복구 대상이 없어도 기동 시 목록 갱신(이전 실행 목록 제거)
 
     def _begin_order_intent(self, symbol: str, side: str, quantity: int) -> bool:
         """Write before sending: a crash/timeout must not erase a submission."""
@@ -1069,6 +1071,7 @@ class OrderExecutor:
     # 명령이 새 주문의 ERROR·orphan을 풀지 못하게 하기 위함입니다. 재시작하면
     # 복원된 ERROR에도 새 ID가 붙으므로, 재시작 전에 쓴 명령은 자동으로 무효입니다.
     RECOVERY_FILE = "recovery_required.json"
+    CLAIM_RETRY_SEC = 30      # 8-G: 명령 확보 실패 후 재시도 간격
 
     def recovery_id(self, symbol: str, kind: str) -> str | None:
         rec = self._recovery_ids.get((symbol, kind))
@@ -1144,18 +1147,27 @@ class OrderExecutor:
         sub = cmd_file.parent / "processing"
         stamp = now_kst().strftime("%Y%m%d_%H%M%S_%f")
         dest = sub / f"{cmd_file.stem}.{stamp}{cmd_file.suffix}"
+        sig = self._command_signature(cmd_file)
         try:
             sub.mkdir(parents=True, exist_ok=True)
             cmd_file.replace(dest)
-            return dest
         except OSError as exc:
-            sig = self._command_signature(cmd_file)
-            if sig not in self._claim_failed:
-                self._claim_failed.add(sig)
+            first = sig not in self._claim_failed
+            self._claim_failed[sig] = self._now()
+            if first:
                 self.app_logger.critical(
-                    f"[{tag}] {symbol} | 명령 확보 실패 — 실행하지 않음(원문 그대로): {type(exc).__name__}: {exc}. "
+                    f"[{tag}] {symbol} | 명령 확보 실패 — 이번에는 실행하지 않음(원문 그대로, "
+                    f"{self.CLAIM_RETRY_SEC}초 간격으로 재시도): {type(exc).__name__}: {exc}. "
                     f"commands/processing 폴더 권한·경로 충돌 확인")
             return None
+        if self._claim_failed.pop(sig, None) is not None:
+            self.app_logger.warning(f"[{tag}] {symbol} | 명령 확보 재시도 성공 — 실행합니다")
+        return dest
+
+    def _claim_retry_wait(self, cmd_file: Path) -> bool:
+        """확보 실패 직후면 True(이번 폴링은 건너뜀). 간격이 지나면 False(재시도)."""
+        last = self._claim_failed.get(self._command_signature(cmd_file))
+        return last is not None and (self._now() - last).total_seconds() < self.CLAIM_RETRY_SEC
 
     @staticmethod
     def _command_signature(path: Path) -> tuple[str, int, int]:
@@ -1196,8 +1208,8 @@ class OrderExecutor:
             return
         for cmd_file in sorted(commands_dir.glob("ack_error_*.json")):
             symbol = cmd_file.stem[len("ack_error_"):]
-            if self._command_signature(cmd_file) in self._claim_failed:
-                continue
+            if self._claim_retry_wait(cmd_file):
+                continue   # 8-G: 확보 실패 직후 — 간격이 지나면 재시도(실행 전이라 중복 실행 없음)
             claimed = self._claim_command(cmd_file, "ACK_ERROR_COMMAND", symbol)
             if claimed is None:
                 continue
@@ -1237,8 +1249,8 @@ class OrderExecutor:
             return
         for cmd_file in sorted(commands_dir.glob("ack_orphan_*.json")):
             symbol = cmd_file.stem[len("ack_orphan_"):]
-            if self._command_signature(cmd_file) in self._claim_failed:
-                continue
+            if self._claim_retry_wait(cmd_file):
+                continue   # 8-G: 확보 실패 직후 — 간격이 지나면 재시도(실행 전이라 중복 실행 없음)
             claimed = self._claim_command(cmd_file, "ACK_ORPHAN_COMMAND", symbol)
             if claimed is None:
                 continue

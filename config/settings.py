@@ -92,6 +92,8 @@ class StorageConfig:
     fill_ledger_file: str = "data/fill_ledger.jsonl"
     # 일일 리포트 폴더 (7라운드)
     reports_dir: str = "reports"
+    # 사람 확인 복구 명령 폴더 (8-G — 테스트는 임시 폴더를 씀)
+    commands_dir: str = "commands"
 
 
 @dataclass(frozen=True)

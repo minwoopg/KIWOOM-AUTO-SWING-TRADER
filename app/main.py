@@ -302,6 +302,7 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
         app_logger=app_logger, trade_logger=TradeCsvLogger(settings.storage.trade_log_file),
         position_lifecycle_logger=PositionLifecycleLogger(settings.storage.position_lifecycle_log_file),
         clock=clock,   # 테스트의 가짜 시계 (운영은 None → datetime.now)
+        commands_dir=settings.storage.commands_dir,   # 8-G: 설정 경로 (테스트는 임시 폴더)
     )
     after_close = None
     if settings.session.update_daily_bars_after_close and isinstance(broker, KiwoomBroker):

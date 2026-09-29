@@ -48,6 +48,7 @@ def build_minimal_settings(tmpdir: str) -> Settings:
             order_status_observation_log_file=f"{tmpdir}/order_status_observations.jsonl",
             fill_ledger_file=f"{tmpdir}/fill_ledger.jsonl",
             reports_dir=f"{tmpdir}/reports",
+            commands_dir=f"{tmpdir}/commands",
         ),
         kakao=KakaoConfig(token_state_file=f"{tmpdir}/kakao_token_state.json"),
         market_data=MarketDataConfig(daily_bars_dir=f"{tmpdir}/daily_bars"),

@@ -41,6 +41,7 @@ storage:
   order_status_observation_log_file: logs/order_status_observations.jsonl
   fill_ledger_file: data/fill_ledger.jsonl
   reports_dir: reports
+  commands_dir: commands           # 복구 명령(ack_error/ack_orphan)·recovery_required.json
 
 # 일봉 수집 (tools/update_daily_bars.py)
 # 실측: 0.5초 간격 5번째 호출에서 429 → 1초 간격. 600행/페이지.
