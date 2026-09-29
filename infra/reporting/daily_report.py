@@ -195,7 +195,7 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
         L.append("- 과거 날짜 재생성 — 미해결 주문·장부 대조는 표시하지 않음(그날 세션 로그 확인)")
     elif inp.unresolved_intents or inp.journal_symbols:
         L.append(f"- ⚠ 미해결 주문: 주문 의도 {inp.unresolved_intents or '없음'} / 저널 {inp.journal_symbols or '없음'}"
-                 " — 다음 기동 시 ERROR로 복원됨, HTS 확인 후 `commands/ack_error_<종목>.json`")
+                 " — 다음 기동 시 ERROR로 복원됨, HTS 확인 후 `commands/recovery_required.json`의 recovery_id로 `commands/ack_error_<종목>.json`")
     else:
         L.append("- 미해결 주문 없음")
     if inp.close_check:

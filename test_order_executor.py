@@ -171,7 +171,8 @@ e.sync()
 check("4-8) 잔고 0이어도 ERROR 유지(자동 회복 없음)", e.st("005930").lifecycle == L.ERROR)
 e.cmd_dir.mkdir(exist_ok=True)
 (e.cmd_dir / "ack_error_005930.json").write_text(
-    json.dumps({"broker_quantity": 0, "note": "HTS 확인"}), encoding="utf-8")
+    json.dumps({"broker_quantity": 0, "note": "HTS 확인",
+                "recovery_id": e.ex.recovery_id("005930", "ERROR")}), encoding="utf-8")
 e.sync()
 check("4-9) ack_error 명령으로만 해제", e.st("005930").lifecycle != L.ERROR)
 check("4-10) 명령 파일은 처리 후 processed/로 이동",
@@ -395,7 +396,9 @@ e.sync()
 check("15-1) 0주 체결로 타임아웃 → orphan", e.ex.position_state_machine.has_orphan_order("005930"))
 check("15-2) orphan이면 신규매수 차단", e.ex.submit_buy("005930", 1, 70000).block_code != "")
 e.cmd_dir.mkdir(exist_ok=True)
-(e.cmd_dir / "ack_orphan_005930.json").write_text(json.dumps({"note": "HTS 미체결 없음"}), encoding="utf-8")
+(e.cmd_dir / "ack_orphan_005930.json").write_text(json.dumps({"note": "HTS 미체결 없음",
+                                                               "recovery_id": e.ex.recovery_id("005930", "ORPHAN")}),
+                                                   encoding="utf-8")
 e.sync()
 check("15-3) ack_orphan으로 해제", not e.ex.position_state_machine.has_orphan_order("005930"))
 check("15-4) 보류 중이던 매수 컨텍스트 폐기, 훅 미호출",
@@ -468,7 +471,8 @@ e = _error_env()
 check("18-0) 준비: ambiguous 매수 → ERROR", e.st("005930").lifecycle == L.ERROR)
 # PowerShell 5.1 Out-File -Encoding utf8 형식(BOM + CRLF)
 (e.cmd_dir / "ack_error_005930.json").write_bytes(
-    b"\xef\xbb\xbf" + json.dumps({"broker_quantity": 0, "note": "HTS 확인"}, ensure_ascii=False).encode("utf-8") + b"\r\n")
+    b"\xef\xbb\xbf" + json.dumps({"broker_quantity": 0, "note": "HTS 확인", "recovery_id": e.ex.recovery_id("005930", "ERROR")},
+                                   ensure_ascii=False).encode("utf-8") + b"\r\n")
 e.sync()
 check("18-1) BOM 포함 명령도 정상 처리 → ERROR 해제", e.st("005930").lifecycle != L.ERROR)
 check("18-2) 처리된 BOM 명령은 processed/에 보관",
@@ -614,43 +618,95 @@ check("20-5) 목표 도달 상태로 타임아웃 → 증거 없으므로 orphan
       e.ex.position_state_machine.has_orphan_order("005930")
       and e.ex.submit_sell("005930", 70, 70_000).block_code != "")
 
-# ── 21. R4: 명령 보관 실패 시 원문 보존·재실행 금지 ───────────────
+# ── 21. R4/8-F: 명령 확보 → 실행 → 보관, 복구 사건 ID ─────────────
 from unittest.mock import patch  # noqa: E402
+
+
+def ack_payload(e, sym="005930", qty=0):
+    return json.dumps({"broker_quantity": qty, "note": "HTS", "recovery_id": e.ex.recovery_id(sym, "ERROR")})
+
 
 e = _error_env()
 (e.cmd_dir / "failed").write_text("경로 충돌", encoding="utf-8")        # failed/가 폴더가 아니라 파일
 (e.cmd_dir / "ack_error_005930.json").write_bytes(b"{broken")
 e.sync()
-holds = list(e.cmd_dir.glob("ack_error_005930.json.*.hold"))
-check("21-1) [R4 재현] failed/ 경로 충돌 → 원문 삭제 없이 .hold로 보존, 사유 파일, ERROR 유지",
-      len(holds) == 1 and holds[0].read_bytes() == b"{broken"
-      and len(list(e.cmd_dir.glob("*.hold.error.txt"))) == 1 and e.st("005930").lifecycle == L.ERROR
-      and "보관 실패" in e.critical_text())
+kept = list((e.cmd_dir / "processing").glob("ack_error_005930.*.json"))
+check("21-1) failed/ 경로 충돌 → 원문은 processing/에 보존(삭제 없음)·사유 파일, ERROR 유지",
+      len(kept) == 1 and kept[0].read_bytes() == b"{broken"
+      and len(list((e.cmd_dir / "processing").glob("*.error.txt"))) == 1 and e.st("005930").lifecycle == L.ERROR
+      and "보관 실패" in e.critical_text() and not (e.cmd_dir / "ack_error_005930.json").exists())
 
 e = _error_env()
 (e.cmd_dir / "processed").write_text("경로 충돌", encoding="utf-8")
-(e.cmd_dir / "ack_error_005930.json").write_text(json.dumps({"broker_quantity": 0, "note": "HTS"}), encoding="utf-8")
+(e.cmd_dir / "ack_error_005930.json").write_text(ack_payload(e), encoding="utf-8")
 calls = []
 orig_ack = e.ex.position_state_machine.acknowledge_error
 e.ex.position_state_machine.acknowledge_error = lambda *a: (calls.append(a), orig_ack(*a))
 e.sync()
 e.sync()
-check("21-2) 실행 성공·보관 실패 → '실행 성공(상태 변경됨)'으로 기록, 원문 보존, 재실행 없음",
+check("21-2) 실행 성공·보관 실패 → '실행 성공(상태 변경됨)' 기록, 원문 processing/ 보존, 재실행 없음",
       len(calls) == 1 and e.st("005930").lifecycle != L.ERROR
-      and len(list(e.cmd_dir.glob("ack_error_005930.json.*.hold"))) == 1
+      and len(list((e.cmd_dir / "processing").glob("ack_error_005930.*.json"))) == 1
       and "실행 성공(상태 변경됨)" in e.critical_text())
 
 e = _error_env()
-(e.cmd_dir / "ack_error_005930.json").write_text(json.dumps({"broker_quantity": 0, "note": "HTS"}), encoding="utf-8")
+(e.cmd_dir / "ack_error_005930.json").write_text(ack_payload(e), encoding="utf-8")
 calls = []
 orig_ack = e.ex.position_state_machine.acknowledge_error
 e.ex.position_state_machine.acknowledge_error = lambda *a: (calls.append(a), orig_ack(*a))
 with patch("pathlib.Path.replace", side_effect=PermissionError("locked")):
     e.sync()
     e.sync()
-check("21-3) 이동·이름 변경 모두 실패 → 원문 그대로, 같은 내용은 이 프로세스에서 재실행 안 함",
-      (e.cmd_dir / "ack_error_005930.json").exists() and len(calls) == 1
-      and "보류 이름 변경도 실패" in e.critical_text())
+check("21-3) 확보(processing/ 이동) 실패 → 실행하지 않음, 원문 그대로, CRITICAL 1회",
+      calls == [] and e.st("005930").lifecycle == L.ERROR and (e.cmd_dir / "ack_error_005930.json").exists()
+      and e.critical_text().count("명령 확보 실패") == 1)
+
+# 21-4: GPT 재현 — 옛 명령 + 새 주문 + 재시작
+e = held100_env = Env()
+e.sync()
+e.broker.next_result.append("ambiguous")
+e.ex.submit_buy("005930", 10, 70000)
+e.sync()
+e.cmd_dir.mkdir(exist_ok=True)
+(e.cmd_dir / "processed").write_text("경로 충돌", encoding="utf-8")      # 보관 실패로 원문이 남는 상황
+(e.cmd_dir / "ack_error_005930.json").write_text(ack_payload(e), encoding="utf-8")
+e.sync()
+check("21-4a) 준비: 옛 ERROR 해제(보관 실패로 원문 잔존)", e.st("005930").lifecycle != L.ERROR)
+sub = e.ex.submit_buy("005930", 5, 70000)                                 # 새 주문, 미체결
+check("21-4b) 준비: 새 매수 접수·미체결", sub.accepted and e.st("005930").lifecycle == L.BUY_PENDING)
+e2 = Env(tmpdir=e.tmp)                                                    # 재시작
+e2.broker = e.broker
+e2.ex.broker = e.broker
+e2.ex.restore_order_recovery_blocks()
+e2.sync()
+e2.sync()
+n = len(e2.broker.place_calls)
+again = e2.ex.submit_buy("005930", 1, 70000)
+check("21-4) [8-F 재현] 재시작 후 옛 명령이 새 주문의 ERROR를 풀지 않음 — ERROR·저널 유지, 추가 주문 0회",
+      e2.st("005930").lifecycle == L.ERROR and "005930" in e2.journal()
+      and not again.accepted and len(e2.broker.place_calls) == n)
+
+(e2.cmd_dir / "ack_error_005930.json").write_text(ack_payload(e), encoding="utf-8")   # 재시작 전 ID로 쓴 명령
+e2.sync()
+check("21-5) 재시작 전 recovery_id로 쓴 명령 → 불일치로 거부(failed/), ERROR 유지",
+      e2.st("005930").lifecycle == L.ERROR and "recovery_id 불일치" in " ".join(
+          str(c.args[0]) for c in e2.logger.error.call_args_list))
+rec = json.loads((e2.cmd_dir / "recovery_required.json").read_text(encoding="utf-8"))
+cur = e2.ex.recovery_id("005930", "ERROR")
+check("21-6) recovery_required.json에 현재 ID·명령 템플릿",
+      any(i["recovery_id"] == cur and i["command_file"] == "ack_error_005930.json" for i in rec["items"])
+      and cur != json.loads(ack_payload(e))["recovery_id"])
+(e2.cmd_dir / "ack_error_005930.json").write_text(ack_payload(e2, qty=0), encoding="utf-8")
+(e2.cmd_dir / "processed").unlink()
+e2.sync()
+check("21-7) 현재 ID로 쓴 명령은 적용 → ERROR 해제, 목록에서 제거",
+      e2.st("005930").lifecycle != L.ERROR and e2.ex.recovery_id("005930", "ERROR") is None
+      and not any(i["symbol"] == "005930" and i["kind"] == "ERROR" for i in json.loads(
+          (e2.cmd_dir / "recovery_required.json").read_text(encoding="utf-8"))["items"]))
+e = _error_env()
+(e.cmd_dir / "ack_error_005930.json").write_text(json.dumps({"broker_quantity": 0, "note": "HTS"}), encoding="utf-8")
+e.sync()
+check("21-8) recovery_id 없는 명령 거부", e.st("005930").lifecycle == L.ERROR)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

@@ -42,6 +42,7 @@ from __future__ import annotations
 """
 
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -143,8 +144,10 @@ class OrderExecutor:
         self.app_logger = app_logger
         self.trade_logger = trade_logger
         self._commands_dir = Path(commands_dir)
-        # 8-E (R4): 보관(이동)에 실패해 원문을 그 자리에 둔 명령 — 같은 내용이면 이 프로세스에서 재실행하지 않음
-        self._held_commands: set[tuple[str, int, int]] = set()
+        # 8-F: 확보(processing/ 이동)에 실패한 명령 — 로그 반복 방지용(실행은 원래 안 함)
+        self._claim_failed: set[tuple[str, int, int]] = set()
+        # 8-F: (종목, ERROR|ORPHAN) → 현재 복구 사건
+        self._recovery_ids: dict[tuple[str, str], dict] = {}
         self._on_first_fill_buy = on_first_fill_buy
         self._on_sell_closed = on_sell_closed
 
@@ -263,6 +266,7 @@ class OrderExecutor:
             self.app_logger.critical(
                 f"[STARTUP_ORDER_RECOVERY] {symbol} | 미확인 주문 복원 — 주문·잔고 대조 필요"
             )
+        self._refresh_recovery_ids()   # 8-F: 복원된 ERROR에 이번 프로세스의 새 복구 사건 ID
 
     def _begin_order_intent(self, symbol: str, side: str, quantity: int) -> bool:
         """Write before sending: a crash/timeout must not erase a submission."""
@@ -617,6 +621,13 @@ class OrderExecutor:
     # ══════════════════════════════════════════════════════════════
 
     def sync_with_balance(self, balance: AccountBalance, watch_symbols=()) -> None:
+        """잔고 대조 후 ERROR·orphan 복구 사건 ID를 갱신합니다(8-F)."""
+        try:
+            self._sync_with_balance_impl(balance, watch_symbols)
+        finally:
+            self._refresh_recovery_ids()
+
+    def _sync_with_balance_impl(self, balance: AccountBalance, watch_symbols=()) -> None:
         """Reconcile holdings and tracked orders through lifecycle methods.
 
         Lifecycle states gate real orders; ERROR and unresolved orders are
@@ -1052,43 +1063,99 @@ class OrderExecutor:
     # 사람 확인 파일 명령 (폴더 경로 인자화 + 8-A: BOM 허용·입력 검증·처리 파일 보관)
     # ══════════════════════════════════════════════════════════════
 
-    def _process_pending_ack_error_commands(self) -> None:
-        """commands/ack_error_{symbol}.json 파일로 ERROR 상태를 정정합니다.
+    # ── 복구 사건 ID (8-F, R4 후속) ───────────────────────────────
+    # ERROR·orphan이 생길 때마다 이 프로세스에서 새 복구 사건 ID를 발급합니다.
+    # 명령 파일은 이 ID를 담아야 적용됩니다 — 예전 사건(또는 재시작 전)을 위해 쓴
+    # 명령이 새 주문의 ERROR·orphan을 풀지 못하게 하기 위함입니다. 재시작하면
+    # 복원된 ERROR에도 새 ID가 붙으므로, 재시작 전에 쓴 명령은 자동으로 무효입니다.
+    RECOVERY_FILE = "recovery_required.json"
 
-        사용법 (PowerShell):
-            $body = @{ broker_quantity = 100; note = "HTS 직접 확인" } | ConvertTo-Json
-            $body | Out-File -Encoding utf8 commands\\ack_error_475150.json
-        처리 후 파일은 삭제하지 않고 commands/processed/ 또는 commands/failed/로
-        옮깁니다(실패 시 사유는 같은 이름의 .error.txt). BOM 있는 UTF-8도 읽습니다.
+    def recovery_id(self, symbol: str, kind: str) -> str | None:
+        rec = self._recovery_ids.get((symbol, kind))
+        return rec["recovery_id"] if rec else None
+
+    def _refresh_recovery_ids(self) -> None:
+        psm = self._position_state_machine
+        changed = False
+        for sym, st in list(psm._states.items()):
+            for kind, active, order_id in (
+                ("ERROR", st.lifecycle == PositionLifecycle.ERROR, st.pending_order_id),
+                ("ORPHAN", bool(st.orphan_order_id), st.orphan_order_id),
+            ):
+                key = (sym, kind)
+                if active and key not in self._recovery_ids:
+                    rid = f"{kind}-{sym}-{uuid.uuid4().hex[:8]}"
+                    self._recovery_ids[key] = {
+                        "symbol": sym, "kind": kind, "recovery_id": rid,
+                        "since": self._now().isoformat(timespec="seconds"),
+                        "order_id": order_id or "", "last_error": st.last_error or "",
+                    }
+                    changed = True
+                    cmd = "ack_error" if kind == "ERROR" else "ack_orphan"
+                    self.app_logger.critical(
+                        f"[RECOVERY_REQUIRED] {sym} | {kind} | recovery_id={rid} | order={order_id or '-'} — "
+                        f"HTS 확인 후 commands/{cmd}_{sym}.json 에 \"recovery_id\": \"{rid}\" 포함 "
+                        f"(목록: commands/{self.RECOVERY_FILE})"
+                    )
+                elif not active and key in self._recovery_ids:
+                    self._recovery_ids.pop(key)
+                    changed = True
+        if changed:
+            self._write_recovery_file()
+
+    def _write_recovery_file(self) -> None:
+        try:
+            self._commands_dir.mkdir(parents=True, exist_ok=True)
+            path = self._commands_dir / self.RECOVERY_FILE
+            tmp = path.with_name(path.name + ".tmp")
+            items = []
+            for rec in sorted(self._recovery_ids.values(), key=lambda r: (r["symbol"], r["kind"])):
+                tpl = {"recovery_id": rec["recovery_id"], "note": "HTS 확인 내용"}
+                if rec["kind"] == "ERROR":
+                    tpl = {"recovery_id": rec["recovery_id"], "broker_quantity": "<HTS에서 확인한 수량>",
+                           "note": "HTS 확인 내용"}
+                items.append({**rec, "command_file": f"ack_{rec['kind'].lower()}_{rec['symbol']}.json",
+                              "command_template": tpl})
+            tmp.write_text(json.dumps({"generated_at": self._now().isoformat(timespec="seconds"),
+                                       "items": items}, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception as exc:
+            self.app_logger.error(f"[RECOVERY_REQUIRED] 목록 파일 저장 실패(복구 ID는 app.log에 있음): {exc}")
+
+    def _check_recovery_id(self, symbol: str, kind: str, payload: dict) -> str:
+        current = self.recovery_id(symbol, kind)
+        given = payload.get("recovery_id")
+        if current is None:
+            raise ValueError(f"{symbol}: 현재 {kind} 복구 사건이 없음 — 명령을 적용할 대상이 아님")
+        if given != current:
+            raise ValueError(
+                f"{symbol}: recovery_id 불일치(명령 {given!r} ≠ 현재 {current}) — 이전 사건·재시작 전에 쓴 "
+                f"명령은 적용하지 않음. commands/{self.RECOVERY_FILE}의 현재 ID로 다시 작성하세요")
+        return current
+
+    # ── 명령 확보 → 실행 → 보관 (8-F) ───────────────────────────
+    def _claim_command(self, cmd_file: Path, tag: str, symbol: str) -> Path | None:
+        """실행 **전에** 명령을 commands/processing/으로 원자적으로 옮깁니다.
+
+        옮기지 못하면 실행하지 않습니다(원문은 그대로 — 다음 폴링·재시작에서 다시
+        확보를 시도). 확보한 뒤에는 원래 경로에 파일이 없으므로, 이후 보관이 실패해도
+        재시작 후 같은 명령이 다시 실행되지 않습니다.
         """
-        commands_dir = self._commands_dir
-        if not commands_dir.is_dir():
-            return
-        for cmd_file in sorted(commands_dir.glob("ack_error_*.json")):
-            symbol = cmd_file.stem[len("ack_error_"):]
-            if self._command_signature(cmd_file) in self._held_commands:
-                continue   # 8-E: 이미 처리했지만 보관 못 한 명령 — 재실행 금지
-            try:
-                payload = _read_command_json(cmd_file)
-                broker_quantity = payload.get("broker_quantity")
-                if type(broker_quantity) is not int or broker_quantity < 0:
-                    raise ValueError(f"broker_quantity는 0 이상 정수여야 합니다: {broker_quantity!r}")
-                raw_note = payload.get("note")
-                if not isinstance(raw_note, str) or not raw_note.strip():
-                    raise ValueError("note는 비어 있지 않은 문자열이어야 합니다")
-                note = raw_note.strip()
-                self._position_state_machine.acknowledge_error(symbol, broker_quantity, note)
-                self.app_logger.warning(
-                    f"[ACK_ERROR_COMMAND] {symbol} | 파일 명령으로 ERROR 해제 — "
-                    f"broker_quantity={broker_quantity}, note={note!r}"
-                )
-            except Exception as exc:
-                self.app_logger.error(
-                    f"[ACK_ERROR_COMMAND] {symbol} | 명령 실행 실패, 상태 변경 없음: {exc} — 파일을 고쳐 commands/에 다시 넣으세요"
-                )
-                self._settle_command(cmd_file, "ACK_ERROR_COMMAND", symbol, ok=False, error=f"{type(exc).__name__}: {exc}")
-            else:
-                self._settle_command(cmd_file, "ACK_ERROR_COMMAND", symbol, ok=True)
+        sub = cmd_file.parent / "processing"
+        stamp = now_kst().strftime("%Y%m%d_%H%M%S_%f")
+        dest = sub / f"{cmd_file.stem}.{stamp}{cmd_file.suffix}"
+        try:
+            sub.mkdir(parents=True, exist_ok=True)
+            cmd_file.replace(dest)
+            return dest
+        except OSError as exc:
+            sig = self._command_signature(cmd_file)
+            if sig not in self._claim_failed:
+                self._claim_failed.add(sig)
+                self.app_logger.critical(
+                    f"[{tag}] {symbol} | 명령 확보 실패 — 실행하지 않음(원문 그대로): {type(exc).__name__}: {exc}. "
+                    f"commands/processing 폴더 권한·경로 충돌 확인")
+            return None
 
     @staticmethod
     def _command_signature(path: Path) -> tuple[str, int, int]:
@@ -1098,29 +1165,70 @@ class OrderExecutor:
         except OSError:
             return (str(path), -1, -1)
 
-    def _settle_command(self, cmd_file: Path, tag: str, symbol: str, *, ok: bool, error: str = "") -> None:
-        """실행 결과(ok)와 별개로 보관 결과를 처리·기록합니다 (8-E, R4).
+    def _settle_command(self, claimed: Path, tag: str, symbol: str, *, ok: bool, error: str = "") -> None:
+        """실행 결과(ok)와 별개로 보관 결과를 처리·기록합니다.
 
-        보관(processed/·failed/ 이동)에 실패해도 원문을 지우지 않습니다. 같은 폴더에서
-        `.hold`로 이름을 바꿔 다시 실행되지 않게 하고, 그것도 안 되면 원문을 그대로 둔 채
-        이 프로세스에서는 같은 내용의 파일을 다시 실행하지 않습니다.
+        보관(processing/ → processed/·failed/)에 실패하면 원문은 processing/에 그대로
+        남습니다 — processing/은 실행 대상이 아니므로 재시작해도 다시 실행되지 않습니다.
         """
-        signature = self._command_signature(cmd_file)
-        result = _archive_command(cmd_file, ok=ok, error=error)
+        result = _archive_command(claimed, ok=ok, error=error)
         if result.archived is not None:
             return
         outcome = "실행 성공(상태 변경됨)" if ok else "실행 실패(상태 변경 없음)"
-        if result.held is None:
-            self._held_commands.add(signature)
         self.app_logger.critical(
             f"[{tag}] {symbol} | {outcome} — 그러나 명령 파일 보관 실패: {result.detail}. "
-            f"원문은 보존({result.held or cmd_file}), 이 프로세스에서 재실행하지 않음. 폴더 권한·경로 충돌 확인"
+            f"원문은 {claimed}에 보존(실행 대상 아님, 재시작해도 재실행 안 됨). 폴더 권한·경로 충돌 확인"
         )
+
+    def _process_pending_ack_error_commands(self) -> None:
+        """commands/ack_error_{symbol}.json 파일로 ERROR 상태를 정정합니다.
+
+        payload: {"recovery_id": "<현재 복구 사건 ID>", "broker_quantity": 100, "note": "HTS 직접 확인"}
+        recovery_id는 app.log [RECOVERY_REQUIRED] 또는 commands/recovery_required.json에 있습니다.
+        사용법 (PowerShell):
+            $body = @{ recovery_id = "ERROR-475150-1a2b3c4d"; broker_quantity = 100; note = "HTS 직접 확인" } | ConvertTo-Json
+            $body | Out-File -Encoding utf8 commands\\ack_error_475150.json
+        실행 전 commands/processing/으로 확보하고, 실행 후 commands/processed/ 또는
+        commands/failed/로 옮깁니다(실패 사유는 .error.txt). BOM 있는 UTF-8도 읽습니다.
+        """
+        commands_dir = self._commands_dir
+        if not commands_dir.is_dir():
+            return
+        for cmd_file in sorted(commands_dir.glob("ack_error_*.json")):
+            symbol = cmd_file.stem[len("ack_error_"):]
+            if self._command_signature(cmd_file) in self._claim_failed:
+                continue
+            claimed = self._claim_command(cmd_file, "ACK_ERROR_COMMAND", symbol)
+            if claimed is None:
+                continue
+            try:
+                payload = _read_command_json(claimed)
+                rid = self._check_recovery_id(symbol, "ERROR", payload)
+                broker_quantity = payload.get("broker_quantity")
+                if type(broker_quantity) is not int or broker_quantity < 0:
+                    raise ValueError(f"broker_quantity는 0 이상 정수여야 합니다: {broker_quantity!r}")
+                raw_note = payload.get("note")
+                if not isinstance(raw_note, str) or not raw_note.strip():
+                    raise ValueError("note는 비어 있지 않은 문자열이어야 합니다")
+                note = raw_note.strip()
+                self._position_state_machine.acknowledge_error(symbol, broker_quantity, f"{note} [{rid}]")
+                self.app_logger.warning(
+                    f"[ACK_ERROR_COMMAND] {symbol} | 파일 명령으로 ERROR 해제 — recovery_id={rid}, "
+                    f"broker_quantity={broker_quantity}, note={note!r}"
+                )
+            except Exception as exc:
+                self.app_logger.error(
+                    f"[ACK_ERROR_COMMAND] {symbol} | 명령 실행 실패, 상태 변경 없음: {exc} — 파일을 고쳐 commands/에 다시 넣으세요"
+                )
+                self._settle_command(claimed, "ACK_ERROR_COMMAND", symbol, ok=False, error=f"{type(exc).__name__}: {exc}")
+            else:
+                self._settle_command(claimed, "ACK_ERROR_COMMAND", symbol, ok=True)
+        self._refresh_recovery_ids()
 
     def _process_pending_ack_orphan_commands(self) -> None:
         """commands/ack_orphan_{symbol}.json 파일로 orphan을 해제합니다.
 
-        payload: {"note": "HTS에서 미체결 없음 확인"} (비어 있지 않은 문자열 필수)
+        payload: {"recovery_id": "<현재 복구 사건 ID>", "note": "HTS에서 미체결 없음 확인"}
         해제 시 이 종목의 보류 중인 매수/매도 부작용 컨텍스트도 함께 버립니다
         (원본과 동일 — 훅은 호출되지 않음).
         """
@@ -1129,10 +1237,13 @@ class OrderExecutor:
             return
         for cmd_file in sorted(commands_dir.glob("ack_orphan_*.json")):
             symbol = cmd_file.stem[len("ack_orphan_"):]
-            if self._command_signature(cmd_file) in self._held_commands:
-                continue   # 8-E: 이미 처리했지만 보관 못 한 명령 — 재실행 금지
+            if self._command_signature(cmd_file) in self._claim_failed:
+                continue
+            claimed = self._claim_command(cmd_file, "ACK_ORPHAN_COMMAND", symbol)
+            if claimed is None:
+                continue
             try:
-                payload = _read_command_json(cmd_file)
+                payload = _read_command_json(claimed)
                 raw_note = payload.get("note")
                 if not isinstance(raw_note, str) or not raw_note.strip():
                     raise ValueError("note는 비어 있지 않은 문자열이어야 합니다")
@@ -1141,13 +1252,14 @@ class OrderExecutor:
                     raise ValueError(
                         f"{symbol}: 현재 orphan 주문이 없어 ack_orphan을 적용할 수 없습니다"
                     )
-                self._position_state_machine.acknowledge_orphan(symbol, note)
+                rid = self._check_recovery_id(symbol, "ORPHAN", payload)
+                self._position_state_machine.acknowledge_orphan(symbol, f"{note} [{rid}]")
                 had_buy_ctx = symbol in self._pending_buy_side_effects
                 had_sell_ctx = symbol in self._pending_sell_side_effects
                 self._pending_buy_side_effects.pop(symbol, None)
                 self._pending_sell_side_effects.pop(symbol, None)
                 self.app_logger.warning(
-                    f"[ACK_ORPHAN_COMMAND] {symbol} | 파일 명령으로 orphan 해제 — "
+                    f"[ACK_ORPHAN_COMMAND] {symbol} | 파일 명령으로 orphan 해제 — recovery_id={rid}, "
                     f"note={note!r}, buy_ctx_cleared={had_buy_ctx}, "
                     f"sell_ctx_cleared={had_sell_ctx}"
                 )
@@ -1155,9 +1267,10 @@ class OrderExecutor:
                 self.app_logger.error(
                     f"[ACK_ORPHAN_COMMAND] {symbol} | 명령 실행 실패, 상태 변경 없음: {exc} — 파일을 고쳐 commands/에 다시 넣으세요"
                 )
-                self._settle_command(cmd_file, "ACK_ORPHAN_COMMAND", symbol, ok=False, error=f"{type(exc).__name__}: {exc}")
+                self._settle_command(claimed, "ACK_ORPHAN_COMMAND", symbol, ok=False, error=f"{type(exc).__name__}: {exc}")
             else:
-                self._settle_command(cmd_file, "ACK_ORPHAN_COMMAND", symbol, ok=True)
+                self._settle_command(claimed, "ACK_ORPHAN_COMMAND", symbol, ok=True)
+        self._refresh_recovery_ids()
 
 
 # ── 사람 확인 파일 명령 보관 (8-A, F7) ──────────────────────────────
@@ -1172,41 +1285,32 @@ def _read_command_json(path: Path) -> dict:
 @dataclass(frozen=True)
 class CommandArchiveResult:
     archived: Path | None      # processed/·failed/로 옮긴 경로 (성공 시)
-    held: Path | None          # 옮기지 못해 같은 폴더에서 이름만 바꾼 경로(.hold)
     detail: str = ""
 
 
-def _archive_command(path: Path, *, ok: bool, error: str = "") -> CommandArchiveResult:
-    """명령 파일을 processed/ 또는 failed/로 옮깁니다(삭제하지 않음 — 재현·감사용).
+def _archive_command(claimed: Path, *, ok: bool, error: str = "") -> CommandArchiveResult:
+    """processing/에 확보된 명령을 processed/ 또는 failed/로 옮깁니다(삭제하지 않음).
 
-    8-E (R4): 옮기기에 실패해도 **원문을 지우지 않습니다**. 같은 폴더에서
-    `<이름>.json.hold`로 바꿔 재실행 대상(glob `*.json`)에서 빼고, 실패 사유는
-    `<이름>.json.hold.error.txt`에 남깁니다. 이름 바꾸기도 실패하면 원문을 그대로
-    둡니다(호출부가 같은 내용 재실행을 막음).
+    8-F: 옮기지 못하면 processing/에 그대로 둡니다(실행 대상 아님). 실패 사유는
+    가능하면 같은 위치에 `.error.txt`로 남깁니다.
     """
-    sub = path.parent / ("processed" if ok else "failed")
-    stamp = now_kst().strftime("%Y%m%d_%H%M%S_%f")
-    dest = sub / f"{path.stem}.{stamp}{path.suffix}"
+    sub = claimed.parent.parent / ("processed" if ok else "failed")
+    dest = sub / claimed.name
     try:
         sub.mkdir(parents=True, exist_ok=True)
-        path.replace(dest)
+        claimed.replace(dest)
     except OSError as move_exc:
         reason = f"보관 폴더로 이동 실패: {type(move_exc).__name__}: {move_exc}"
-        hold = path.with_name(f"{path.name}.{stamp}.hold")
         try:
-            path.replace(hold)
-        except OSError as hold_exc:
-            return CommandArchiveResult(None, None, f"{reason}; 보류 이름 변경도 실패: {hold_exc}")
-        try:
-            Path(str(hold) + ".error.txt").write_text(
+            claimed.with_suffix(".error.txt").write_text(
                 (error + "\n" if error else "") + ("실행 성공 — " if ok else "실행 실패 — ") + reason + "\n",
                 encoding="utf-8")
         except OSError:
             pass
-        return CommandArchiveResult(None, hold, reason)
+        return CommandArchiveResult(None, reason)
     if not ok:
         try:
             dest.with_suffix(".error.txt").write_text(error + "\n", encoding="utf-8")
         except OSError as exc:
-            return CommandArchiveResult(dest, None, f"사유 파일 기록 실패: {exc}")
-    return CommandArchiveResult(dest, None)
+            return CommandArchiveResult(dest, f"사유 파일 기록 실패: {exc}")
+    return CommandArchiveResult(dest)

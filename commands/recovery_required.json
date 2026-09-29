@@ -1,0 +1,18 @@
+{
+  "generated_at": "2026-09-28T10:02:00",
+  "items": [
+    {
+      "symbol": "000660",
+      "kind": "ORPHAN",
+      "recovery_id": "ORPHAN-000660-d8057764",
+      "since": "2026-09-28T10:02:00",
+      "order_id": "0000001",
+      "last_error": "",
+      "command_file": "ack_orphan_000660.json",
+      "command_template": {
+        "recovery_id": "ORPHAN-000660-d8057764",
+        "note": "HTS 확인 내용"
+      }
+    }
+  ]
+}

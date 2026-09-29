@@ -96,9 +96,15 @@ for step in SCENARIOS[scen_name]:
         oid = f"{step[1]:07d}"
         broker.status[oid] = RuntimeError("api down") if step[2] == "RAISE" else BrokerOrderStatus[step[2]]
     elif k == "ack_error":
-        (Path("commands") / f"ack_error_{step[1]}.json").write_text(json.dumps({"broker_quantity": step[2], "note": "t"}), encoding="utf-8")
+        payload = {"broker_quantity": step[2], "note": "t"}
+        if mode != "orig":   # 스윙 8-F: 현재 복구 사건 ID 필요
+            payload["recovery_id"] = obj.recovery_id(step[1], "ERROR")
+        (Path("commands") / f"ack_error_{step[1]}.json").write_text(json.dumps(payload), encoding="utf-8")
     elif k == "ack_orphan":
-        (Path("commands") / f"ack_orphan_{step[1]}.json").write_text(json.dumps({"note": "t"}), encoding="utf-8")
+        payload = {"note": "t"}
+        if mode != "orig":
+            payload["recovery_id"] = obj.recovery_id(step[1], "ORPHAN")
+        (Path("commands") / f"ack_orphan_{step[1]}.json").write_text(json.dumps(payload), encoding="utf-8")
     elif k == "restart":
         obj = build()
     snap = snapshot(psm(), obj.state.unresolved_order_intents, journal(), obj._pending_buy_side_effects, obj._pending_sell_side_effects, broker.calls)
