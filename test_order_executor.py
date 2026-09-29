@@ -511,7 +511,12 @@ check("19-1) 매도 30주 요청 → 목표 잔고 70 고정, 저널에도 70",
       and e.journal()["005930"].base_quantity_before_order == 100)
 e.broker.positions["005930"] = 70
 e.sync()
-check("19-2) [F2 재현] 30주 전부 체결(잔고 70) → OPEN, 미해결 주문 없음",
+check("19-2) [R1] 잔고가 목표(70)에 도달해도 주문 종료 증거 전에는 SELL_PENDING·저널 유지",
+      e.st("005930").lifecycle == L.SELL_PENDING and e.ex.has_unresolved_orders() and "005930" in e.journal())
+e.age("005930", 31)
+e.broker.status["0000001"] = BrokerOrderStatus.FILLED
+e.sync()
+check("19-2b) 주문 FILLED + 잔고 70 → OPEN, 미해결 주문 없음",
       e.st("005930").lifecycle == L.OPEN and not e.ex.has_unresolved_orders()
       and e.st("005930").pending_order_id is None and e.st("005930").known_quantity == 70)
 check("19-3) 저널·주문 의도 정리", "005930" not in e.journal() and "005930" not in e.ex.state.unresolved_order_intents)
@@ -520,7 +525,7 @@ check("19-4) 분할청산은 청산 훅을 부르지 않고 보류 컨텍스트�
 sub = e.ex.submit_sell("005930", 70, 70_000)
 e.broker.positions["005930"] = 0
 e.sync()
-check("19-5) 이어서 남은 70주 전량 매도 → FLAT, 청산 훅 1회",
+check("19-5) 이어서 남은 70주 전량 매도 → FLAT, 청산 훅 1회(전량은 잔고 0으로 확정)",
       sub.accepted and e.st("005930").lifecycle == L.FLAT and len(e.closes) == 1)
 
 e = held100()
@@ -539,7 +544,12 @@ e.sync()
 check("19-8) 목표(70) 미도달 변화는 orphan 유지", e.ex.position_state_machine.has_orphan_order("005930"))
 e.broker.positions["005930"] = 70
 e.sync()
-check("19-9) 목표 잔고 70 도달 → orphan 해제", not e.ex.position_state_machine.has_orphan_order("005930")
+check("19-9) [R1] orphan: 목표 잔고 70 도달만으로는 해제 안 함",
+      e.ex.position_state_machine.has_orphan_order("005930") and e.ex.has_unresolved_orders())
+e.ex._last_order_status_query_at.pop("005930", None)
+e.broker.status["0000001"] = BrokerOrderStatus.FILLED
+e.sync()
+check("19-9b) orphan: FILLED + 잔고 70 → 해제", not e.ex.position_state_machine.has_orphan_order("005930")
       and not e.ex.has_unresolved_orders())
 
 e = held100()
@@ -572,6 +582,75 @@ e2.broker.positions["005930"] = 70
 e2.ex.restore_order_recovery_blocks()
 check("19-13) 분할청산 도중 재시작 → 저널 목표 70 보존, 자동 확정 없이 ERROR 복원(사람 확인)",
       e2.journal()["005930"].target_quantity_after_order == 70 and e2.st("005930").lifecycle == L.ERROR)
+
+# ── 20. R1: 주문 종료 증거 없이는 분할청산 차단 유지 ─────────────
+for label, status in (("OPEN", BrokerOrderStatus.OPEN), ("UNKNOWN", BrokerOrderStatus.UNKNOWN),
+                      ("조회 오류", RuntimeError("api down"))):
+    e = held100()
+    e.ex.submit_sell("005930", 30, 70_000)
+    e.age("005930", 31)
+    e.broker.status["0000001"] = status
+    e.broker.positions["005930"] = 70
+    e.sync()
+    n_calls = len(e.broker.place_calls)
+    sub = e.ex.submit_sell("005930", 70, 70_000)
+    check(f"20-{label}) [R1 재현] 잔고 70·주문 조회 {label} → 차단·저널 유지, 추가 SELL 전송 0회",
+          e.st("005930").lifecycle == L.SELL_PENDING and "005930" in e.journal()
+          and not sub.accepted and len(e.broker.place_calls) == n_calls)
+e = held100()
+e.ex.submit_sell("005930", 30, 70_000)
+e.age("005930", 31)
+e.broker.status["0000001"] = BrokerOrderStatus.FILLED
+e.broker.positions["005930"] = 90
+e.sync()
+check("20-4) FILLED + 잔고 90(목표 70 미도달) → 계속 대조 필요(SELL_PENDING)", e.st("005930").lifecycle == L.SELL_PENDING)
+e = held100()
+e.ex.submit_sell("005930", 30, 70_000)
+e.broker.positions["005930"] = 70
+e.sync()
+e.age("005930", 120)
+e.sync()
+check("20-5) 목표 도달 상태로 타임아웃 → 증거 없으므로 orphan으로 차단 유지",
+      e.ex.position_state_machine.has_orphan_order("005930")
+      and e.ex.submit_sell("005930", 70, 70_000).block_code != "")
+
+# ── 21. R4: 명령 보관 실패 시 원문 보존·재실행 금지 ───────────────
+from unittest.mock import patch  # noqa: E402
+
+e = _error_env()
+(e.cmd_dir / "failed").write_text("경로 충돌", encoding="utf-8")        # failed/가 폴더가 아니라 파일
+(e.cmd_dir / "ack_error_005930.json").write_bytes(b"{broken")
+e.sync()
+holds = list(e.cmd_dir.glob("ack_error_005930.json.*.hold"))
+check("21-1) [R4 재현] failed/ 경로 충돌 → 원문 삭제 없이 .hold로 보존, 사유 파일, ERROR 유지",
+      len(holds) == 1 and holds[0].read_bytes() == b"{broken"
+      and len(list(e.cmd_dir.glob("*.hold.error.txt"))) == 1 and e.st("005930").lifecycle == L.ERROR
+      and "보관 실패" in e.critical_text())
+
+e = _error_env()
+(e.cmd_dir / "processed").write_text("경로 충돌", encoding="utf-8")
+(e.cmd_dir / "ack_error_005930.json").write_text(json.dumps({"broker_quantity": 0, "note": "HTS"}), encoding="utf-8")
+calls = []
+orig_ack = e.ex.position_state_machine.acknowledge_error
+e.ex.position_state_machine.acknowledge_error = lambda *a: (calls.append(a), orig_ack(*a))
+e.sync()
+e.sync()
+check("21-2) 실행 성공·보관 실패 → '실행 성공(상태 변경됨)'으로 기록, 원문 보존, 재실행 없음",
+      len(calls) == 1 and e.st("005930").lifecycle != L.ERROR
+      and len(list(e.cmd_dir.glob("ack_error_005930.json.*.hold"))) == 1
+      and "실행 성공(상태 변경됨)" in e.critical_text())
+
+e = _error_env()
+(e.cmd_dir / "ack_error_005930.json").write_text(json.dumps({"broker_quantity": 0, "note": "HTS"}), encoding="utf-8")
+calls = []
+orig_ack = e.ex.position_state_machine.acknowledge_error
+e.ex.position_state_machine.acknowledge_error = lambda *a: (calls.append(a), orig_ack(*a))
+with patch("pathlib.Path.replace", side_effect=PermissionError("locked")):
+    e.sync()
+    e.sync()
+check("21-3) 이동·이름 변경 모두 실패 → 원문 그대로, 같은 내용은 이 프로세스에서 재실행 안 함",
+      (e.cmd_dir / "ack_error_005930.json").exists() and len(calls) == 1
+      and "보류 이름 변경도 실패" in e.critical_text())
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

@@ -301,6 +301,7 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
         settings=settings, broker=broker, state=state, highest_price=hp, state_store=state_store,
         app_logger=app_logger, trade_logger=TradeCsvLogger(settings.storage.trade_log_file),
         position_lifecycle_logger=PositionLifecycleLogger(settings.storage.position_lifecycle_log_file),
+        clock=clock,   # 테스트의 가짜 시계 (운영은 None → datetime.now)
     )
     after_close = None
     if settings.session.update_daily_bars_after_close and isinstance(broker, KiwoomBroker):
@@ -316,24 +317,35 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
         quote_source=quote_source if quote_source is not None else (
             KiwoomQuoteSource(broker, logger=app_logger) if isinstance(broker, KiwoomBroker) else None),
     )
+    import uuid as _uuid
     try:
         summary = runner.run()
     finally:
         executor.shutdown()
+    summary.run_id = _uuid.uuid4().hex[:12]
     if summary.status != "CLOSED_DAY":
+        missing = ""
+        if summary.final_reconcile is None:
+            last_at = runner.last_balance_at
+            missing = ("마감 후 잔고 조회·대조 실패"
+                       + (f" (마지막 성공 잔고 {last_at:%H:%M:%S} — 마감 검증에 사용 불가)" if last_at else ""))
         try:
             from app.reports import generate_daily_report
-            generate_daily_report(settings, summary.trade_date, balance=runner.last_balance,
+            generate_daily_report(settings, summary.trade_date, balance=None,
                                   reconcile_report=summary.final_reconcile, session_lines=summary.lines(),
-                                  calendar=calendar, logger=app_logger, today=summary.trade_date)
+                                  calendar=calendar, logger=app_logger, today=summary.trade_date,
+                                  final_only=True, reconcile_missing_reason=missing,
+                                  close_check=summary.close_check, close_issues=summary.close_issues)
             summary.report = "OK"
         except Exception as exc:
             summary.report = f"FAILED: {type(exc).__name__}: {exc}"
             app_logger.error(f"[REPORT] 일일 리포트 생성 실패(매매 결과에는 영향 없음): {type(exc).__name__}: {exc}")
-            if summary.close_check == "VERIFIED":
-                summary.add_close_issue("REPORT_FAILED")
-                app_logger.critical("[SESSION_CLOSE] 마감 검증 NEEDS_REVIEW — REPORT_FAILED")
-        write_session_status(settings, summary, app_logger)
+            summary.add_close_issue("REPORT_FAILED")
+            app_logger.critical(f"[SESSION_CLOSE] {summary.close_check} — REPORT_FAILED")
+        if write_session_status(settings, summary, app_logger) is None:
+            summary.add_close_issue("STATUS_WRITE_FAILED")
+            app_logger.critical(f"[SESSION_CLOSE] 상태 파일 저장 실패 — {summary.close_check}, "
+                                f"{', '.join(summary.close_issues)} (run_id={summary.run_id})")
     return summary
 
 
@@ -345,6 +357,7 @@ def write_session_status(settings, summary, app_logger) -> Path | None:
     import json as _json
     import os as _os
     import tempfile as _tempfile
+    tmp = path = None
     try:
         d = Path(settings.storage.reports_dir)
         d.mkdir(parents=True, exist_ok=True)
@@ -356,10 +369,24 @@ def write_session_status(settings, summary, app_logger) -> Path | None:
             fh.flush()
             _os.fsync(fh.fileno())
         _os.replace(tmp, path)
+        tmp = None
         return path
     except Exception as exc:
         app_logger.error(f"[SESSION_STATUS] 상태 파일 저장 실패: {type(exc).__name__}: {exc}")
+        # 8-E (R3): 같은 날짜의 이전 실행 파일이 이번 결과처럼 보이지 않게 치움
+        if path is not None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as rm_exc:
+                app_logger.critical(f"[SESSION_STATUS] 이전 상태 파일이 남아 있음(이번 실행 결과 아님): "
+                                    f"{path} — {rm_exc}")
         return None
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _make_daily_bar_updater(settings, broker, calendar, state, ledger_store, app_logger):
@@ -394,8 +421,9 @@ def main() -> int:
     check_only = "--check-only" in sys.argv[1:]
     try:
         summary = asyncio.run(async_main(check_only=check_only))
-        if getattr(summary, "close_check", "") == "NEEDS_REVIEW":
-            print(f"\n[주의] 마감 검증 NEEDS_REVIEW — {', '.join(summary.close_issues)} (app.log [SESSION_CLOSE])")
+        if getattr(summary, "close_check", "") == "NEEDS_REVIEW" or getattr(summary, "close_issues", None):
+            print(f"\n[주의] 마감 검증 {summary.close_check} — {', '.join(summary.close_issues)} "
+                  f"(app.log [SESSION_CLOSE])")
             exit_code = 2
     except KeyboardInterrupt:
         print("\n[종료] Ctrl+C 감지 — 정상 종료 처리 중...")

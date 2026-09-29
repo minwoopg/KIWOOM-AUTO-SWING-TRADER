@@ -76,6 +76,7 @@ class SessionSummary:
     final_reconcile: ReconcileReport | None = None
     denied_codes: dict[str, int] = field(default_factory=dict)
     # 8-D (F5): 마감 검증
+    run_id: str = ""                     # 8-E (R3): 이번 실행 식별자
     close_check: str = ""                # "" (휴장일) / VERIFIED / NEEDS_REVIEW / NOT_RUN (마감 전 중지)
     close_issues: list[str] = field(default_factory=list)
     final_balance_at: datetime | None = None
@@ -89,9 +90,15 @@ class SessionSummary:
         if self.close_check in ("VERIFIED", ""):
             self.close_check = "NEEDS_REVIEW"
 
+    @property
+    def needs_attention(self) -> bool:
+        """종료 코드 2 대상: 마감 검증 실패 또는 (마감 전 중지 등에서도) 기록된 문제."""
+        return self.close_check == "NEEDS_REVIEW" or bool(self.close_issues)
+
     def to_status_dict(self) -> dict:
         iso = lambda v: v.isoformat(timespec="seconds") if v else None
         return {
+            "run_id": self.run_id, "generated_at": datetime.now().isoformat(timespec="seconds"),
             "trade_date": self.trade_date.isoformat() if self.trade_date else None,
             "status": self.status, "close_check": self.close_check, "close_issues": list(self.close_issues),
             "final_balance_at": iso(self.final_balance_at), "final_reconcile_at": iso(self.final_reconcile_at),
@@ -444,6 +451,10 @@ class SessionRunner:
             self.log.info("[SESSION_CLOSE] 마감 검증 VERIFIED — 마감 후 잔고·장부 대조 일치, 미해결 주문 없음")
         else:
             self.log.critical(f"[SESSION_CLOSE] 마감 검증 NEEDS_REVIEW — {', '.join(s.close_issues)}")
+
+    @property
+    def last_balance_at(self) -> datetime | None:
+        return self._last_balance_ok_at
 
     @property
     def last_reconcile(self) -> ReconcileReport | None:

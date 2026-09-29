@@ -36,9 +36,17 @@ def generate_daily_report(
     calendar: TradingCalendar | None = None,
     logger=None,
     today: date | None = None,
+    final_only: bool = False,
+    reconcile_missing_reason: str = "",
+    close_check: str = "",
+    close_issues: list[str] | None = None,
 ) -> Path:
     """trade_date가 오늘(today, 기본 date.today())보다 이전이면 과거 재생성:
-    기준일까지의 원장만 쓰고, 현재 잔고·메타·주문 상태는 쓰지 않습니다 (8-D, F6)."""
+    기준일까지의 원장만 쓰고, 현재 잔고·메타·주문 상태는 쓰지 않습니다 (8-D, F6).
+
+    final_only=True(세션 마감 보고서, 8-E R2): 넘겨받은 최종 대조 결과만 쓰고,
+    잔고로 다시 대조하지 않습니다. 최종 대조가 없으면 reconcile_missing_reason을
+    표시합니다(오래된 잔고로 "일치"를 만들지 않음)."""
     calendar = calendar or TradingCalendar.load()
     historical = trade_date < (today or date.today())
     events = FillLedgerStore(settings.storage.fill_ledger_file).load()
@@ -52,7 +60,7 @@ def generate_daily_report(
     closes = latest_closes(DailyBarStore(settings.market_data.daily_bars_dir), symbols, trade_date)
     if historical:
         balance, reconcile_report = None, None
-    elif reconcile_report is None and balance is not None:
+    elif reconcile_report is None and balance is not None and not final_only:
         reconcile_report = reconcile(apply_events(events), balance, state.positions,
                                      in_flight_symbols=set(state.unresolved_order_intents) | {j for j in journal if not j.startswith("(")})
     cost_model = None
@@ -67,6 +75,8 @@ def generate_daily_report(
         unresolved_intents=sorted(state.unresolved_order_intents), journal_symbols=journal,
         reconcile=reconcile_report, balance_available=balance is not None or reconcile_report is not None,
         session_lines=session_lines or [], generated_at=datetime.now(), historical=historical,
+        reconcile_missing_reason=reconcile_missing_reason if reconcile_report is None else "",
+        close_check=close_check, close_issues=list(close_issues or []),
     ), calendar=calendar, cost_model=cost_model)
     path = write_report(settings.storage.reports_dir, trade_date, text)
     if logger is not None:

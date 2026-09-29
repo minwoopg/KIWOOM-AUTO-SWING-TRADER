@@ -49,6 +49,9 @@ class ReportInputs:
     session_lines: list[str] = field(default_factory=list)
     generated_at: datetime | None = None
     historical: bool = False     # 과거 날짜 재생성 — 생성 시점 상태(메타·주문·대조) 표시 안 함
+    reconcile_missing_reason: str = ""   # 8-E (R2): 대조를 시도했지만 최종 결과가 없음 — 이유
+    close_check: str = ""                # 8-E (R2): 세션 마감 검증 결과 (VERIFIED / NEEDS_REVIEW ...)
+    close_issues: list[str] = field(default_factory=list)
 
 
 def _won(v: float | int | None) -> str:
@@ -195,8 +198,14 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
                  " — 다음 기동 시 ERROR로 복원됨, HTS 확인 후 `commands/ack_error_<종목>.json`")
     else:
         L.append("- 미해결 주문 없음")
+    if inp.close_check:
+        mark = "" if inp.close_check == "VERIFIED" else "⚠ "
+        L.append(f"- {mark}마감 검증: {inp.close_check}"
+                 + (f" — {', '.join(inp.close_issues)}" if inp.close_issues else ""))
     if inp.historical:
         pass
+    elif inp.reconcile is None and inp.reconcile_missing_reason:
+        L.append(f"- ⚠ 장부 대조: 마감 최종 대조 미확보 — {inp.reconcile_missing_reason}")
     elif not inp.balance_available:
         L.append("- 잔고 없이 생성 — 장부 대조 생략")
     elif inp.reconcile is None:

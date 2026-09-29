@@ -17,7 +17,7 @@ from unittest.mock import Mock
 sys.path.insert(0, ".")
 
 from app.main import run_session
-from domain.models import AccountBalance, OrderResult, Position
+from domain.models import AccountBalance, BrokerOrderStatus, OrderResult, Position
 from domain.position.lifecycle import PositionLifecycle as L
 from domain.service.lot_ledger import apply_events
 from domain.position.position_book import opening_events_from_balance
@@ -68,7 +68,7 @@ class SimBroker(ScriptedBroker):
     def place_order(self, order):
         res = super().place_order(order)
         if res.accepted:
-            self.pending.append((order.symbol, order.side.value, order.quantity))
+            self.pending.append((order.symbol, order.side.value, order.quantity, res.order_id))
         return res
 
     def get_account_balance(self):
@@ -77,7 +77,7 @@ class SimBroker(ScriptedBroker):
         if self.fail_balance_windows and self.clock and any(a <= self.clock() < b for a, b in self.fail_balance_windows):
             raise RuntimeError("kiwoom request failed: http=500")
         still = []
-        for sym, side, qty in self.pending:
+        for sym, side, qty, oid in self.pending:
             q = int(qty * self.fill_ratio)
             cur = self.positions.get(sym, 0)
             px = self.prices.get(sym, 10_000)
@@ -89,7 +89,9 @@ class SimBroker(ScriptedBroker):
             else:
                 self.positions[sym] = cur - q
             if q < qty:
-                still.append((sym, side, qty - q)) if self.fill_ratio == 1.0 else None
+                still.append((sym, side, qty - q, oid)) if self.fill_ratio == 1.0 else None
+            else:
+                self.status[oid] = BrokerOrderStatus.FILLED   # 8-E: 주문 조회 FILLED 증거
         self.pending = still
         return AccountBalance(self.cash, self.cash, [
             Position(s, q, self.avg.get(s, self.prices.get(s, 10_000))) for s, q in self.positions.items() if q > 0])
@@ -425,6 +427,62 @@ finally:
 s, *_ = day(datetime(2026, 9, 27, 9, 0))
 check("14-12) 휴장일은 마감 검증 대상 아님", s.status == "CLOSED_DAY" and s.close_check == "")
 
+# ── 15. 8-E R2·R3: 마감 보고서·상태 저장 ──────────────────────────
+br = SimBroker()
+br.fail_balance_windows = [(datetime(2026, 9, 28, 15, 30), datetime(2026, 9, 28, 17, 0))]
+s, st, br, lg, _ = day(datetime(2026, 9, 28, 15, 29), broker=br)
+rep = (Path(st.storage.reports_dir) / "daily_report_2026-09-28.md").read_text(encoding="utf-8")
+check("15-1) [R2 재현] 15:29 성공·마감 후 실패 → 보고서에 '일치' 없이 최종 대조 미확보·마지막 잔고 시각 표시",
+      s.close_check == "NEEDS_REVIEW" and "원장·잔고·메타 일치" not in rep
+      and "마감 최종 대조 미확보" in rep and "15:29:00" in rep and "마감 검증에 사용 불가" in rep)
+check("15-2) 보고서 운영 상태에 마감 검증 결과 표시", "⚠ 마감 검증: NEEDS_REVIEW — FINAL_BALANCE_FAILED" in rep)
+s, st, *_ = day(datetime(2026, 9, 28, 15, 10))
+rep = (Path(st.storage.reports_dir) / "daily_report_2026-09-28.md").read_text(encoding="utf-8")
+status = json.loads((Path(st.storage.reports_dir) / "session_status_2026-09-28.json").read_text(encoding="utf-8"))
+check("15-3) 정상 마감: 보고서 '마감 검증: VERIFIED'·일치, 상태 파일에 run_id·생성 시각",
+      "- 마감 검증: VERIFIED" in rep and "원장·잔고·메타 일치" in rep
+      and status["run_id"] == s.run_id and len(s.run_id) == 12 and status["generated_at"])
+
+import os as _os  # noqa: E402
+real_replace = _os.replace
+
+
+def failing_replace(src, dst, *a, **k):
+    if "session_status_" in str(dst):
+        raise PermissionError("locked")
+    return real_replace(src, dst, *a, **k)
+
+
+def seed_old_status(settings):
+    d = Path(settings.storage.reports_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "session_status_2026-09-28.json").write_text('{"close_check": "VERIFIED", "run_id": "old"}', encoding="utf-8")
+    return settings
+
+
+_os.replace = failing_replace
+try:
+    s, st, br, lg, _ = day(datetime(2026, 9, 28, 15, 10), settings_fn=seed_old_status)
+finally:
+    _os.replace = real_replace
+d = Path(st.storage.reports_dir)
+check("15-4) [R3 재현] 상태 파일 교체 실패 → STATUS_WRITE_FAILED, VERIFIED로 끝나지 않음",
+      "STATUS_WRITE_FAILED" in s.close_issues and s.close_check == "NEEDS_REVIEW" and s.needs_attention)
+check("15-5) 이전 실행 상태 파일은 치워 이번 결과로 오인되지 않음, 임시 파일 없음",
+      not (d / "session_status_2026-09-28.json").exists() and list(d.glob("session_status_*.tmp")) == [])
+check("15-6) 실패는 CRITICAL로 run_id와 함께 기록", any("상태 파일 저장 실패" in m and s.run_id in m
+                                                        for m in logs(lg, "critical")))
+
+orig_gen = app_reports.generate_daily_report
+try:
+    app_reports.generate_daily_report = boom
+    s, *_ = day(datetime(2026, 9, 28, 9, 58), stop_at=datetime(2026, 9, 28, 11, 0))
+finally:
+    app_reports.generate_daily_report = orig_gen
+check("15-7) 마감 전 중지(NOT_RUN)에서도 리포트 실패는 사유에 누적 → 종료 코드 2 대상",
+      s.close_check == "NOT_RUN" and "REPORT_FAILED" in s.close_issues and s.needs_attention)
+
+
 # 종료 코드 (마지막에 — main()이 logging.shutdown을 부름)
 orig_am = app_main.async_main
 try:
@@ -436,13 +494,16 @@ try:
     async def fake_ok(check_only=False):
         return SimpleNamespace(close_check="VERIFIED", close_issues=[])
 
+    async def fake_notrun_issue(check_only=False):
+        return SimpleNamespace(close_check="NOT_RUN", close_issues=["REPORT_FAILED"])
+
     async def fake_crash(check_only=False):
         raise RuntimeError("boom")
     codes = []
-    for fn in (fake_ok, fake_review, fake_crash):
+    for fn in (fake_ok, fake_review, fake_crash, fake_notrun_issue):
         app_main.async_main = fn
         codes.append(app_main.main())
-    check("14-13) 종료 코드: VERIFIED 0 / NEEDS_REVIEW 2 / 예외 1", codes == [0, 2, 1])
+    check("14-13) 종료 코드: VERIFIED 0 / NEEDS_REVIEW 2 / 예외 1 / 중지+문제 기록 2", codes == [0, 2, 1, 2])
 finally:
     app_main.async_main = orig_am
 

@@ -228,7 +228,10 @@ class PositionStateMachine:
     아무것도 기록하지 않습니다 — 하위호환 유지.
     """
 
-    def __init__(self, logger: "Any | None" = None) -> None:
+    def __init__(self, logger: "Any | None" = None, *, clock: "Any | None" = None) -> None:
+        # 스윙 8-E: 시계 주입(세션·테스트와 같은 시계로 타임아웃·주문 조회 경과를 계산).
+        # 기본값은 원본과 같은 datetime.now.
+        self._now = clock or datetime.now
         self._states: dict[str, SymbolPositionState] = {}
         self._logger = logger  # PositionLifecycleLogger 인스턴스 또는 None
 
@@ -241,7 +244,7 @@ class PositionStateMachine:
             return
         state = self.get(symbol)
         self._logger.append({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": self._now().isoformat(),
             "symbol": symbol,
             "event": event,
             "from_lifecycle": from_lifecycle.value,
@@ -315,13 +318,13 @@ class PositionStateMachine:
         state.pending_order_id = order_id
         state.pending_quantity = quantity
         # 1P0.1: 이 주문의 목표를 여기서 한 번만 고정합니다.
-        state.pending_since = datetime.now()
+        state.pending_since = self._now()
         state.partial_fill_since = None
         state.base_quantity_before_order = state.known_quantity
         state.requested_quantity = quantity
         state.expected_final_quantity = state.known_quantity + quantity
         state.observed_quantity = state.known_quantity
-        state.requested_at = datetime.now()
+        state.requested_at = self._now()
         self._log_event(symbol, "BUY_REQUESTED", prev, state.lifecycle, detail=f"qty={quantity}")
 
     def on_buy_result(self, symbol: str, accepted: bool) -> None:
@@ -383,7 +386,7 @@ class PositionStateMachine:
             # 목표 수량에 정확히 도달 -> 전량 체결
             state.lifecycle = PositionLifecycle.OPEN
             state.known_quantity = broker_quantity
-            state.last_filled_at = datetime.now()
+            state.last_filled_at = self._now()
             state.pending_order_id = None
             state.pending_quantity = 0
             state.requested_quantity = 0
@@ -405,7 +408,7 @@ class PositionStateMachine:
             state.lifecycle = PositionLifecycle.ERROR
             state.known_quantity = broker_quantity
             state.last_error = "UNEXPECTED_QUANTITY_EXCESS"
-            state.error_since = datetime.now()
+            state.error_since = self._now()
             self._log_event(
                 symbol, "BUY_CONFIRMED", prev, state.lifecycle, broker_quantity,
                 f"UNEXPECTED_QUANTITY_EXCESS(expected_final={expected_final}, "
@@ -417,7 +420,7 @@ class PositionStateMachine:
             state.known_quantity = broker_quantity
             state.last_error = "PARTIAL_FILL"
             if state.partial_fill_since is None:
-                state.partial_fill_since = datetime.now()
+                state.partial_fill_since = self._now()
             self._log_event(symbol, "BUY_CONFIRMED", prev, prev, broker_quantity,
                             f"PARTIAL_FILL_PENDING(base={base}, "
                             f"expected_final={expected_final})")
@@ -426,7 +429,7 @@ class PositionStateMachine:
             state.lifecycle = PositionLifecycle.ERROR
             state.known_quantity = broker_quantity
             state.last_error = "UNEXPECTED_QUANTITY_DECREASE"
-            state.error_since = datetime.now()
+            state.error_since = self._now()
             self._log_event(
                 symbol, "BUY_CONFIRMED", prev, state.lifecycle, broker_quantity,
                 f"UNEXPECTED_QUANTITY_DECREASE(base={base}, actual={broker_quantity})",
@@ -450,10 +453,10 @@ class PositionStateMachine:
         state.lifecycle = PositionLifecycle.SELL_PENDING
         state.pending_order_id = order_id
         state.pending_quantity = quantity
-        state.requested_at = datetime.now()
+        state.requested_at = self._now()
         # 1P0.1: SELL 주문 직전 보유수량을 고정합니다. 부분체결 판정의
         # 기준을 known_quantity(갱신됨)가 아니라 이 값으로 삼습니다.
-        state.pending_since = datetime.now()
+        state.pending_since = self._now()
         state.partial_fill_since = None
         state.sell_base_quantity = state.known_quantity
         state.observed_quantity = state.known_quantity
@@ -470,9 +473,15 @@ class PositionStateMachine:
         self._log_event(symbol, "SELL_REQUESTED", prev, state.lifecycle, detail=detail)
 
     def on_sell_result(self, symbol: str, accepted: bool, broker_quantity: int,
-                       reject_reason: str | None = None) -> None:
+                       reject_reason: str | None = None, *, order_filled: bool = False) -> None:
         """매도 주문 결과 처리. broker_quantity는 매도 시도 '이후' 다음
         폴링에서 확인한 실제 잔고 — 이 값으로 전량/부분/미체결을 판단.
+
+        스윙 8-E (R1): 분할청산(목표 잔고 > 0)은 잔고가 목표에 도달해도
+        **주문번호별 FILLED 증거(order_filled=True)** 가 있어야 종료합니다.
+        잔고 감소는 그 주문의 체결을 증명하지 않기 때문입니다(다른 주문·수동
+        거래·조회 시차). 전량매도(목표 0)는 남은 보유가 없어 원본과 같이
+        잔고 0으로 확정합니다.
         """
         state = self.get(symbol)
         prev = state.lifecycle
@@ -484,7 +493,7 @@ class PositionStateMachine:
             state.pending_quantity = 0
             # 1P0.2: 연속 거부 횟수를 누적해 backoff 근거로 씁니다.
             state.sell_reject_count += 1
-            state.sell_reject_last_at = datetime.now()
+            state.sell_reject_last_at = self._now()
             state.sell_reject_last_reason = reject_reason
             self._log_event(
                 symbol, "SELL_RESULT", prev, state.lifecycle, broker_quantity,
@@ -505,9 +514,19 @@ class PositionStateMachine:
             state.sell_base_quantity = 0
             self._reset_transient_block_state(state)
             detail = "FILLED_FULL"
+        elif broker_quantity == target and target > 0 and not order_filled:
+            # 스윙 8-E (R1): 목표 잔고 도달만으로는 주문 종료를 확정하지 않음.
+            state.known_quantity = broker_quantity
+            if state.partial_fill_since is None:
+                state.partial_fill_since = self._now()
+            self._log_event(
+                symbol, "SELL_RESULT", prev, prev, broker_quantity,
+                f"TARGET_REACHED_AWAITING_FILL_EVIDENCE(sell_base={sell_base}, target={target})",
+            )
+            return
         elif broker_quantity == target and target > 0:
             # 스윙 8-C (F2): 분할청산 주문이 요청 수량만큼 모두 체결 —
-            # 주문은 종료, 포지션은 남은 수량으로 OPEN 유지.
+            # 주문은 종료, 포지션은 남은 수량으로 OPEN 유지. (8-E: FILLED 증거 확인됨)
             state.lifecycle = PositionLifecycle.OPEN
             state.known_quantity = broker_quantity
             state.sell_base_quantity = 0
@@ -518,7 +537,7 @@ class PositionStateMachine:
             state.lifecycle = PositionLifecycle.ERROR
             state.known_quantity = broker_quantity
             state.last_error = "UNEXPECTED_QUANTITY_DECREASE"
-            state.error_since = datetime.now()
+            state.error_since = self._now()
             self._log_event(
                 symbol, "SELL_RESULT", prev, state.lifecycle, broker_quantity,
                 f"UNEXPECTED_QUANTITY_DECREASE(sell_base={sell_base}, target={target}, actual={broker_quantity})",
@@ -536,7 +555,7 @@ class PositionStateMachine:
             state.known_quantity = broker_quantity
             state.last_error = "PARTIAL_FILL"
             if state.partial_fill_since is None:
-                state.partial_fill_since = datetime.now()
+                state.partial_fill_since = self._now()
             self._log_event(
                 symbol, "SELL_RESULT", prev, prev, broker_quantity,
                 f"PARTIAL_FILL_PENDING(sell_base={sell_base}, "
@@ -561,7 +580,7 @@ class PositionStateMachine:
             state.lifecycle = PositionLifecycle.ERROR
             state.known_quantity = broker_quantity
             state.last_error = "UNEXPECTED_QUANTITY_INCREASE"
-            state.error_since = datetime.now()
+            state.error_since = self._now()
             self._log_event(
                 symbol, "SELL_RESULT", prev, state.lifecycle, broker_quantity,
                 f"UNEXPECTED_QUANTITY_INCREASE(known_before={known_before}, actual={broker_quantity})",
@@ -572,10 +591,10 @@ class PositionStateMachine:
             state.lifecycle = PositionLifecycle.ERROR
             state.known_quantity = broker_quantity
             state.last_error = "UNREACHABLE_SELL_BRANCH"
-            state.error_since = datetime.now()
+            state.error_since = self._now()
             detail = f"UNREACHABLE(sell_base={sell_base}, actual={broker_quantity})"
 
-        state.last_filled_at = datetime.now()
+        state.last_filled_at = self._now()
         state.pending_order_id = None
         state.pending_quantity = 0
         # 체결이 진행됐으므로 거부 backoff 해제
@@ -696,7 +715,7 @@ class PositionStateMachine:
         prev = state.lifecycle
         state.lifecycle = PositionLifecycle.ERROR
         state.last_error = f"{side.upper()}_PLACEMENT_AMBIGUOUS"
-        state.error_since = datetime.now()
+        state.error_since = self._now()
         self._log_event(
             symbol, "PLACEMENT_AMBIGUOUS", prev, state.lifecycle,
             detail=(f"side={side} pending_order={state.pending_order_id} | {detail}")[:300],
@@ -730,7 +749,7 @@ class PositionStateMachine:
     BUY_PENDING_TIMEOUT_SEC = 120        # 이후 관측값 기준으로 상태 확정
 
     def _elapsed(self, at: "datetime | None") -> float:
-        return (datetime.now() - at).total_seconds() if at else 0.0
+        return (self._now() - at).total_seconds() if at else 0.0
 
     # 2026-08-10 (1P0.7): TTL로 orphan을 자동 해제하지 않습니다
     # (TTL 경과는 주문 종료의 증거가 아님). 진단 로그의 "age" 표시용
@@ -792,7 +811,8 @@ class PositionStateMachine:
             raise ValueError("acknowledge_orphan에는 확인 근거(note)가 필요합니다")
         self.clear_orphan(symbol, f"ACKNOWLEDGED: {note}")
 
-    def observe_for_orphan(self, symbol: str, broker_quantity: int) -> str | None:
+    def observe_for_orphan(self, symbol: str, broker_quantity: int, *,
+                           order_filled: bool = False) -> str | None:
         """잔고가 **정확히 목표에 도달**했을 때만 orphan을 자동 해소합니다.
 
         2026-08-10 (1P0.7, GPT 코드리뷰, 재현 확인): 이전엔 "잔고가
@@ -812,7 +832,9 @@ class PositionStateMachine:
         state = self.get(symbol)
         if not state.orphan_order_id:
             return None
-        if state.orphan_expected_delta < 0 and broker_quantity == state.expected_final_quantity:
+        if (state.orphan_expected_delta < 0 and broker_quantity == state.expected_final_quantity
+                and (broker_quantity == 0 or order_filled)):
+            # 스윙 8-E (R1): 분할청산 orphan(목표 > 0)은 FILLED 증거가 있어야 해제.
             # 스윙 8-C (F2): 분할청산이면 목표 잔고(>0), 전량매도면 0 (원본과 동일).
             note = (f"목표수량({broker_quantity}) 도달 (SELL orphan 완전 체결 확인)"
                     if broker_quantity else "잔고 0 도달 (SELL orphan 완전 체결 확인)")
@@ -909,11 +931,13 @@ class PositionStateMachine:
                 # block으로 이관해 새 SELL을 계속 막습니다(아래).
                 state.lifecycle = PositionLifecycle.OPEN
                 state.known_quantity = broker_quantity
-            # 스윙 8-C (F2): 목표 잔고(분할청산이면 >0)보다 많이 남았을 때만
-            # 원 주문이 살아 있을 수 있음 → orphan. 전량매도면 원본과 동일.
-            if broker_quantity > max(state.expected_final_quantity, 0) and state.pending_order_id:
+            # 스윙 8-C/8-E: 전량매도(목표 0)는 원본과 같이 잔고가 남았을 때만 orphan.
+            # 분할청산(목표 > 0)은 종료 증거 없이 타임아웃됐으므로 잔고와 무관하게 orphan
+            # (원 주문이 살아 있을 수 있음 — FILLED 조회 또는 ack_orphan으로만 해제).
+            _target = max(state.expected_final_quantity, 0)
+            if state.pending_order_id and (broker_quantity > _target or _target > 0):
                 state.orphan_order_id = state.pending_order_id
-                state.orphan_since = datetime.now()
+                state.orphan_since = self._now()
                 state.orphan_expected_delta = -broker_quantity
             state.pending_order_id = None
             state.pending_quantity = 0
@@ -943,7 +967,7 @@ class PositionStateMachine:
             orphan_created_now = False
             if state.pending_order_id:
                 state.orphan_order_id = state.pending_order_id
-                state.orphan_since = datetime.now()
+                state.orphan_since = self._now()
                 state.orphan_expected_delta = max(
                     0, state.expected_final_quantity - broker_quantity)
                 orphan_created_now = True
@@ -976,7 +1000,7 @@ class PositionStateMachine:
         if self._elapsed(state.sell_reject_last_at) < self.SELL_REJECT_DECAY_SEC:
             return False
         state.sell_reject_count = max(0, state.sell_reject_count - 1)
-        state.sell_reject_last_at = datetime.now()
+        state.sell_reject_last_at = self._now()
         if state.sell_reject_count == 0:
             state.sell_reject_last_reason = None
         return True
@@ -989,7 +1013,7 @@ class PositionStateMachine:
             return 0.0
         idx = min(state.sell_reject_count, len(self.SELL_RETRY_BACKOFF_SECONDS) - 1)
         wait = self.SELL_RETRY_BACKOFF_SECONDS[idx]
-        elapsed = (datetime.now() - state.sell_reject_last_at).total_seconds()
+        elapsed = (self._now() - state.sell_reject_last_at).total_seconds()
         return max(0.0, wait - elapsed)
 
     # 2026-08-10 (1P0.7, GPT 코드리뷰): 차단을 HARD와 SOFT로 명확히
@@ -1059,7 +1083,7 @@ class PositionStateMachine:
         않습니다** — RECONCILIATION_REQUIRED는 사람의 개입 신호일
         뿐입니다.
         """
-        now = now or datetime.now()
+        now = now or self._now()
         state = self.get(symbol)
         hard = self._evaluate_hard_sell_blocks(symbol)
         if hard is None:
@@ -1088,7 +1112,7 @@ class PositionStateMachine:
           3. SOFT block — 재시도 backoff/MAX_RETRY. forced가 우회.
           4. ALLOW
         """
-        now = now or datetime.now()
+        now = now or self._now()
         state = self.get(symbol)
 
         # ── 1. HARD block ────────────────────────────────────────

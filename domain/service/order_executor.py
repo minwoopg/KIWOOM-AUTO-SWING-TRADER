@@ -125,6 +125,7 @@ class OrderExecutor:
         on_first_fill_buy: FirstFillHook | None = None,
         on_sell_closed: SellClosedHook | None = None,
         commands_dir: str | Path = "commands",
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         """
         state / highest_price는 호출부가 state_store.load()로 읽은 객체를 그대로
@@ -132,6 +133,8 @@ class OrderExecutor:
         들고 있던 것과 같은 효과). 이 클래스는 state.unresolved_order_intents와
         state.last_order_id_by_symbol만 씁니다.
         """
+        # 스윙 8-E: 세션과 같은 시계(기본 datetime.now — 원본과 동일)
+        self._now = clock or datetime.now
         self.settings = settings
         self.broker = broker
         self.state = state
@@ -140,6 +143,8 @@ class OrderExecutor:
         self.app_logger = app_logger
         self.trade_logger = trade_logger
         self._commands_dir = Path(commands_dir)
+        # 8-E (R4): 보관(이동)에 실패해 원문을 그 자리에 둔 명령 — 같은 내용이면 이 프로세스에서 재실행하지 않음
+        self._held_commands: set[tuple[str, int, int]] = set()
         self._on_first_fill_buy = on_first_fill_buy
         self._on_sell_closed = on_sell_closed
 
@@ -171,7 +176,7 @@ class OrderExecutor:
                     "'계측 비활성'으로 표시됨)"
                 )
 
-        self._position_state_machine = PositionStateMachine(logger=position_lifecycle_logger)
+        self._position_state_machine = PositionStateMachine(logger=position_lifecycle_logger, clock=self._now)
         self._position_state_machine_initialized = False
         self._journal_recovery_failed = False
         self._pending_sell_side_effects: dict[str, dict] = {}
@@ -294,7 +299,7 @@ class OrderExecutor:
                 base_quantity_before_order=state.base_quantity_before_order,
                 # 스윙 8-C (F2): SELL도 주문별 목표 잔고(분할청산이면 >0) 기록.
                 target_quantity_after_order=state.expected_final_quantity,
-                accepted_at=datetime.now(),
+                accepted_at=self._now(),
                 lifecycle_kind="BUY_PENDING" if side == "BUY" else "SELL_PENDING",
             )
             self._tracked_order_journal.upsert(record)
@@ -316,7 +321,7 @@ class OrderExecutor:
             state = self._position_state_machine.get(symbol)
             changed = False
             if state.orphan_order_id and record.orphaned_at is None:
-                record.orphaned_at = state.orphan_since or datetime.now()
+                record.orphaned_at = state.orphan_since or self._now()
                 changed = True
             if state.partial_fill_since and record.first_fill_at is None:
                 record.first_fill_at = state.partial_fill_since
@@ -346,7 +351,7 @@ class OrderExecutor:
     ) -> None:
         """원본 `_write_trade_log`와 동일 (TradeCsvLogger가 모르는 키는 무시됨)."""
         row = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": self._now().isoformat(),
             "symbol": symbol,
             "side": side,
             "quantity": quantity,
@@ -596,7 +601,7 @@ class OrderExecutor:
                 "quantity": quantity,
                 "forced": forced,
                 "order_id": result.order_id,
-                "recorded_at": datetime.now(),
+                "recorded_at": self._now(),
             }
             self.app_logger.info(
                 f"[ORDER] {symbol} | 매도 주문 접수 완료 | 수량 {quantity}주 | 주문번호 {result.order_id}"
@@ -759,7 +764,7 @@ class OrderExecutor:
         가장 오래 대기한 것 하나만 고릅니다(pending_since / orphan_since 기준).
         자격 판정은 _reconcile_tracked_order_status()와 같은 규칙."""
         psm = self._position_state_machine
-        now = datetime.now()
+        now = self._now()
         best_symbol: str | None = None
         best_since: datetime | None = None
         for symbol in symbols:
@@ -870,7 +875,7 @@ class OrderExecutor:
             observation = OrderStatusObservation(
                 query_id=query_id,
                 started_at=started_at_iso,
-                finished_at=datetime.now().isoformat(),
+                finished_at=self._now().isoformat(),
                 account_scope_id=account_scope_id,
                 env=env,
                 symbol=symbol,
@@ -915,7 +920,7 @@ class OrderExecutor:
             kind = "BUY_PENDING"
             order_id = state.pending_order_id
             age_sec = (
-                (datetime.now() - state.pending_since).total_seconds()
+                (self._now() - state.pending_since).total_seconds()
                 if state.pending_since else 0.0
             )
             observation_pending_age_sec = age_sec
@@ -925,7 +930,7 @@ class OrderExecutor:
             kind = "SELL_PENDING"
             order_id = state.pending_order_id
             age_sec = (
-                (datetime.now() - state.pending_since).total_seconds()
+                (self._now() - state.pending_since).total_seconds()
                 if state.pending_since else 0.0
             )
             observation_pending_age_sec = age_sec
@@ -936,7 +941,7 @@ class OrderExecutor:
             order_id = state.orphan_order_id
             orphan_since = getattr(state, "orphan_since", None)
             observation_pending_age_sec = (
-                (datetime.now() - orphan_since).total_seconds() if orphan_since else 0.0
+                (self._now() - orphan_since).total_seconds() if orphan_since else 0.0
             )
         else:
             return  # BUY_PENDING/SELL_PENDING/orphan 아님 — 추적 대상 아님
@@ -944,7 +949,7 @@ class OrderExecutor:
         if not is_trackable_order_id(order_id):
             return  # 실제 브로커 주문번호가 아님 — 조회하지 않음(429 절약)
 
-        now = datetime.now()
+        now = self._now()
         last_at = self._last_order_status_query_at.get(symbol)
         if last_at is not None and (
             (now - last_at).total_seconds() < self.ORDER_STATUS_QUERY_MIN_INTERVAL_SEC
@@ -953,7 +958,7 @@ class OrderExecutor:
         self._last_order_status_query_at[symbol] = now
 
         query_id = uuid.uuid4().hex
-        query_started_at_iso = datetime.now().isoformat()
+        query_started_at_iso = self._now().isoformat()
         try:
             evidence = self.broker.get_order_status_evidence(order_id, symbol)
         except Exception as exc:
@@ -1013,7 +1018,7 @@ class OrderExecutor:
             expected = state.expected_final_quantity
             if broker_qty == expected:
                 self._position_state_machine.on_sell_result(
-                    symbol, accepted=True, broker_quantity=broker_qty)
+                    symbol, accepted=True, broker_quantity=broker_qty, order_filled=True)
             else:
                 self.app_logger.warning(
                     f"[ORDER_STATUS_BALANCE_MISMATCH] {symbol} | kind=SELL_PENDING | "
@@ -1029,7 +1034,8 @@ class OrderExecutor:
                     and broker_qty == state.expected_final_quantity)
             )
             if matched:
-                note = self._position_state_machine.observe_for_orphan(symbol, broker_qty)
+                note = self._position_state_machine.observe_for_orphan(
+                    symbol, broker_qty, order_filled=True)
                 if note:
                     self.app_logger.warning(
                         f"[LIFECYCLE_ORPHAN][ORDER_STATUS_CONFIRMED] {symbol} | {note}"
@@ -1060,6 +1066,8 @@ class OrderExecutor:
             return
         for cmd_file in sorted(commands_dir.glob("ack_error_*.json")):
             symbol = cmd_file.stem[len("ack_error_"):]
+            if self._command_signature(cmd_file) in self._held_commands:
+                continue   # 8-E: 이미 처리했지만 보관 못 한 명령 — 재실행 금지
             try:
                 payload = _read_command_json(cmd_file)
                 broker_quantity = payload.get("broker_quantity")
@@ -1075,13 +1083,39 @@ class OrderExecutor:
                     f"broker_quantity={broker_quantity}, note={note!r}"
                 )
             except Exception as exc:
-                dest = _archive_command(cmd_file, ok=False, error=f"{type(exc).__name__}: {exc}")
                 self.app_logger.error(
-                    f"[ACK_ERROR_COMMAND] {symbol} | 명령 파일 처리 실패, 상태 변경 없음: {exc} — "
-                    f"원본은 {dest}로 옮김. 파일을 고쳐 commands/에 다시 넣으세요"
+                    f"[ACK_ERROR_COMMAND] {symbol} | 명령 실행 실패, 상태 변경 없음: {exc} — 파일을 고쳐 commands/에 다시 넣으세요"
                 )
+                self._settle_command(cmd_file, "ACK_ERROR_COMMAND", symbol, ok=False, error=f"{type(exc).__name__}: {exc}")
             else:
-                _archive_command(cmd_file, ok=True)
+                self._settle_command(cmd_file, "ACK_ERROR_COMMAND", symbol, ok=True)
+
+    @staticmethod
+    def _command_signature(path: Path) -> tuple[str, int, int]:
+        try:
+            st = path.stat()
+            return (str(path), st.st_mtime_ns, st.st_size)
+        except OSError:
+            return (str(path), -1, -1)
+
+    def _settle_command(self, cmd_file: Path, tag: str, symbol: str, *, ok: bool, error: str = "") -> None:
+        """실행 결과(ok)와 별개로 보관 결과를 처리·기록합니다 (8-E, R4).
+
+        보관(processed/·failed/ 이동)에 실패해도 원문을 지우지 않습니다. 같은 폴더에서
+        `.hold`로 이름을 바꿔 다시 실행되지 않게 하고, 그것도 안 되면 원문을 그대로 둔 채
+        이 프로세스에서는 같은 내용의 파일을 다시 실행하지 않습니다.
+        """
+        signature = self._command_signature(cmd_file)
+        result = _archive_command(cmd_file, ok=ok, error=error)
+        if result.archived is not None:
+            return
+        outcome = "실행 성공(상태 변경됨)" if ok else "실행 실패(상태 변경 없음)"
+        if result.held is None:
+            self._held_commands.add(signature)
+        self.app_logger.critical(
+            f"[{tag}] {symbol} | {outcome} — 그러나 명령 파일 보관 실패: {result.detail}. "
+            f"원문은 보존({result.held or cmd_file}), 이 프로세스에서 재실행하지 않음. 폴더 권한·경로 충돌 확인"
+        )
 
     def _process_pending_ack_orphan_commands(self) -> None:
         """commands/ack_orphan_{symbol}.json 파일로 orphan을 해제합니다.
@@ -1095,6 +1129,8 @@ class OrderExecutor:
             return
         for cmd_file in sorted(commands_dir.glob("ack_orphan_*.json")):
             symbol = cmd_file.stem[len("ack_orphan_"):]
+            if self._command_signature(cmd_file) in self._held_commands:
+                continue   # 8-E: 이미 처리했지만 보관 못 한 명령 — 재실행 금지
             try:
                 payload = _read_command_json(cmd_file)
                 raw_note = payload.get("note")
@@ -1116,13 +1152,12 @@ class OrderExecutor:
                     f"sell_ctx_cleared={had_sell_ctx}"
                 )
             except Exception as exc:
-                dest = _archive_command(cmd_file, ok=False, error=f"{type(exc).__name__}: {exc}")
                 self.app_logger.error(
-                    f"[ACK_ORPHAN_COMMAND] {symbol} | 명령 파일 처리 실패, 상태 변경 없음: {exc} — "
-                    f"원본은 {dest}로 옮김. 파일을 고쳐 commands/에 다시 넣으세요"
+                    f"[ACK_ORPHAN_COMMAND] {symbol} | 명령 실행 실패, 상태 변경 없음: {exc} — 파일을 고쳐 commands/에 다시 넣으세요"
                 )
+                self._settle_command(cmd_file, "ACK_ORPHAN_COMMAND", symbol, ok=False, error=f"{type(exc).__name__}: {exc}")
             else:
-                _archive_command(cmd_file, ok=True)
+                self._settle_command(cmd_file, "ACK_ORPHAN_COMMAND", symbol, ok=True)
 
 
 # ── 사람 확인 파일 명령 보관 (8-A, F7) ──────────────────────────────
@@ -1134,11 +1169,20 @@ def _read_command_json(path: Path) -> dict:
     return payload
 
 
-def _archive_command(path: Path, *, ok: bool, error: str = "") -> Path:
+@dataclass(frozen=True)
+class CommandArchiveResult:
+    archived: Path | None      # processed/·failed/로 옮긴 경로 (성공 시)
+    held: Path | None          # 옮기지 못해 같은 폴더에서 이름만 바꾼 경로(.hold)
+    detail: str = ""
+
+
+def _archive_command(path: Path, *, ok: bool, error: str = "") -> CommandArchiveResult:
     """명령 파일을 processed/ 또는 failed/로 옮깁니다(삭제하지 않음 — 재현·감사용).
 
-    옮기기 자체가 실패하면 같은 명령이 매 폴링마다 반복 처리되지 않도록 마지막
-    수단으로 삭제합니다.
+    8-E (R4): 옮기기에 실패해도 **원문을 지우지 않습니다**. 같은 폴더에서
+    `<이름>.json.hold`로 바꿔 재실행 대상(glob `*.json`)에서 빼고, 실패 사유는
+    `<이름>.json.hold.error.txt`에 남깁니다. 이름 바꾸기도 실패하면 원문을 그대로
+    둡니다(호출부가 같은 내용 재실행을 막음).
     """
     sub = path.parent / ("processed" if ok else "failed")
     stamp = now_kst().strftime("%Y%m%d_%H%M%S_%f")
@@ -1146,9 +1190,23 @@ def _archive_command(path: Path, *, ok: bool, error: str = "") -> Path:
     try:
         sub.mkdir(parents=True, exist_ok=True)
         path.replace(dest)
-        if not ok:
+    except OSError as move_exc:
+        reason = f"보관 폴더로 이동 실패: {type(move_exc).__name__}: {move_exc}"
+        hold = path.with_name(f"{path.name}.{stamp}.hold")
+        try:
+            path.replace(hold)
+        except OSError as hold_exc:
+            return CommandArchiveResult(None, None, f"{reason}; 보류 이름 변경도 실패: {hold_exc}")
+        try:
+            Path(str(hold) + ".error.txt").write_text(
+                (error + "\n" if error else "") + ("실행 성공 — " if ok else "실행 실패 — ") + reason + "\n",
+                encoding="utf-8")
+        except OSError:
+            pass
+        return CommandArchiveResult(None, hold, reason)
+    if not ok:
+        try:
             dest.with_suffix(".error.txt").write_text(error + "\n", encoding="utf-8")
-        return dest
-    except OSError:
-        path.unlink(missing_ok=True)
-        return Path("(삭제됨 — 보관 실패)")
+        except OSError as exc:
+            return CommandArchiveResult(dest, None, f"사유 파일 기록 실패: {exc}")
+    return CommandArchiveResult(dest, None)
