@@ -78,6 +78,27 @@
     "domain/position/swing_state.py": {
       "status": "new"
     },
+    "domain/research/__init__.py": {
+      "status": "new"
+    },
+    "domain/research/features.py": {
+      "status": "new"
+    },
+    "domain/research/market.py": {
+      "status": "new"
+    },
+    "domain/research/s1.py": {
+      "status": "new"
+    },
+    "domain/research/series.py": {
+      "status": "new"
+    },
+    "domain/research/types.py": {
+      "status": "new"
+    },
+    "domain/research/weekly.py": {
+      "status": "new"
+    },
     "domain/risk/account_guard.py": {
       "status": "new"
     },
@@ -290,7 +311,16 @@
     "test_probe_market_data.py": {
       "status": "new"
     },
+    "test_probe_research_sources.py": {
+      "status": "new"
+    },
     "test_quote_source.py": {
+      "status": "new"
+    },
+    "test_research_features.py": {
+      "status": "new"
+    },
+    "test_research_s1.py": {
       "status": "new"
     },
     "test_run_baseline.py": {
@@ -334,6 +364,9 @@
       "status": "new"
     },
     "tools/probe_market_data.py": {
+      "status": "new"
+    },
+    "tools/probe_research_sources.py": {
       "status": "new"
     },
     "tools/update_daily_bars.py": {
