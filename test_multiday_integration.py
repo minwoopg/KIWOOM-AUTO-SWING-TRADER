@@ -10,7 +10,9 @@
              → 복구 명령(현재 recovery_id) 확보 1회 실패 → 30초 뒤 재확보·적용
              → 잔고 API 장애 구간(주문 없음) → 마감: 원장 14 vs 잔고 10 → NEEDS_REVIEW
   (마감 후 사람이 재시작 구간 체결 4주를 원장에 정정 기록)
-  D4 10/1(목) 보유만 → 마감 VERIFIED, 원장 = 잔고
+  D4 10/1(목) 정상 종목(000660) 매수 의도가 잔고 API 장애 구간에 걸림 → 장애 중 전략 호출·주문 0,
+             복구 후 첫 폴링에서 1회 실행 → 마감 VERIFIED, 원장 = 잔고
+  종료코드는 운영 main()으로 확인 (0, 2, 2, 0)
 
 완료 기준 (GPT 9단계 제안)
   - 중복 주문 0건, 중복 체결 기록 0건
@@ -69,7 +71,8 @@ class DayBroker(ScriptedBroker):
 
     def __init__(self):
         super().__init__()
-        self.prices = {"005930": 70_000}
+        self.prices = {"005930": 70_000, "000660": 180_000}
+        self.place_times: list[datetime] = []
         self.avg: dict[str, int] = {}
         self.pending: list[tuple] = []
         self.hold: set[str] = set()
@@ -78,6 +81,8 @@ class DayBroker(ScriptedBroker):
         self.balance_calls = 0
 
     def place_order(self, order):
+        if self.clock:
+            self.place_times.append(self.clock())
         res = super().place_order(order)
         if res.accepted:
             self.pending.append((order.symbol, order.side.value, order.quantity, res.order_id))
@@ -117,6 +122,7 @@ class Script:
     def __init__(self, items):
         self.items = list(items)
         self.seen_blocked: list[frozenset] = []
+        self.tick_times: list[datetime] = []
 
     def on_session_start(self, ctx):
         pass
@@ -126,6 +132,7 @@ class Script:
 
     def on_tick(self, ctx):
         self.seen_blocked.append(ctx.blocked_symbols)
+        self.tick_times.append(ctx.now)
         out = []
         for item in list(self.items):
             t, what = item
@@ -140,7 +147,7 @@ class Script:
 TMP = tempfile.mkdtemp()
 SETTINGS = build_minimal_settings(TMP)
 BROKER = DayBroker()
-QUOTES = StaticQuoteSource({"005930": 70_000})
+QUOTES = StaticQuoteSource({"005930": 70_000, "000660": 180_000})
 REPORTS = Path(SETTINGS.storage.reports_dir)
 CMDS = Path(SETTINGS.storage.commands_dir)
 
@@ -232,6 +239,9 @@ check("D2-1) 주문 0건, 원장 20 = 잔고 20, 보고서 보유 거래일 1",
       len(BROKER.place_calls) == 1 and "| 005930 | 20 | 70,000 | 2026-09-28 | 1 |" in rep2)
 check("D2-2) 상태 파일 저장 실패 → STATUS_WRITE_FAILED·종료코드 2, 상태 파일 없음(이전 결과로 오인 불가)",
       s2.close_issues == ["STATUS_WRITE_FAILED"] and exit_code(s2) == 2 and status_of(D2) is None)
+check("D2-3) [9-A] 보고서도 최종 판정 NEEDS_REVIEW·STATUS_WRITE_FAILED 표시 (VERIFIED로 남지 않음)",
+      consistent(s2, D2, status_expected=False) and "⚠ 마감 검증: NEEDS_REVIEW — STATUS_WRITE_FAILED" in rep2
+      and "마감 검증: VERIFIED" not in report_of(D2))
 
 # ── D3: 분할매도 → 장중 중지 → 재시작 → 복구 → API 장애 → 마감 ─────
 calls_before_d3 = len(BROKER.place_calls)
@@ -320,20 +330,34 @@ FillLedgerStore(SETTINGS.storage.fill_ledger_file).append(FillEvent(
     price=70_000, price_source="ORDER_ESTIMATE", trade_date=D3, occurred_at=datetime(2026, 9, 30, 16, 0),
     order_id=held_oid, note="재시작 구간 체결 — HTS 확인 후 수동 정정"))
 
-# ── D4: 보유만 → VERIFIED ───────────────────────────────────────
-s4, lg4, _ = run(D4, time(8, 50), Script([]))
-check("D4-1) 정정 후 원장 10 = 잔고 10, 마감 VERIFIED·종료코드 0, 보고서·상태 파일 일치",
-      ledger().position("005930").quantity == 10 and s4.close_check == "VERIFIED" and exit_code(s4) == 0
+# ── D4: 정상 종목 매수가 잔고 API 장애 구간에 걸림 → VERIFIED ─────────
+BROKER.fail_windows = [(datetime(2026, 10, 1, 10, 0), datetime(2026, 10, 1, 10, 5))]
+calls_before_d4 = len(BROKER.place_calls)
+script4 = Script([(time(10, 2), OrderIntent("000660", "BUY", 1, 180_000, reason="during outage"))])
+s4, lg4, _ = run(D4, time(9, 58), script4)
+BROKER.fail_windows = []
+outage = (datetime(2026, 10, 1, 10, 0), datetime(2026, 10, 1, 10, 5))
+buy_time = BROKER.place_times[calls_before_d4]
+check("D4-1) [9-B] 장애 구간에는 전략 호출 0회(오래된 잔고로 판단하지 않음)",
+      not any(outage[0] <= t < outage[1] for t in script4.tick_times) and s4.balance_failures == 5)
+check("D4-2) [9-B] 정상 종목 000660 매수는 장애 중 전송 0회, 복구 후 첫 폴링(10:05)에 정확히 1회",
+      BROKER.place_calls[calls_before_d4:] == [("000660", "BUY", 1)] and buy_time == datetime(2026, 10, 1, 10, 5)
+      and min(t for t in script4.tick_times if t >= outage[1]) == buy_time)
+check("D4-3) 정정 후 원장 = 잔고(005930 10, 000660 1), 마감 VERIFIED·종료코드 0, 보고서·상태 파일 일치",
+      ledger().position("005930").quantity == 10 and ledger().position("000660").quantity == 1
+      and BROKER.positions["000660"] == 1 and s4.close_check == "VERIFIED" and exit_code(s4) == 0
       and consistent(s4, D4))
 
 # ── 전 기간 불변식 ─────────────────────────────────────────────
 events = FillLedgerStore(SETTINGS.storage.fill_ledger_file).load()
 ids = [e.event_id for e in events]
 check("ALL-1) 중복 체결 기록 0건 (event_id 유일), 사건 = 매수 20·매도 6·4(정정)",
-      len(ids) == len(set(ids)) and [(e.kind, e.quantity) for e in events] == [("BUY", 20), ("SELL", 6), ("SELL", 4)])
-check("ALL-2) 전 기간 주문 = 매수 20, 매도 6, 매도 4 (중복 주문 0건)",
-      BROKER.place_calls == [("005930", "BUY", 20), ("005930", "SELL", 6), ("005930", "SELL", 4)])
-check("ALL-3) 실현 10주, 보유 10주 — 원장·잔고 정합", sum(r.quantity for r in ledger().realized) == 10
+      len(ids) == len(set(ids)) and [(e.symbol, e.kind, e.quantity) for e in events]
+      == [("005930", "BUY", 20), ("005930", "SELL", 6), ("005930", "SELL", 4), ("000660", "BUY", 1)])
+check("ALL-2) 전 기간 주문 = 매수 20, 매도 6, 매도 4, 000660 매수 1 (중복 주문 0건)",
+      BROKER.place_calls == [("005930", "BUY", 20), ("005930", "SELL", 6), ("005930", "SELL", 4),
+                             ("000660", "BUY", 1)])
+check("ALL-3) 실현 10주, 005930 보유 10주 — 원장·잔고 정합", sum(r.quantity for r in ledger().realized) == 10
       and BROKER.positions["005930"] == 10)
 rep1_again = __import__("app.reports", fromlist=["x"]).generate_daily_report(
     SETTINGS, D1, today=D4).read_text(encoding="utf-8")
@@ -341,6 +365,21 @@ check("ALL-4) 과거(D1) 보고서 재생성해도 D1 보유 20주 그대로", "
 check("ALL-5) 미해결 주문·저널 없음, 복구 목록 비어 있음",
       TrackedOrderJournalStore(SETTINGS.storage.tracked_order_journal_file).load_all() == {}
       and json.loads((CMDS / "recovery_required.json").read_text(encoding="utf-8"))["items"] == [])
+
+# 종료코드: 운영 main()에 각 날의 세션 결과를 넣어 확인 (마지막에 — main()이 logging.shutdown 호출)
+import app.main as app_main  # noqa: E402
+
+orig_async_main = app_main.async_main
+codes = []
+try:
+    for summ in (s1, s2, s3, s4):
+        async def _fake(check_only=False, _s=summ):
+            return _s
+        app_main.async_main = _fake
+        codes.append(app_main.main())
+finally:
+    app_main.async_main = orig_async_main
+check("ALL-6) 운영 main() 종료코드 D1~D4 = 0, 2, 2, 0", codes == [0, 2, 2, 0])
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

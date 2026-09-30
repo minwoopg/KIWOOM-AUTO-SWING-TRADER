@@ -330,23 +330,31 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
             last_at = runner.last_balance_at
             missing = ("마감 후 잔고 조회·대조 실패"
                        + (f" (마지막 성공 잔고 {last_at:%H:%M:%S} — 마감 검증에 사용 불가)" if last_at else ""))
-        try:
-            from app.reports import generate_daily_report
-            generate_daily_report(settings, summary.trade_date, balance=None,
-                                  reconcile_report=summary.final_reconcile, session_lines=summary.lines(),
-                                  calendar=calendar, logger=app_logger, today=summary.trade_date,
-                                  final_only=True, reconcile_missing_reason=missing,
-                                  close_check=summary.close_check, close_issues=summary.close_issues)
-            summary.report = "OK"
-        except Exception as exc:
-            summary.report = f"FAILED: {type(exc).__name__}: {exc}"
-            app_logger.error(f"[REPORT] 일일 리포트 생성 실패(매매 결과에는 영향 없음): {type(exc).__name__}: {exc}")
-            summary.add_close_issue("REPORT_FAILED")
-            app_logger.critical(f"[SESSION_CLOSE] {summary.close_check} — REPORT_FAILED")
+        def make_report() -> bool:
+            try:
+                from app.reports import generate_daily_report
+                generate_daily_report(settings, summary.trade_date, balance=None,
+                                      reconcile_report=summary.final_reconcile, session_lines=summary.lines(),
+                                      calendar=calendar, logger=app_logger, today=summary.trade_date,
+                                      final_only=True, reconcile_missing_reason=missing,
+                                      close_check=summary.close_check, close_issues=summary.close_issues)
+                summary.report = "OK"
+                return True
+            except Exception as exc:
+                summary.report = f"FAILED: {type(exc).__name__}: {exc}"
+                app_logger.error(f"[REPORT] 일일 리포트 생성 실패(매매 결과에는 영향 없음): {type(exc).__name__}: {exc}")
+                summary.add_close_issue("REPORT_FAILED")
+                app_logger.critical(f"[SESSION_CLOSE] {summary.close_check} — REPORT_FAILED")
+                return False
+
+        report_ok = make_report()
         if write_session_status(settings, summary, app_logger) is None:
             summary.add_close_issue("STATUS_WRITE_FAILED")
             app_logger.critical(f"[SESSION_CLOSE] 상태 파일 저장 실패 — {summary.close_check}, "
                                 f"{', '.join(summary.close_issues)} (run_id={summary.run_id})")
+            # 9-A: 보고서가 먼저 만들어졌으므로 최종 판정(STATUS_WRITE_FAILED 포함)으로 다시 씀
+            if report_ok:
+                make_report()
     return summary
 
 
