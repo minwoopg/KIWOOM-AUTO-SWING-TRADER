@@ -643,4 +643,42 @@ GPT 재검토(`08c6eab` 기준, F1·F3·F4·F6·F8 해결 확인)에서 잔여 4
 ### 전달 파일
 - 패치 0001 (feat), 0002 (docs) — 9-A·9-B 패치 위에 적용
 
+## 2026-09-30 — A13-R1~R5: 연구 계산층 경계 보완 (GPT 재검토 `94dca36`)
+
+### 배경
+GPT 재검토: 회귀 28/28·신규 94/94·동등성 18/18 통과, 그러나 백필 연결 전 보완 5건 재현.
+- R1(P1): 종목·지수·시장 판정의 기준일을 맞춰 보지 않음 — 2025-10-20 신호에 2026-01-02 기준 지수를 넘기자 RS60·최종 판정이 경고 없이 바뀜.
+- R2(P1): 수요일까지 잘린 세션 목록을 주봉에 넘기면 수요일을 주 마지막으로 보고 완성 처리. `available_at` 없음.
+- R3(P2): 세션 중복·정렬 미검증 — 159개 봉으로 HISTORY 160 통과.
+- R4(P2): INVALID_STOP이어도 최종 신호 PASS.
+- R5(P2): +무한대 가격 허용 → 주봉에 Infinity·NaN.
+
+### 변경 내용
+| ID | 파일 | 내용 |
+|---|---|---|
+| R1 | `features.rs`, `market.py`, `s1.py` | RS는 두 View 기준일이 같고 수익률 구간 날짜 배열이 같을 때만(아니면 `AS_OF_MISMATCH`/`SESSION_ALIGNMENT_MISMATCH` UNKNOWN). `MarketRegime`에 `as_of`·`index_id`. 평가기는 지수 View·시장 판정 기준일이 종목과 다르면 시장 UNKNOWN. `market=None`이면 같은 지수로 직접 판정 |
+| R2 | `weekly.py` (w1→w2) | 주봉은 **주 단위 예정 일정(`WeekSchedule`)**으로만 판정: `CalendarWeekSchedule`(TradingCalendar), `ExplicitWeekSchedule`(known_through까지 모든 평일이 세션·휴장일로 명시돼야 함, 잘린 목록 → `ScheduleCoverageError`). `session_closed_at`·`available_at`(종료+30분 `ASSUMED_DELAY` / 실제 확보 시각 `OBSERVED`)·`availability_basis`. 평가 시각 as_of보다 늦게 사용 가능한 주 제외. 일정 불명 지난 주는 불완전으로 남김 |
+| R3 | `series.py` | 세션 목록 date 타입·엄격한 오름차순 검증(오류), 기준일 타입, 창 인자 음수·0 → BAD_WINDOW, 반환 길이 검증 |
+| R4 | `s1.py` | `STOP_VALID` 조건·`stop_valid` 필드. `eligible_signal` = 패턴·자격·시장·손절 유효 **모두 PASS**. 패턴 등 개별 결과는 보존. `S1Config` 값 검증(양의 정수·0 이상 유한수·pullback 범위) |
+| R5 | `series.py`, `weekly.py` | 가격 `math.isfinite`+양수, volume·trade_value의 bool 거부, 주봉 추세 비유한값 → UNKNOWN(`NON_FINITE`) |
+| 문서 | `docs/research_a_stage.md` | available_at 시간대(Asia/Seoul naive)·데이터 확보 시각·백필 해석, 기준일 정합 규칙 |
+
+### 테스트 및 검증
+- 새 경계 테스트: `test_research_features` 50→66, `test_research_s1` 30→38.
+  R1: 미래 기준일 지수 View·시장 판정, 다른 날짜 시장 판정만 전달, 지수 세션 하나 누락. R2: 잘린 목록 오류, 수요일 진행 중 주 제외,
+  금요일 휴장 주 목요일 16:00 사용 가능·14:00/15:40 제외·OBSERVED, 실제 달력 어댑터(2026 추석 주·미지원 연도·특수일). R3: 중복·역순 세션, 159봉+중복 세션.
+  R4: INVALID_STOP → 패턴·자격·시장 PASS 보존, 최종 FAIL. R5: ±무한대·NaN·음수·bool 거부, allow_nan=False 직렬화.
+- 변이 확인: R1 검사·R4 결합을 되돌리면 새 테스트 6건 실패.
+- **정상 S1 기준선 결과 유지**: 기존 정상 시나리오 PASS 그대로(1-1~1-4), 같은 기준일 지수로 직접 판정한 결과 = 기존 결과(8-3).
+- `run_regression_tests.py --skip test_broker_order_status.py`: 28개 전부 통과. 단타 원본 동등성 18/18. 테스트 후 `git status` 깨끗, `commands/` 생성 없음.
+
+### 변경하지 않은 것
+- 전략 조건·임계값, 운영 원장·복구·주문 경로. 실제 원천 필드·단위(프로브 결과 대기).
+
+### 다음 작업
+- A1 실측 결과 반영 → A2 수집(과거 달력 보강 포함).
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (docs)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
