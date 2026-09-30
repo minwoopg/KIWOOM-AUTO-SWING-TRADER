@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+"""연구 수집 전용 키움 조회 클라이언트 (A2).
+
+안전 규칙 (A단계 합의·프로브와 같은 원칙)
+- **모의투자 도메인(https://mockapi.kiwoom.com)에서만** 동작합니다. 우회 옵션 없음.
+  (모의 도메인의 시세·목록은 실제 시장 데이터 — A1 실측으로 확인)
+- 허용 TR은 조회 3개뿐: ka10099(종목 목록)·ka10081(종목 일봉)·ka20006(지수 일봉).
+  주문·계좌 TR은 목록에 없으므로 호출 자체가 막힙니다.
+- 운영 브로커(`infra.broker`)·주문 실행부·원장·commands 폴더와 무관합니다.
+- 토큰·앱키는 예외 메시지나 로그에 넣지 않습니다.
+
+호출 간격: 모든 요청을 이 객체 하나로 통과시켜 `min_interval_sec`(기본 1초 — 0.5초 간격에서 429 실측)를 지킵니다.
+429·전송 실패는 대기 후 재시도(조회 전용이라 안전), HTTP 401은 한 번 재인증 후 재시도.
+그 밖의 HTTP 오류·return_code≠0·목록 없음은 재시도하지 않고 `ResearchApiError`.
+"""
+
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Callable, Sequence
+from urllib.parse import urlparse
+
+from utils.time_utils import now_local
+
+ALLOWED_BASE_URL_HOST = "mockapi.kiwoom.com"
+RESEARCH_API = {
+    "ka10099": "/api/dostk/stkinfo",   # 종목정보 리스트
+    "ka10081": "/api/dostk/chart",     # 주식 일봉
+    "ka20006": "/api/dostk/chart",     # 업종(지수) 일봉
+}
+
+
+class ResearchConfigError(ValueError):
+    """안전 요건 위반 (도메인·TR)."""
+
+
+class ResearchApiError(RuntimeError):
+    """재시도하지 않는 조회 오류."""
+
+
+class _Retryable(RuntimeError):
+    pass
+
+
+def assert_mock_domain(base_url: str) -> None:
+    parsed = urlparse(base_url or "")
+    if ((parsed.scheme or "").lower() != "https"
+            or (parsed.hostname or "").lower() != ALLOWED_BASE_URL_HOST
+            or parsed.port not in (None, 443)):
+        raise ResearchConfigError(
+            f"연구 수집은 https://{ALLOWED_BASE_URL_HOST} 에서만 실행합니다 (현재 {base_url!r})")
+
+
+@dataclass(frozen=True)
+class Page:
+    rows: list
+    cont_yn: str
+    next_key: str
+    received_at: datetime          # 응답을 받은 시각 (Asia/Seoul naive)
+
+    @property
+    def has_more(self) -> bool:
+        return self.cont_yn == "Y" and bool(self.next_key)
+
+
+class ReadOnlyResearchClient:
+    def __init__(self, session, base_url: str, app_key: str, secret_key: str, *,
+                 min_interval_sec: float = 1.0,
+                 retry_backoff_sec: Sequence[float] = (2.0, 5.0, 10.0, 20.0),
+                 now: Callable[[], datetime] = now_local,
+                 monotonic: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep,
+                 log: Callable[[str], None] | None = None) -> None:
+        assert_mock_domain(base_url)
+        if min_interval_sec < 0.5:
+            raise ResearchConfigError("min_interval_sec는 0.5 이상 (실측상 0.5초 간격에서도 429)")
+        self.session = session
+        self.base_url = base_url
+        self._app_key = app_key
+        self._secret_key = secret_key
+        self.min_interval_sec = min_interval_sec
+        self.retry_backoff_sec = tuple(retry_backoff_sec)
+        self.now = now
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self.log = log or (lambda msg: None)
+        self._token = ""
+        self._last_call: float | None = None
+        self.calls = 0
+        self.retries = 0
+
+    # ── 인증 ──
+    def authenticate(self) -> None:
+        assert_mock_domain(self.base_url)
+        self._pace()
+        r = self.session.post(f"{self.base_url}/oauth2/token", json={
+            "grant_type": "client_credentials", "appkey": self._app_key, "secretkey": self._secret_key,
+        }, timeout=10)
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+        token = body.get("token") if isinstance(body, dict) else None
+        if r.status_code != 200 or not token:
+            msg = body.get("return_msg") if isinstance(body, dict) else ""
+            raise ResearchApiError(f"토큰 발급 실패: http={r.status_code} return_msg={msg}")
+        self._token = str(token)
+
+    # ── 조회 ──
+    def _pace(self) -> None:
+        if self._last_call is not None:
+            wait = self.min_interval_sec - (self.monotonic() - self._last_call)
+            if wait > 0:
+                self.sleep(wait)
+        self._last_call = self.monotonic()
+
+    def _post_once(self, api_id: str, payload: dict, cont_yn: str, next_key: str) -> tuple[int, dict, Any]:
+        import requests
+        headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "authorization": f"Bearer {self._token}",
+            "cont-yn": cont_yn, "next-key": next_key, "api-id": api_id,
+        }
+        self._pace()
+        self.calls += 1
+        try:
+            r = self.session.post(f"{self.base_url}{RESEARCH_API[api_id]}", headers=headers, json=payload, timeout=15)
+        except requests.RequestException as exc:
+            raise _Retryable(f"전송 실패 {type(exc).__name__}") from exc
+        resp_headers = {k: str(r.headers.get(k, "") or "").strip() for k in ("cont-yn", "next-key")}
+        try:
+            body = r.json()
+        except ValueError:
+            body = None
+        return r.status_code, resp_headers, body
+
+    def fetch_page(self, api_id: str, payload: dict, list_key: str,
+                   cont_yn: str = "N", next_key: str = "") -> Page:
+        assert_mock_domain(self.base_url)
+        if api_id not in RESEARCH_API:
+            raise ResearchConfigError(f"연구 수집에 허용되지 않은 api-id: {api_id}")
+        if not self._token:
+            self.authenticate()
+        attempt, reauthed = 0, False
+        while True:
+            try:
+                status, h, body = self._post_once(api_id, payload, cont_yn, next_key)
+                if status == 429:
+                    raise _Retryable("HTTP 429")
+                if status == 401 and not reauthed:
+                    reauthed = True
+                    self.log(f"[RESEARCH] {api_id} HTTP 401 — 재인증 후 재시도")
+                    self.authenticate()
+                    continue
+                break
+            except _Retryable as exc:
+                if attempt >= len(self.retry_backoff_sec):
+                    raise ResearchApiError(f"{api_id} {payload}: 재시도 {attempt}회 후에도 실패 — {exc}") from exc
+                wait = self.retry_backoff_sec[attempt]
+                attempt += 1
+                self.retries += 1
+                self.log(f"[RESEARCH] {api_id} {exc} — {wait}초 후 재시도 ({attempt}/{len(self.retry_backoff_sec)})")
+                self.sleep(wait)
+        received_at = self.now()
+        if status != 200 or not isinstance(body, dict):
+            raise ResearchApiError(f"{api_id} {payload}: HTTP {status}")
+        if body.get("return_code") not in (0, None):
+            raise ResearchApiError(f"{api_id} {payload}: return_code={body.get('return_code')} "
+                                   f"{body.get('return_msg', '')}")
+        rows = body.get(list_key)
+        if not isinstance(rows, list):
+            raise ResearchApiError(f"{api_id} {payload}: 응답에 {list_key} 목록 없음")
+        return Page(rows, h.get("cont-yn", "").upper(), h.get("next-key", ""), received_at)

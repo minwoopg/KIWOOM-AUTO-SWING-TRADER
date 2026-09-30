@@ -29,7 +29,8 @@ A13-R2 수정 (w1 → w2): 일봉용으로 기준일 뒤를 잘라낸 세션 목
 - 한 주 전체가 예정 휴장이면 항목을 만들지 않고 다음 항목의 gap_weeks_before로 기록합니다.
   weekly_trend는 34주 창 안의 주 시작 간격이 7×(1+gap_weeks_before)일인지 확인합니다.
 - 주봉: O=첫 세션 시가, H=최고, L=최저, C=마지막 세션 종가, V·거래대금=합계(거래대금은 하나라도
-  없으면 None).
+  없으면 None). 거래 없는 봉(거래량 0)은 합산에 포함하고 no_trade_days로 표시만 합니다(일봉 창 정책과 별개 —
+  주간 추세는 종가만 씀).
 - SMA30W = 최근 30개 완성 주봉 종가 평균, slope4W = SMA30W[w]/SMA30W[w-4]-1 (34주 연속 필요).
 - 상태: UP_PROXY / DOWN_PROXY / UNCLASSIFIED / UNKNOWN. Stage 1~4 분류가 아닙니다(근사).
 """
@@ -126,6 +127,7 @@ class WeeklyBar:
     complete: bool
     reason: str = ""
     gap_weeks_before: int = 0           # 직전 항목과의 사이에 있던 '한 주 전체 휴장' 주 수 (A13-Q3)
+    no_trade_days: int = 0              # 거래 없는 봉(거래량 0) 수 — 표시만. 주봉은 종가 기반 관찰값이라 합산에 포함(A2)
 
 
 def _placeholder(monday, last, closed_at, available_at, basis, reason, gap) -> WeeklyBar:
@@ -222,7 +224,8 @@ def weekly_bars(bars: Sequence[ResearchBar], schedule: WeekSchedule, as_of: date
             tv = None if any(b.trade_value is None for b in got) else sum(b.trade_value for b in got)
             out.append(WeeklyBar(monday, last, closed_at, available_at, basis, got[0].open,
                                  max(b.high for b in got), min(b.low for b in got), got[-1].close,
-                                 sum(b.volume for b in got), tv, True, "", gap))
+                                 sum(b.volume for b in got), tv, True, "", gap,
+                                 sum(1 for b in got if b.no_trades)))
         monday += timedelta(days=7)
     if out and out[-1].reason == "DATA_NOT_READY":      # 가장 최근에 끝난 주 하나만 '아직 도착 전'으로 잘라냄
         out.pop()                                       # 그보다 앞선 주까지 준비 안 됐으면 불완전 자리로 남김

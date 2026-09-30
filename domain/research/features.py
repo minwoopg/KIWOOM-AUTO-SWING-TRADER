@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-"""순수 지표 함수 (feature_version = f1).
+"""순수 지표 함수 (feature_version = f2).
+
+f1 → f2 (A2): 거래 없는 봉(거래량 0) 정책 — 기준일이면 NO_TRADES_AT_T, 창 안이면 NO_TRADES:<날짜>로
+UNKNOWN, EMA 연속 구간도 끊김 (`series.NO_TRADES_POLICY`). 나머지 정의는 f1과 같습니다.
 
 모두 `SeriesView`(기준일 t까지만 보는 창)를 받아 `FV`(값 또는 UNKNOWN+사유)를
 돌려줍니다. `off`는 t에서 몇 세션 전을 기준으로 계산할지입니다(0 = t).
@@ -30,7 +33,7 @@ from datetime import date
 from domain.research.series import ResearchBar, SeriesView
 from domain.research.types import FV, ratio
 
-FEATURE_VERSION = "f1"
+FEATURE_VERSION = "f2"
 EMA_WARMUP_MULTIPLE = 5
 
 
@@ -178,9 +181,11 @@ def ema(v: SeriesView, n: int, off: int = 0) -> EmaResult:
         return EmaResult(FV.unknown(st or "INSUFFICIENT_SESSIONS"), None, 0)
     if target not in v.by_date:
         return EmaResult(FV.unknown(f"DATA_GAP:{target.isoformat()}"), None, 0)
-    # target에서 거슬러 올라가 공백 없는 구간 시작 찾기
+    if not v.usable(target):
+        return EmaResult(FV.unknown(f"NO_TRADES:{target.isoformat()}"), None, 0)
+    # target에서 거슬러 올라가 공백·거래 없는 봉 없이 이어진 구간 시작 찾기
     i = v._idx[target]
-    while i - 1 >= 0 and v.sessions[i - 1] in v.by_date:
+    while i - 1 >= 0 and v.usable(v.sessions[i - 1]):
         i -= 1
     run = [v.by_date[d] for d in v.sessions[i:v._idx[target] + 1]]
     if len(run) < n:

@@ -91,10 +91,12 @@ jump = bars_from(S[:30], [100.0] * 29 + [110.0])            # 마지막 날 갭 
 va = SeriesView(jump, S, S[29])
 check("3-5) 갭은 |H-전일C|로 TR에 반영: (13×2 + 11)/14", approx(F.atr(va).value, (13 * 2 + 11) / 14))
 check("3-6) extension20 = (C-SMA20)/ATR14", approx(F.extension(v).value, (159 - 149.5) / 2.0))
-flat = [ResearchBar(d, 10.0, 10.0, 10.0, 10.0, 0, None) for d in S[:40]]
+flat = [ResearchBar(d, 10.0, 10.0, 10.0, 10.0, 1, None) for d in S[:40]]
 vf = SeriesView(flat, S, S[39])
 check("3-7) 고저 같으면 close_location UNKNOWN(ZERO_RANGE)", F.close_location(vf).reason == "ZERO_RANGE")
-check("3-8) 거래량 평균 0이면 volume_ratio UNKNOWN", not F.volume_ratio(vf).ok)
+flat0 = [ResearchBar(d, 10.0, 10.0, 10.0, 10.0, 0, None) for d in S[:40]]
+check("3-8) 거래량 0인 봉만 있으면 volume_ratio UNKNOWN(NO_TRADES_AT_T — 분모 0까지 가지 않음)",
+      F.volume_ratio(SeriesView(flat0, S, S[39])).reason == "NO_TRADES_AT_T")
 check("3-9) ATR 0이면 extension UNKNOWN(분모 0)", "ZERO_DENOMINATOR" in F.extension(vf).reason)
 tvb = bars_from(S[:25], [100.0] * 25, tv=5_000_000_000)
 check("3-10) 거래대금 평균(원)", F.trade_value_avg(SeriesView(tvb, S, S[24]), 20).value == 5e9)
@@ -347,6 +349,32 @@ check("10-12) 최근 주 하나만 '도착 전'으로 잘라냄 — 그 앞 주�
       and weekly_trend(w_two).state == "UNKNOWN")
 check("10-11) 정상 주봉(가정 모드) 결과 유지: 마지막 = 평가 주 금요일, 추세 UP_PROXY",
       full2[-1].week_end_session == fri and weekly_trend(full2).state == UP_PROXY)
+
+# ── 11. A2: 거래 없는 봉(NO_TRADES) 정책 (feature f2) ──────────────────
+S11 = weekdays(date(2024, 1, 1), 400)
+base11 = bars_from(S11[:400], [100.0 + (i % 7) for i in range(400)])
+halt = {S11[300], S11[301], S11[302]}                       # 삼성전자 2018-04-30~05-03 같은 3일 정지(가격 그대로, 거래 0)
+nt = [ResearchBar(b.date, b.close, b.close, b.close, b.close, 0, 0) if b.date in halt else b for b in base11]
+check("11-1) 거래량 0 봉은 no_trades 표시, 원본 OHLC 보존", nt[300].no_trades and nt[300].close == base11[300].close
+      and not nt[299].no_trades)
+check("11-2) 기준일이 거래 없는 봉이면 NO_TRADES_AT_T, 모든 지표 UNKNOWN",
+      SeriesView(nt, S11, S11[301]).status() == "NO_TRADES_AT_T"
+      and F.sma(SeriesView(nt, S11, S11[301]), 20).reason == "NO_TRADES_AT_T")
+v11 = SeriesView(nt, S11, S11[310])
+check("11-3) 창 안에 거래 없는 봉이 있으면 UNKNOWN(NO_TRADES:첫 날짜) — ATR·거래량비·SMA 모두",
+      F.atr(v11).reason == f"NO_TRADES:{S11[300].isoformat()}"
+      and F.volume_ratio(v11).reason.startswith("NO_TRADES") and F.sma(v11, 20).reason.startswith("NO_TRADES"))
+check("11-4) 창이 거래 없는 봉 뒤에서 시작하면 정상 (SMA5)", F.sma(v11, 5).ok)
+check("11-5) DATA_GAP과 구분되는 사유", "DATA_GAP" not in F.atr(v11).reason)
+e_nt = F.ema(SeriesView(nt, S11, S11[399]), 20)
+check("11-6) EMA 연속 구간이 거래 없는 봉에서 끊김 (시작값 = 정지 뒤 20번째 봉, 97회 갱신 → 워밍업 미달)",
+      not e_nt.value.ok and e_nt.seed_date == S11[322] and e_nt.updates_after_seed == 399 - 322)
+check("11-7) 정지 없는 원본은 EMA 유효(기준선 유지)", F.ema(SeriesView(base11, S11, S11[399]), 20).value.ok)
+SCHED11 = ExplicitWeekSchedule([d for d in weekdays(date(2024, 1, 1), 800) if d <= KNOWN], [], KNOWN)
+w11 = weekly_bars(nt, SCHED11, DT.combine(S11[309], TM(20, 0)))
+wk_halt = [w for w in w11 if w.week_start <= S11[300] <= w.week_start + timedelta(days=6)][0]
+check("11-8) 주봉은 거래 없는 봉을 합산하고 no_trade_days로 표시(완성 유지)",
+      wk_halt.complete and wk_halt.no_trade_days >= 1)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

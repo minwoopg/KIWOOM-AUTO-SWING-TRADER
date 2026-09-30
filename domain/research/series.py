@@ -10,6 +10,12 @@ from __future__ import annotations
   * 창(window)은 **거래 세션 기준**입니다. 세션 목록(달력)에 있는데 봉이 없으면
     상장 전(INSUFFICIENT_HISTORY)인지 중간 공백(DATA_GAP — 거래정지·수집 누락)인지
     구분해 UNKNOWN을 돌려줍니다. 앞뒤 봉을 당겨 채우지 않습니다.
+- **거래 없는 봉(NO_TRADES, A2)**: 거래량 0인 봉(예: 삼성전자 2018-04-30~05-03 액면분할 정지 — OHLC가
+  전일 종가 그대로, 거래량·거래대금 0)은 원본대로 보존하되 계산에는 쓰지 않습니다(정책 NO_TRADES_POLICY).
+  * 기준일 t가 거래 없는 봉이면 status = NO_TRADES_AT_T → 모든 지표 UNKNOWN(그날 신호·체결 가정 없음).
+  * 창 안에 거래 없는 봉이 있으면 UNKNOWN(NO_TRADES:<날짜>) — 범위(ATR)·거래량 지표 왜곡 방지.
+  * EMA의 "공백 없이 이어진 구간"도 거래 없는 봉에서 끊깁니다.
+  거래량 0만으로 거래정지를 확정하지 않습니다(표시만). 완화는 버전을 올려 따로 합니다.
 """
 
 import math
@@ -18,6 +24,9 @@ from datetime import date, datetime
 from typing import Iterable, Sequence
 
 from domain.research.types import FV
+
+
+NO_TRADES_POLICY = "UNKNOWN_IN_WINDOW"   # 거래 없는 봉이 창에 있으면 UNKNOWN (feature f2)
 
 
 class ResearchBarError(ValueError):
@@ -54,6 +63,11 @@ class ResearchBar:
     @property
     def range(self) -> float:
         return self.high - self.low
+
+    @property
+    def no_trades(self) -> bool:
+        """거래량 0 — 거래 없는 봉(NO_TRADES). 거래정지 확정이 아니라 품질 표시."""
+        return self.volume == 0
 
 
 def bars_from_daily(daily_bars: Iterable, trade_values: dict[date, int] | None = None) -> list[ResearchBar]:
@@ -101,7 +115,14 @@ class SeriesView:
             return "T_NOT_SESSION"
         if self.t not in self.by_date:
             return "NO_BAR_AT_T"
+        if self.by_date[self.t].no_trades:
+            return "NO_TRADES_AT_T"
         return ""
+
+    def usable(self, d: date) -> bool:
+        """그 세션의 봉이 있고 거래가 있었는가 (NO_TRADES 봉은 계산에 쓰지 않음)."""
+        b = self.by_date.get(d)
+        return b is not None and not b.no_trades
 
     def session_at(self, offset: int) -> date | None:
         """t에서 offset 세션 전의 날짜 (offset=0 → t)."""
@@ -131,6 +152,8 @@ class SeriesView:
                 if self.first_bar_date is None or d < self.first_bar_date:
                     return None, "INSUFFICIENT_HISTORY"
                 return None, f"DATA_GAP:{d.isoformat()}"
+            if b.no_trades:
+                return None, f"NO_TRADES:{d.isoformat()}"
             out.append(b)
         if len(out) != n:                       # 방어: 세션 검증이 있으므로 도달하지 않음
             return None, "WINDOW_LENGTH_MISMATCH"
@@ -141,10 +164,10 @@ class SeriesView:
         return bars, (FV.unknown(why) if bars is None else None)
 
     def contiguous_run_start(self) -> date | None:
-        """t에서 거슬러 올라가며 공백 없이 이어진 구간의 첫 세션 날짜."""
+        """t에서 거슬러 올라가며 공백·거래 없는 봉 없이 이어진 구간의 첫 세션 날짜."""
         if self.status():
             return None
         i = self.t_index
-        while i - 1 >= 0 and self.sessions[i - 1] in self.by_date:
+        while i - 1 >= 0 and self.usable(self.sessions[i - 1]):
             i -= 1
         return self.sessions[i]

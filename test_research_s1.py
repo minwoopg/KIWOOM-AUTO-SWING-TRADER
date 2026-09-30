@@ -185,7 +185,7 @@ check("5-2) 같은 입력·설정 → 같은 결과", run(bars, t).to_dict() == 
 cfg2 = replace(S1Config(), min_trade_value_20=2_000_000_000)
 check("5-3) 설정 해시: 같은 설정 동일, 값 바꾸면 다름",
       S1Config().config_hash() == S1Config().config_hash() and cfg2.config_hash() != S1Config().config_hash())
-check("5-4) 기록에 전략·지표 버전·설정 해시", base["strategy"] == "s1_pullback_v0.1" and base["feature_version"] == "f1"
+check("5-4) 기록에 전략·지표 버전·설정 해시", base["strategy"] == "s1_pullback_v0.1" and base["feature_version"] == "f2"
       and base["config_hash"] == S1Config().config_hash())
 
 # ── 6. 후보 정렬 ─────────────────────────────────────────────
@@ -286,6 +286,21 @@ try:
 except ValueError:
     relabel = False
 check("9-6) 시장 판정에 View 원천과 다른 지수 이름을 붙일 수 없음", not relabel)
+
+# ── 10. A2: 거래 없는 봉(NO_TRADES) ─────────────────────────────
+bars10, t10 = scenario()
+halt_i = 150                                                 # 기준일 55세션 전 3일 거래 없음(가격 그대로)
+nt10 = [ResearchBar(b.date, bars10[halt_i - 1].close, bars10[halt_i - 1].close, bars10[halt_i - 1].close,
+                    bars10[halt_i - 1].close, 0, 0) if halt_i <= i < halt_i + 3 else b for i, b in enumerate(bars10)]
+r10 = run(nt10, t10)
+check("10-1) 최근 160세션 안에 거래 없는 봉 → HISTORY UNKNOWN(NO_TRADES), 최종 PASS 아님",
+      res_of(r10, "HISTORY") == Tri.UNKNOWN and "NO_TRADES" in r10.check("HISTORY").detail
+      and r10.eligible_signal != Tri.PASS)
+t_halt = [b for b in nt10 if b.no_trades][0].date
+r10b = evaluate_s1("005930", SeriesView(nt10, S, t_halt), SeriesView(IDX, S, t_halt, source_id=IDX_ID), None, OK)
+check("10-2) 기준일 자체가 거래 없는 봉 → 신호 UNKNOWN", r10b.eligible_signal == Tri.UNKNOWN
+      and all(c.result != Tri.PASS for c in r10b.checks if c.name == "HISTORY"))
+check("10-3) 정상 기준선(거래 없는 봉 없음) 결과 유지", run(*scenario()).eligible_signal == Tri.PASS)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
