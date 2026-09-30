@@ -229,6 +229,16 @@ python tools/probe_market_data.py --env-file ..\KIWOOM-AUTO-TRADER\.env --skip-d
 
 `.env`의 `KAKAO_*` 값을 비워두면 알림이 자동으로 꺼집니다(코드 변경 불필요).
 
+## 연구(관찰) 계층 — A단계 (주문 없음)
+
+매매 로직(S1 눌림 회복)을 **주문 없이** 신호·관찰 데이터로 먼저 쌓는 단계입니다. 합의 명세: `docs/research_a_stage.md`.
+
+- `domain/research/`: 순수 계산(지표·주봉·시장 환경·S1 평가기). 네트워크·파일·주문 경로를 쓰지 않습니다.
+  확인할 수 없는 값은 UNKNOWN(사유 포함)이고, 기준일 이후 데이터는 계산 전에 잘라냅니다.
+- 원천 확인(조회 전용, 모의 도메인만): `python tools/probe_research_sources.py` — 종목 목록 필드·위험 상태 후보,
+  일봉 거래대금 필드와 단위, 지수 일봉 TR을 실측합니다(TR 이름은 조사 후보). 장 마감 후 권장.
+- 수집·스캔·저장·보고·다음날 확인은 A2·A4·A5에서 추가됩니다.
+
 ## 원본과의 관계 (`provenance.json`)
 
 | status | 의미 |

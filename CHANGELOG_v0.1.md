@@ -607,4 +607,40 @@ GPT 재검토(`08c6eab` 기준, F1·F3·F4·F6·F8 해결 확인)에서 잔여 4
 ### 전달 파일
 - 패치 0001 (fix+test), 0002 (CHANGELOG)
 
+## 2026-09-30 — A1·A3: 연구 원천 실측 도구, 순수 지표·시장 환경·주봉·S1_BASE 평가기 (주문 없음)
+
+### 배경
+- 사용자 결정: 원장 정정 도구·guard 보강보다 **매매 로직(S1)을 주문 없이 먼저 구축해 관찰 데이터를 쌓기**.
+- 요청서·보충안을 Claude·GPT가 검토해 합의한 명세를 `docs/research_a_stage.md`로 정리
+  (S1_BASE 주 가설, 전체 보통주, 날짜 기준 백필, 백필 자격 조건별 분리, EMA 6N, 사건 ID, 주봉 사용 시각).
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `domain/research/` (신규) | `types`(PASS/FAIL/UNKNOWN, NaN·무한대 차단), `series`(ResearchBar·SeriesView: 미래 봉·세션 차단, 세션 기준 창, 상장 전/중간 공백 구분), `features`(f1), `market`(m1), `weekly`(w1), `s1`(s1_pullback_v0.1) |
+| `tools/probe_research_sources.py` (신규) | A1 조회 전용 프로브: 종목 목록(ka10099 후보) 필드·값 분포·코드 형태, 일봉 거래대금 후보 필드·단위 추정·이력 깊이, 지수 일봉(ka20006 후보) 필드·원문 값·소수점 여부. 오류 응답도 기록 |
+| `tools/probe_market_data.py` | 허용 TR에 ka10099·ka20006(조사 후보) 추가 — 모의 도메인 제한·주문 TR 금지는 그대로 |
+| `docs/research_a_stage.md` (신규), `README.md` | 합의 명세·안내 |
+| 테스트 (신규) | `test_research_features`(50), `test_research_s1`(30), `test_probe_research_sources`(14) |
+
+### 테스트 및 검증
+- 경계·실패: 상장 전 vs 중간 공백, 기준일 봉 없음, ATR 0·분모 0, 거래대금 하나라도 없으면 UNKNOWN(종가×거래량으로 채우지 않음),
+  t 당일 급등이 수축 지표 불변, 252개 미만 52주 UNKNOWN, EMA 6N 경계·공백 뒤 재시작·손계산 일치,
+  주봉(수요일 진행 중 제외·금요일 휴장·달력 미확정·일봉 누락 주), SMA30W ≠ SMA150.
+- S1: 정상 눌림 회복 PASS, MA60 이탈·RS 부족·과열·전일 고가 미돌파·하락 추세 반등·조정 길이·낮은 종가 없음·빈 조정 구간·고점 동률,
+  위험 상태 UNKNOWN/우선주/위험 종목/거래대금 부족·없음, 시장 MIXED 보류·지수 없음 UNKNOWN, 이력 부족·공백, INVALID_STOP,
+  **t 이후 봉·지수를 바꿔도 결과 동일**, 설정 해시, 결정적 정렬, 연구 계층의 주문·브로커·원장·네트워크 의존 없음.
+- `run_regression_tests.py --skip test_broker_order_status.py`: **28개** 전부 통과. 단타 원본 동등성 18/18.
+
+### 변경하지 않은 것
+- 운영 세션·NullStrategy·주문 경로·원장·복구 규칙.
+- 실제 원천 필드·단위·지수 배율은 **미확인**(프로브 실행 전). 테스트의 응답 형식은 가짜.
+
+### 다음 작업
+- 사용자: 장 마감 후 `python tools/probe_research_sources.py` 실행 → 요약 파일 공유.
+- A2: 결과를 반영한 날짜별 종목 목록·지수·거래대금 수집(중단 후 이어서), 과거 달력 보강.
+
+### 전달 파일
+- 패치 0001 (feat), 0002 (docs) — 9-A·9-B 패치 위에 적용
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
