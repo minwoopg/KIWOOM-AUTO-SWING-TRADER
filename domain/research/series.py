@@ -76,7 +76,10 @@ def validate_sessions(sessions: Sequence[date], what: str = "sessions") -> None:
 class SeriesView:
     """기준일 t에서 본 한 종목(또는 지수)의 일봉."""
 
-    def __init__(self, bars: Sequence[ResearchBar], sessions: Sequence[date], t: date) -> None:
+    def __init__(self, bars: Sequence[ResearchBar], sessions: Sequence[date], t: date, *,
+                 source_id: str = "") -> None:
+        """source_id: 원천 식별자(예: "INDEX:KOSPI:001", "STOCK:005930"). 지수 View와 시장 판정이
+        같은 원천인지 확인하는 데 씁니다 (A13-Q1)."""
         dates = [b.date for b in bars]
         if any(b <= a for a, b in zip(dates, dates[1:])):
             raise ResearchBarError("일봉 날짜가 오름차순·중복 없음이 아님")
@@ -84,6 +87,7 @@ class SeriesView:
         if not isinstance(t, date) or isinstance(t, datetime):
             raise ResearchBarError(f"기준일 t는 date 타입이어야 함 — {t!r}")
         self.t = t
+        self.source_id = str(source_id or "")
         self.sessions = [s for s in sessions if s <= t]          # 미래 세션 차단
         self.by_date = {b.date: b for b in bars if b.date <= t}  # 미래 봉 차단
         self.first_bar_date = min(self.by_date) if self.by_date else None

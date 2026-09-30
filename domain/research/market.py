@@ -39,7 +39,12 @@ class MarketRegime:
                 "ma60_prev5": self.ma60_prev5, "ma120": self.ma120, "reason": self.reason}
 
 
-def classify_market(index: SeriesView, index_id: str = "") -> MarketRegime:
+def classify_market(index: SeriesView, index_id: str | None = None) -> MarketRegime:
+    """index_id를 생략하면 View의 source_id를 씁니다. 둘 다 있는데 다르면 오류(A13-Q1)."""
+    if index_id is None:
+        index_id = index.source_id
+    elif index.source_id and index_id != index.source_id:
+        raise ValueError(f"index_id({index_id})가 View 원천({index.source_id})과 다름")
     c, m60, m60p, m120 = F.close(index), F.sma(index, 60), F.sma(index, 60, 5), F.sma(index, 120)
     vals = [c, m60, m60p, m120]
     if not all(x.ok for x in vals):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-"""완성 주봉과 주간 추세 근사 (보충안 5절, weekly_version = w2).
+"""완성 주봉과 주간 추세 근사 (보충안 5절, weekly_version = w3).
+
+A13-Q2·Q3 (w2 → w3): 관측 모드는 주 전체 봉의 확보 시각, 끝난 주의 준비 안 된 입력은 불완전 자리로.
 
 A13-R2 수정 (w1 → w2): 일봉용으로 기준일 뒤를 잘라낸 세션 목록을 주봉 판정에 쓰면 수요일을
 "그 주 마지막 세션"으로 오인합니다. 그래서 주봉은 세션 목록이 아니라 **주 단위 예정 일정
@@ -17,10 +19,15 @@ A13-R2 수정 (w1 → w2): 일봉용으로 기준일 뒤를 잘라낸 세션 목
   * `available_at`      : 주봉을 계산에 쓸 수 있는 시각.
       - 기본(ASSUMED_DELAY): session_closed_at + data_delay(기본 30분 — 장 마감 후 일봉 확정·수집 여유).
         **백필 해석**: 과거 주는 실제 수집 시각을 알 수 없으므로 이 가정 시각을 씁니다.
-      - 관측(OBSERVED): data_ready_at[마지막 세션]이 주어지면 max(session_closed_at, 그 시각).
-        앞으로 쌓는 기록은 수집기가 마지막 봉의 실제 확보 시각을 넘겨야 합니다.
-  * 평가 시각 as_of보다 available_at이 늦은 주는 결과에 넣지 않습니다(진행 중인 주 포함).
+      - 관측(OBSERVED, mode="OBSERVED"): max(session_closed_at, 그 주 **모든 세션 봉**의 확보 시각).
+        하나라도 확보 시각이 없으면 불완전(READY_TIME_UNKNOWN) — 30분 가정으로 메우지 않습니다.
+        앞으로 쌓는 기록은 수집기가 각 봉의 실제 확보 시각을 넘겨야 합니다.
+      - 두 모드는 섞지 않습니다(가정 모드에 data_ready_at을 넘기면 ValueError). data_delay 음수 거부.
+  * 아직 끝나지 않은 주는 결과에 넣지 않습니다. 끝났지만 available_at > as_of인 과거 주는
+    DATA_NOT_READY 불완전 자리로 남깁니다(가장 최근에 끝난 주 하나만 "아직 도착 전"으로 잘라냄).
 - 봉이 빠진 주·일정을 모르는 지난 주는 complete=False로 남깁니다(건너뛰어 압축하지 않음).
+- 한 주 전체가 예정 휴장이면 항목을 만들지 않고 다음 항목의 gap_weeks_before로 기록합니다.
+  weekly_trend는 34주 창 안의 주 시작 간격이 7×(1+gap_weeks_before)일인지 확인합니다.
 - 주봉: O=첫 세션 시가, H=최고, L=최저, C=마지막 세션 종가, V·거래대금=합계(거래대금은 하나라도
   없으면 None).
 - SMA30W = 최근 30개 완성 주봉 종가 평균, slope4W = SMA30W[w]/SMA30W[w-4]-1 (34주 연속 필요).
@@ -34,7 +41,7 @@ from typing import Protocol, Sequence
 
 from domain.research.series import ResearchBar, ResearchBarError, validate_sessions
 
-WEEKLY_VERSION = "w2"
+WEEKLY_VERSION = "w3"
 UP_PROXY, DOWN_PROXY, UNCLASSIFIED, UNKNOWN = "UP_PROXY", "DOWN_PROXY", "UNCLASSIFIED", "UNKNOWN"
 DEFAULT_DATA_DELAY = timedelta(minutes=30)
 ASSUMED_DELAY, OBSERVED = "ASSUMED_DELAY", "OBSERVED"
@@ -108,8 +115,8 @@ class WeeklyBar:
     week_start: date                    # 월요일
     week_end_session: date | None       # 그 주 마지막 예정 세션
     session_closed_at: datetime | None
-    available_at: datetime | None
-    availability_basis: str
+    available_at: datetime | None       # 주 전체 필수 입력이 확보된 시각(관측) 또는 가정 시각
+    availability_basis: str             # ASSUMED_DELAY / OBSERVED / ""
     open: float | None
     high: float | None
     low: float | None
@@ -118,14 +125,42 @@ class WeeklyBar:
     trade_value: int | None
     complete: bool
     reason: str = ""
+    gap_weeks_before: int = 0           # 직전 항목과의 사이에 있던 '한 주 전체 휴장' 주 수 (A13-Q3)
+
+
+def _placeholder(monday, last, closed_at, available_at, basis, reason, gap) -> WeeklyBar:
+    return WeeklyBar(monday, last, closed_at, available_at, basis, None, None, None, None, None, None,
+                     False, reason, gap)
 
 
 def weekly_bars(bars: Sequence[ResearchBar], schedule: WeekSchedule, as_of: datetime, *,
+                mode: str = ASSUMED_DELAY,
                 data_ready_at: dict[date, datetime] | None = None,
                 data_delay: timedelta = DEFAULT_DATA_DELAY) -> list[WeeklyBar]:
-    """as_of(Asia/Seoul naive) 시점에 사용 가능한 주봉 목록(오래된 순)."""
+    """as_of(Asia/Seoul naive) 시점의 주봉 목록(오래된 순).
+
+    mode (A13-Q2)
+      ASSUMED_DELAY : 백필용. 확보 시각을 모르므로 마지막 세션 종료 + data_delay를 사용 가능 시각으로 가정.
+                      data_ready_at을 함께 주면 오류(모드 혼용 금지).
+      OBSERVED      : 앞으로 쌓는 기록. **그 주 모든 세션 봉의 실제 확보 시각**이 data_ready_at에 있어야 하고,
+                      available_at = max(마지막 세션 종료, 각 봉 확보 시각). 하나라도 없으면 불완전
+                      (READY_TIME_UNKNOWN) — 가정 시각으로 메우지 않음. 봉 확보 시각이 그 세션 종료보다
+                      이르면 장중 미완성 봉으로 보고 불완전(READY_BEFORE_SESSION_CLOSE).
+    포함 규칙 (A13-Q3)
+      - 마지막 세션이 아직 끝나지 않은 주(진행 중)는 넣지 않습니다.
+      - 끝났지만 입력이 아직 준비 안 된 주(DATA_NOT_READY)는 **불완전 자리로 남깁니다**. 단, 가장 최근에
+        끝난 주 하나만은 "아직 도착 전"으로 보고 잘라냅니다(직전 주까지가 그 시점의 최신 정보).
+        그보다 앞선 주·중간에 낀 주는 남아서 추세를 UNKNOWN으로 만들고 창을 압축하지 못하게 합니다.
+      - 한 주 전체가 예정 휴장인 주는 항목을 만들지 않고, 다음 항목의 gap_weeks_before로 기록합니다.
+    """
     if not isinstance(as_of, datetime):
         raise ResearchBarError("as_of는 datetime(Asia/Seoul naive)이어야 함")
+    if mode not in (ASSUMED_DELAY, OBSERVED):
+        raise ValueError(f"mode는 {ASSUMED_DELAY}/{OBSERVED} — {mode!r}")
+    if not isinstance(data_delay, timedelta) or data_delay < timedelta(0):
+        raise ValueError("data_delay는 0 이상 timedelta")
+    if mode == ASSUMED_DELAY and data_ready_at:
+        raise ValueError("ASSUMED_DELAY 모드에는 data_ready_at을 넘기지 않음(모드 혼용 금지)")
     dates = [b.date for b in bars]
     if any(b <= a for a, b in zip(dates, dates[1:])):
         raise ResearchBarError("일봉 날짜가 오름차순·중복 없음이 아님")
@@ -137,40 +172,60 @@ def weekly_bars(bars: Sequence[ResearchBar], schedule: WeekSchedule, as_of: date
     out: list[WeeklyBar] = []
     monday = _monday(first_bar)
     last_monday = _monday(as_of.date())
+    holiday_weeks = 0
     while monday <= last_monday:
         ss = schedule.sessions_in_week(monday)
         sunday = monday + timedelta(days=6)
         if ss is None:
             if sunday < as_of.date():           # 지난 주인데 일정 불명 → 불완전으로 남김
-                out.append(WeeklyBar(monday, None, None, None, "", None, None, None, None, None, None,
-                                     False, "SCHEDULE_UNKNOWN"))
+                out.append(_placeholder(monday, None, None, None, "", "SCHEDULE_UNKNOWN", holiday_weeks))
+                holiday_weeks = 0
             monday += timedelta(days=7)
             continue
-        if not ss:                              # 한 주 전체 휴장
+        if not ss:                              # 한 주 전체 예정 휴장
+            if out:
+                holiday_weeks += 1
             monday += timedelta(days=7)
             continue
         last = ss[-1]
         closed_at = schedule.close_at(last)
-        if last in ready:
-            available_at, basis = max(closed_at, ready[last]), OBSERVED
-        else:
-            available_at, basis = closed_at + data_delay, ASSUMED_DELAY
-        if available_at > as_of:                # 진행 중이거나 아직 확보 전
+        if closed_at > as_of:                   # 진행 중인 주
             monday += timedelta(days=7)
             continue
         if ss[0] < first_bar:                   # 상장 전 주
             monday += timedelta(days=7)
             continue
+        gap, holiday_weeks = holiday_weeks, 0
         got = [by_date.get(s) for s in ss]
-        if any(b is None for b in got):
-            out.append(WeeklyBar(monday, last, closed_at, available_at, basis, None, None, None, None, None,
-                                 None, False, f"MISSING_DAILY:{sum(b is None for b in got)}"))
+        # ── 사용 가능 시각 ──
+        reason = ""
+        if mode == ASSUMED_DELAY:
+            available_at, basis = closed_at + data_delay, ASSUMED_DELAY
+        else:
+            basis = OBSERVED
+            missing = [s for s in ss if s not in ready]
+            early = [s for s in ss if s in ready and ready[s] < schedule.close_at(s)]
+            if missing:
+                available_at, reason = None, f"READY_TIME_UNKNOWN:{missing[0].isoformat()}"
+            elif early:
+                available_at, reason = None, f"READY_BEFORE_SESSION_CLOSE:{early[0].isoformat()}"
+            else:
+                available_at = max([closed_at] + [ready[s] for s in ss])
+        if reason:
+            out.append(_placeholder(monday, last, closed_at, available_at, basis, reason, gap))
+        elif available_at > as_of:
+            out.append(_placeholder(monday, last, closed_at, available_at, basis, "DATA_NOT_READY", gap))
+        elif any(b is None for b in got):
+            out.append(_placeholder(monday, last, closed_at, available_at, basis,
+                                    f"MISSING_DAILY:{sum(b is None for b in got)}", gap))
         else:
             tv = None if any(b.trade_value is None for b in got) else sum(b.trade_value for b in got)
             out.append(WeeklyBar(monday, last, closed_at, available_at, basis, got[0].open,
                                  max(b.high for b in got), min(b.low for b in got), got[-1].close,
-                                 sum(b.volume for b in got), tv, True))
+                                 sum(b.volume for b in got), tv, True, "", gap))
         monday += timedelta(days=7)
+    if out and out[-1].reason == "DATA_NOT_READY":      # 가장 최근에 끝난 주 하나만 '아직 도착 전'으로 잘라냄
+        out.pop()                                       # 그보다 앞선 주까지 준비 안 됐으면 불완전 자리로 남김
     return out
 
 
@@ -197,6 +252,11 @@ def weekly_trend(weeks: Sequence[WeeklyBar]) -> WeeklyTrend:
                            None, None, None, f"INSUFFICIENT_WEEKS:{len(weeks)}/34")
     last34 = list(weeks[-34:])
     end, avail = last34[-1].week_end_session, last34[-1].available_at
+    # A13-Q3: 주 시작일 간격은 7일 × (1 + 사이의 한 주 전체 휴장 수)여야 함 — 빠진 주가 있으면 압축된 창
+    for prev, cur in zip(last34, last34[1:]):
+        if (cur.week_start - prev.week_start).days != 7 * (1 + cur.gap_weeks_before):
+            return WeeklyTrend(UNKNOWN, end, avail, None, None, None,
+                               f"WEEK_SEQUENCE_GAP:{prev.week_start.isoformat()}→{cur.week_start.isoformat()}")
     bad = [w for w in last34 if not w.complete]
     if bad:
         return WeeklyTrend(UNKNOWN, end, avail, None, None, None, f"INCOMPLETE_WEEK:{bad[-1].week_start.isoformat()}")

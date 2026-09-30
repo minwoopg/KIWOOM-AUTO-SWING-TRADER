@@ -71,9 +71,13 @@ OK = Eligibility(COMMON, "OK")
 IDX = index_bars()
 
 
+IDX_ID = "INDEX:KOSPI:001"
+
+
 def run(bars, t, *, idx=IDX, elig=OK, cfg=None, sessions=S):
-    sv, iv = SeriesView(bars, sessions, t), SeriesView(idx, sessions, t)
-    return evaluate_s1("005930", sv, iv, classify_market(iv), elig, cfg)
+    """기본 경로: 시장 판정은 넘기지 않고(None) 같은 지수 View로 평가기 안에서 계산."""
+    sv, iv = SeriesView(bars, sessions, t), SeriesView(idx, sessions, t, source_id=IDX_ID)
+    return evaluate_s1("005930", sv, iv, None, elig, cfg)
 
 
 def res_of(r, name):
@@ -213,13 +217,13 @@ t_i = S.index(t)
 base = run(bars, t)
 changed_idx = [bar(b.date, b.close * (3.0 if b.date > t else 1.0), up=0.005, dn=0.005, tv=None) for b in IDX]
 sv = SeriesView(bars, S, t)
-iv_future = SeriesView(changed_idx, S, S[259])                      # 미래 기준일의 지수 View
+iv_future = SeriesView(changed_idx, S, S[259], source_id=IDX_ID)    # 미래 기준일의 지수 View
 r = evaluate_s1("005930", sv, iv_future, cm(iv_future), OK)
 check("8-1) [A13-R1 재현] 미래 기준일 지수 View·시장 판정 → RS·시장 UNKNOWN(AS_OF_MISMATCH), PASS/FAIL로 바뀌지 않음",
       res_of(r, "RS60_POS") == Tri.UNKNOWN and "AS_OF_MISMATCH" in r.check("RS60_POS").detail
       and r.market_pass == Tri.UNKNOWN and "AS_OF_MISMATCH" in r.check("MARKET_REGIME").detail
       and r.eligible_signal == Tri.UNKNOWN)
-iv_ok = SeriesView(changed_idx, S, t)
+iv_ok = SeriesView(changed_idx, S, t, source_id=IDX_ID)
 r = evaluate_s1("005930", sv, iv_ok, cm(iv_future), OK)
 check("8-2) 지수 View는 맞는데 다른 날짜의 시장 판정만 전달 → 시장 UNKNOWN(AS_OF_MISMATCH)",
       r.market_pass == Tri.UNKNOWN and "AS_OF_MISMATCH" in r.check("MARKET_REGIME").detail
@@ -229,7 +233,7 @@ check("8-3) 시장 판정을 안 넘기면 같은 기준일 지수로 직접 판
       r.to_dict() == base.to_dict())
 S_skip = [d for d in S if d != S[t_i - 30]]
 idx_skip = [b for b in IDX if b.date != S[t_i - 30]]
-r2 = evaluate_s1("005930", SeriesView(bars, S, t), SeriesView(idx_skip, S_skip, t), None, OK)
+r2 = evaluate_s1("005930", SeriesView(bars, S, t), SeriesView(idx_skip, S_skip, t, source_id=IDX_ID), None, OK)
 check("8-4) 지수 세션 목록에서 날짜 하나를 빼면 RS 구간 불일치 → UNKNOWN(SESSION_ALIGNMENT_MISMATCH)",
       r2.check("RS60_POS").detail == "SESSION_ALIGNMENT_MISMATCH" and res_of(r2, "RS60_POS") == Tri.UNKNOWN)
 short = bars[-159:]
@@ -250,6 +254,38 @@ for kw in ({"pullback_min": 0}, {"pullback_max": 25}, {"stop_atr_buffer": -1.0},
     except ValueError:
         bad_cfg.append(True)
 check("8-8) 잘못된 설정(0·범위 역전·음수·NaN) 거부", all(bad_cfg))
+
+# ── 9. A13-Q1: 지수 원천 정합 ─────────────────────────────────
+KQ_ID = "INDEX:KOSDAQ:101"
+bars, t = scenario()
+down_idx = [bar(S[i], 2500 * 0.998 ** i, up=0.005, dn=0.005, tv=None) for i in range(260)]
+up_idx = IDX
+iv_down = SeriesView(down_idx, S, t, source_id=IDX_ID)
+iv_up_kq = SeriesView(up_idx, S, t, source_id=KQ_ID)
+base_same = evaluate_s1("005930", SeriesView(bars, S, t), iv_down, None, OK)
+mixed_in = evaluate_s1("005930", SeriesView(bars, S, t), iv_down, classify_market(iv_up_kq), OK)
+check("9-1) [A13-Q1 재현] 같은 날짜 다른 지수(KOSDAQ 상승) 시장 판정 혼입 → 시장 UNKNOWN(INDEX_SOURCE_MISMATCH), PASS 안 됨",
+      base_same.market_pass == Tri.FAIL and mixed_in.market_pass == Tri.UNKNOWN
+      and "INDEX_SOURCE_MISMATCH" in mixed_in.check("MARKET_REGIME").detail and mixed_in.eligible_signal != Tri.PASS)
+anon = evaluate_s1("005930", SeriesView(bars, S, t), SeriesView(up_idx, S, t), classify_market(SeriesView(up_idx, S, t)), OK)
+check("9-2) 원천 식별자 없는 외부 시장 판정은 사용하지 않음(UNKNOWN)", anon.market_pass == Tri.UNKNOWN)
+same_ext = evaluate_s1("005930", SeriesView(bars, S, t), SeriesView(up_idx, S, t, source_id=IDX_ID),
+                       classify_market(SeriesView(up_idx, S, t, source_id=IDX_ID)), OK)
+check("9-3) 같은 원천·같은 날짜의 외부 판정은 기본 경로와 같은 결과", same_ext.to_dict() == run(bars, t).to_dict())
+wrong_mkt = evaluate_s1("005930", SeriesView(bars, S, t), SeriesView(up_idx, S, t, source_id=IDX_ID), None,
+                        Eligibility(COMMON, "OK", market_index_id=KQ_ID))
+check("9-4) 종목 소속 시장(KOSDAQ)과 다른 지수(KOSPI) → RS·시장 UNKNOWN(INDEX_NOT_STOCK_MARKET)",
+      res_of(wrong_mkt, "RS60_POS") == Tri.UNKNOWN and wrong_mkt.market_pass == Tri.UNKNOWN
+      and "INDEX_NOT_STOCK_MARKET" in wrong_mkt.check("RS60_POS").detail and wrong_mkt.eligible_signal == Tri.UNKNOWN)
+right_mkt = evaluate_s1("005930", SeriesView(bars, S, t), SeriesView(up_idx, S, t, source_id=IDX_ID), None,
+                        Eligibility(COMMON, "OK", market_index_id=IDX_ID))
+check("9-5) 소속 시장 지수가 맞으면 정상 PASS 유지", right_mkt.eligible_signal == Tri.PASS)
+try:
+    classify_market(SeriesView(up_idx, S, t, source_id=IDX_ID), index_id=KQ_ID)
+    relabel = True
+except ValueError:
+    relabel = False
+check("9-6) 시장 판정에 View 원천과 다른 지수 이름을 붙일 수 없음", not relabel)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

@@ -13,7 +13,11 @@ from __future__ import annotations
 
 기준일 정합 (A13-R1): 종목·지수 View와 시장 판정의 기준일이 모두 같아야 합니다. 다르면
 RS·시장 조건을 UNKNOWN(AS_OF_MISMATCH)으로 두고, 수익률 구간 날짜가 다르면
-SESSION_ALIGNMENT_MISMATCH입니다. market을 넘기지 않으면 index로 직접 판정합니다.
+SESSION_ALIGNMENT_MISMATCH입니다.
+지수 원천 정합 (A13-Q1): **기본 경로는 market=None** — RS에 쓴 같은 index View로 시장을 판정합니다.
+외부 시장 판정을 넘기면 index.source_id와 market.index_id가 둘 다 있고 같아야 하며, 아니면
+시장 조건 UNKNOWN(INDEX_SOURCE_MISMATCH). Eligibility.market_index_id(종목의 당시 소속 시장 지수)를
+주면 index.source_id와 같아야 하고, 다르면 RS·시장 조건 UNKNOWN(INDEX_NOT_STOCK_MARKET).
 
 눌림 정의 (8.3)
   p = t-20..t-1 중 고가 최대 봉(동률이면 최근), 조정 구간 = p 다음 봉 ~ t-1 (2~10개),
@@ -75,6 +79,7 @@ class Eligibility:
     security_type: str | None = None      # "COMMON" / "PREFERRED" / "ETF" ...
     risk_status: str | None = None        # "OK" / "FLAGGED" / None
     risk_detail: str = ""
+    market_index_id: str | None = None    # 종목 소속 시장 지수의 source_id (예: "INDEX:KOSPI:001")
 
 
 @dataclass
@@ -162,9 +167,14 @@ def evaluate_s1(symbol: str, stock: SeriesView, index: SeriesView, market: Marke
                 eligibility: Eligibility, cfg: S1Config | None = None) -> S1Result:
     cfg = cfg or S1Config()
     t = stock.t
+    external_market = market is not None
     if market is None:
         market = classify_market(index)
     r = S1Result(symbol, t, config_hash=cfg.config_hash(), market=market.to_dict())
+    idx_mismatch = ""
+    if eligibility.market_index_id is not None and eligibility.market_index_id != index.source_id:
+        idx_mismatch = (f"INDEX_NOT_STOCK_MARKET:stock_market={eligibility.market_index_id},"
+                        f"index={index.source_id or None}")
     pattern: list[Check] = []
 
     # ── 이력 ──
@@ -184,7 +194,7 @@ def evaluate_s1(symbol: str, stock: SeriesView, index: SeriesView, market: Marke
                              ma60.value / ma60p.value - 1))
     else:
         pattern.append(Check("MA60_RISING", Tri.UNKNOWN, None, (ma60p if ma60.ok else ma60).reason))
-    rs60 = F.rs(stock, index, 60)
+    rs60 = F.rs(stock, index, 60) if not idx_mismatch else FV.unknown(idx_mismatch)
     pattern.append(compare("RS60_POS", rs60, ">", 0.0))
 
     # ── 눌림 ──
@@ -219,7 +229,12 @@ def evaluate_s1(symbol: str, stock: SeriesView, index: SeriesView, market: Marke
     elig.append(compare("LIQUIDITY_TV20", tv20, ">=", float(cfg.min_trade_value_20)))
 
     # ── 시장 ──
-    if index.t != t or market.as_of != t:
+    if idx_mismatch:
+        mk = Check("MARKET_REGIME", Tri.UNKNOWN, market.state, idx_mismatch)
+    elif external_market and (not index.source_id or not market.index_id or market.index_id != index.source_id):
+        mk = Check("MARKET_REGIME", Tri.UNKNOWN, market.state,
+                   f"INDEX_SOURCE_MISMATCH:index={index.source_id or None},market={market.index_id or None}")
+    elif index.t != t or market.as_of != t:
         mk = Check("MARKET_REGIME", Tri.UNKNOWN, market.state,
                    f"AS_OF_MISMATCH:stock={t.isoformat()},index={index.t.isoformat()},"
                    f"market={market.as_of.isoformat() if market.as_of else None}")
@@ -259,7 +274,7 @@ def evaluate_s1(symbol: str, stock: SeriesView, index: SeriesView, market: Marke
     if bars60 and pb.get("pivot_high") is not None:
         hi60 = 1.0 if pb["pivot_high"] >= max(b.high for b in bars60) else 0.0
     r.observations = {
-        "rs20": _v(F.rs(stock, index, 20)), "rs60": _v(rs60), "ret20": _v(F.ret(stock, 20)),
+        "rs20": _v(F.rs(stock, index, 20)) if not idx_mismatch else None, "rs60": _v(rs60), "ret20": _v(F.ret(stock, 20)),
         "ret60": _v(F.ret(stock, 60)), "tv20": _v(tv20), "tv20_reason": "" if tv20.ok else tv20.reason,
         "volume_ratio": _v(F.volume_ratio(stock)), "close_location": _v(F.close_location(stock)),
         "extension20": _v(ext), "ma120_distance_atr": _v(ma120_dist), "pivot_is_60d_high": hi60,

@@ -194,10 +194,12 @@ check("8-3) 금요일 휴장 주: 목요일 마감+30분(16:00)에 완성·사�
 check("8-4) 목요일 장중(14:00)에는 그 주 제외", weekly_bars(wb, SCHED, at(14, 0))[-1].week_end_session == date(2025, 2, 28))
 check("8-5) 목요일 마감 직후(15:40, 데이터 확보 여유 전)도 제외 — 장중과 같은 결과",
       weekly_bars(wb, SCHED, at(15, 40))[-1].week_end_session == date(2025, 2, 28))
-obs = weekly_bars(wb, SCHED, at(17, 0), data_ready_at={thu: at(16, 45)})
-check("8-6) 실제 확보 시각을 주면 OBSERVED(16:45)로 기록, 그 전(16:30)이면 제외",
+READY = {d: DT.combine(d, TM(16, 0)) for d in WS}            # 관측 모드: 모든 봉의 실제 확보 시각
+READY[thu] = at(16, 45)
+obs = weekly_bars(wb, SCHED, at(17, 0), mode="OBSERVED", data_ready_at=READY)
+check("8-6) 관측 모드: 주 전체 확보 시각 중 가장 늦은 값(16:45)으로 OBSERVED, 그 전(16:30)이면 제외",
       obs[-1].available_at == at(16, 45) and obs[-1].availability_basis == "OBSERVED"
-      and weekly_bars(wb, SCHED, at(16, 30), data_ready_at={thu: at(16, 45)})[-1].week_end_session != thu)
+      and weekly_bars(wb, SCHED, at(16, 30), mode="OBSERVED", data_ready_at=READY)[-1].week_end_session != thu)
 short = ExplicitWeekSchedule([d for d in FULL if d <= date(2025, 3, 5)], [], date(2025, 3, 2))
 check("8-7) 일정이 확정되지 않은 주는 완성으로 보지 않음",
       all(w.week_start < date(2025, 3, 3) for w in weekly_bars(wb, short, at(20, 0)) if w.complete))
@@ -280,6 +282,71 @@ check("9-8) 기준일은 같아도 수익률 구간 날짜가 다르면 UNKNOWN(
 iv_same = SeriesView(bars_from(S[:120], [2500.0 + i for i in range(120)]), S, S[119])
 check("9-9) 같은 기준일·같은 날짜 구간이면 정상 계산",
       approx(F.rs(sv_same, iv_same, 60).value, (219 / 159 - 1) - (2619 / 2559 - 1)))
+
+# ── 10. A13-Q2·Q3: 주 전체 확보 시각, 중간 공백, 전체 휴장 주 ─────────
+WS2 = weekdays(date(2025, 1, 6), 260)
+SCHED2 = ExplicitWeekSchedule([d for d in weekdays(date(2025, 1, 6), 600) if d <= KNOWN], [], KNOWN)
+wb2 = bars_from(WS2, [100.0 + i for i in range(260)])
+R2 = {d: DT.combine(d, TM(16, 0)) for d in WS2}
+fri = date(2025, 9, 5)
+mon = date(2025, 9, 1)
+R2_late = dict(R2)
+R2_late[mon] = DT(2025, 9, 6, 20, 0)                        # 월요일 누락 봉을 토요일에 복구
+w_fri = weekly_bars(wb2, SCHED2, DT(2025, 9, 5, 20, 0), mode="OBSERVED", data_ready_at=R2_late)
+check("10-1) [A13-Q2 재현] 월요일 봉이 토요일에 확보됐으면 금요일 20:00 평가에는 그 주 미사용",
+      w_fri[-1].week_end_session == date(2025, 8, 29))
+w_sat = weekly_bars(wb2, SCHED2, DT(2025, 9, 6, 21, 0), mode="OBSERVED", data_ready_at=R2_late)
+check("10-2) 주 전체 확보 뒤에는 최종 확보 시각(토 20:00)으로 OBSERVED",
+      w_sat[-1].week_end_session == fri and w_sat[-1].complete and w_sat[-1].available_at == DT(2025, 9, 6, 20, 0))
+R2_miss = {k: v for k, v in R2.items() if k != date(2025, 9, 3)}
+w_miss = weekly_bars(wb2, SCHED2, DT(2025, 9, 5, 20, 0), mode="OBSERVED", data_ready_at=R2_miss)
+check("10-3) 관측 모드에서 주중 확보 시각 하나가 없으면 가정으로 메우지 않고 불완전(READY_TIME_UNKNOWN)",
+      w_miss[-1].week_end_session == fri and not w_miss[-1].complete
+      and w_miss[-1].reason.startswith("READY_TIME_UNKNOWN") and weekly_trend(w_miss).state == "UNKNOWN")
+R2_early = dict(R2)
+R2_early[date(2025, 9, 3)] = DT(2025, 9, 3, 11, 0)           # 장중에 받은 미완성 봉
+w_early = weekly_bars(wb2, SCHED2, DT(2025, 9, 5, 20, 0), mode="OBSERVED", data_ready_at=R2_early)
+check("10-4) 봉 확보 시각이 그 세션 종료 전이면(장중 봉) 불완전", w_early[-1].reason.startswith("READY_BEFORE_SESSION_CLOSE"))
+mid_end = date(2025, 5, 23)
+R2_mid = dict(R2)
+R2_mid[mid_end] = DT(2025, 9, 30, 20, 0)                     # 중간 주의 입력이 평가 시각 뒤에 확보
+as9 = DT(2025, 9, 5, 20, 0)
+w_mid = weekly_bars(wb2, SCHED2, as9, mode="OBSERVED", data_ready_at=R2_mid)
+check("10-5) [A13-Q3 재현] 중간 주가 사용 불가면 자리를 남김(DATA_NOT_READY) → 추세 UNKNOWN, 더 오래된 주로 채우지 않음",
+      any(w.week_end_session == mid_end and w.reason == "DATA_NOT_READY" for w in w_mid)
+      and weekly_trend(w_mid).state == "UNKNOWN")
+check("10-6) 그 주 입력이 준비된 뒤에는 정상 추세 재개",
+      weekly_trend(weekly_bars(wb2, SCHED2, as9, mode="OBSERVED", data_ready_at=R2)).state == UP_PROXY)
+full2 = weekly_bars(wb2, SCHED2, as9)
+cut = [w for w in full2 if w.week_end_session != mid_end]
+check("10-7) 누군가 목록에서 중간 주를 빼면 WEEK_SEQUENCE_GAP으로 UNKNOWN", weekly_trend(cut).reason.startswith("WEEK_SEQUENCE_GAP"))
+hol_week = [date(2025, 5, 19) + timedelta(days=i) for i in range(5)]     # 한 주 전체 예정 휴장
+S3 = [d for d in weekdays(date(2025, 1, 6), 600) if d <= KNOWN and d not in hol_week]
+SCHED3 = ExplicitWeekSchedule(S3, hol_week, KNOWN)
+wb3 = bars_from([d for d in S3 if d <= as9.date()], [100.0 + i for i in range(len([d for d in S3 if d <= as9.date()]))])
+w3 = weekly_bars(wb3, SCHED3, as9)
+nxt = [w for w in w3 if w.week_start == date(2025, 5, 26)][0]
+check("10-8) 한 주 전체 휴장은 공백이 아님 — 다음 주에 gap_weeks_before=1, 추세 정상",
+      nxt.gap_weeks_before == 1 and weekly_trend(w3).state == UP_PROXY)
+wb3_gap = [b for b in wb3 if b.date.isocalendar()[1] != date(2025, 6, 2).isocalendar()[1]]
+check("10-9) 반면 거래 주의 데이터 공백은 불완전(MISSING_DAILY) → 추세 UNKNOWN",
+      weekly_trend(weekly_bars(wb3_gap, SCHED3, as9)).state == "UNKNOWN")
+errs = []
+for kw in ({"data_delay": timedelta(minutes=-1)}, {"mode": "WHATEVER"}, {"data_ready_at": R2}):
+    try:
+        weekly_bars(wb2, SCHED2, as9, **kw)
+        errs.append(False)
+    except ValueError:
+        errs.append(True)
+check("10-10) 음수 지연·알 수 없는 모드·가정 모드에 확보 시각 혼용 거부", all(errs))
+R2_two = dict(R2)
+R2_two[date(2025, 8, 29)] = DT(2025, 9, 8, 20, 0)          # 지난주 금요일 봉도 아직 미확보
+w_two = weekly_bars(wb2, SCHED2, as9, mode="OBSERVED", data_ready_at={**R2_two, mon: DT(2025, 9, 6, 20, 0)})
+check("10-12) 최근 주 하나만 '도착 전'으로 잘라냄 — 그 앞 주까지 준비 안 됐으면 자리로 남아 추세 UNKNOWN",
+      w_two[-1].week_end_session == date(2025, 8, 29) and w_two[-1].reason == "DATA_NOT_READY"
+      and weekly_trend(w_two).state == "UNKNOWN")
+check("10-11) 정상 주봉(가정 모드) 결과 유지: 마지막 = 평가 주 금요일, 추세 UP_PROXY",
+      full2[-1].week_end_session == fri and weekly_trend(full2).state == UP_PROXY)
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
