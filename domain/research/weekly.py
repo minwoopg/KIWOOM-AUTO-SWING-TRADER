@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-"""완성 주봉과 주간 추세 근사 (보충안 5절, weekly_version = w3).
+"""완성 주봉과 주간 추세 근사 (보충안 5절, weekly_version = w4).
+
+Q-R2 (w3 → w4): 가장 최근에 끝난 주의 입력이 다음 거래일이 시작된 뒤에도 준비되지 않았으면 잘라내지 않고
+DATA_NOT_READY:OVERDUE 자리로 남깁니다(이전 주로 정상 추세를 내지 않음). 정상 대기(다음 거래일 전)만 잘라냄.
 
 A13-Q2·Q3 (w2 → w3): 관측 모드는 주 전체 봉의 확보 시각, 끝난 주의 준비 안 된 입력은 불완전 자리로.
 
@@ -24,7 +27,8 @@ A13-R2 수정 (w1 → w2): 일봉용으로 기준일 뒤를 잘라낸 세션 목
         앞으로 쌓는 기록은 수집기가 각 봉의 실제 확보 시각을 넘겨야 합니다.
       - 두 모드는 섞지 않습니다(가정 모드에 data_ready_at을 넘기면 ValueError). data_delay 음수 거부.
   * 아직 끝나지 않은 주는 결과에 넣지 않습니다. 끝났지만 available_at > as_of인 과거 주는
-    DATA_NOT_READY 불완전 자리로 남깁니다(가장 최근에 끝난 주 하나만 "아직 도착 전"으로 잘라냄).
+    DATA_NOT_READY 불완전 자리로 남깁니다. 가장 최근에 끝난 주 하나만, 다음 거래일이 시작되기 전이면
+    "아직 도착 전"으로 잘라냅니다 — 그 뒤에도 미확보면 OVERDUE 자리로 남아 추세 UNKNOWN.
 - 봉이 빠진 주·일정을 모르는 지난 주는 complete=False로 남깁니다(건너뛰어 압축하지 않음).
 - 한 주 전체가 예정 휴장이면 항목을 만들지 않고 다음 항목의 gap_weeks_before로 기록합니다.
   weekly_trend는 34주 창 안의 주 시작 간격이 7×(1+gap_weeks_before)일인지 확인합니다.
@@ -42,7 +46,7 @@ from typing import Protocol, Sequence
 
 from domain.research.series import ResearchBar, ResearchBarError, validate_sessions
 
-WEEKLY_VERSION = "w3"
+WEEKLY_VERSION = "w4"
 UP_PROXY, DOWN_PROXY, UNCLASSIFIED, UNKNOWN = "UP_PROXY", "DOWN_PROXY", "UNCLASSIFIED", "UNKNOWN"
 DEFAULT_DATA_DELAY = timedelta(minutes=30)
 ASSUMED_DELAY, OBSERVED = "ASSUMED_DELAY", "OBSERVED"
@@ -151,7 +155,8 @@ def weekly_bars(bars: Sequence[ResearchBar], schedule: WeekSchedule, as_of: date
     포함 규칙 (A13-Q3)
       - 마지막 세션이 아직 끝나지 않은 주(진행 중)는 넣지 않습니다.
       - 끝났지만 입력이 아직 준비 안 된 주(DATA_NOT_READY)는 **불완전 자리로 남깁니다**. 단, 가장 최근에
-        끝난 주 하나만은 "아직 도착 전"으로 보고 잘라냅니다(직전 주까지가 그 시점의 최신 정보).
+        끝난 주 하나만은 다음 거래일 0시 전이면 "아직 도착 전"으로 보고 잘라냅니다(직전 주까지가 그 시점의
+        최신 정보). 다음 거래일이 시작됐으면 장애 지연(OVERDUE)으로 자리를 남깁니다(Q-R2).
         그보다 앞선 주·중간에 낀 주는 남아서 추세를 UNKNOWN으로 만들고 창을 압축하지 못하게 합니다.
       - 한 주 전체가 예정 휴장인 주는 항목을 만들지 않고, 다음 항목의 gap_weeks_before로 기록합니다.
     """
@@ -227,9 +232,31 @@ def weekly_bars(bars: Sequence[ResearchBar], schedule: WeekSchedule, as_of: date
                                  sum(b.volume for b in got), tv, True, "", gap,
                                  sum(1 for b in got if b.no_trades)))
         monday += timedelta(days=7)
-    if out and out[-1].reason == "DATA_NOT_READY":      # 가장 최근에 끝난 주 하나만 '아직 도착 전'으로 잘라냄
-        out.pop()                                       # 그보다 앞선 주까지 준비 안 됐으면 불완전 자리로 남김
+    if out and out[-1].reason == "DATA_NOT_READY":
+        # 가장 최근에 끝난 주 하나만, **정상 대기 기간**(다음 거래일이 시작되기 전)이면 '아직 도착 전'으로 잘라냄.
+        # 다음 거래일이 시작됐는데도 미확보면 장애 지연 → 자리를 남겨 추세 UNKNOWN (Q-R2).
+        # 다음 거래일을 모르면(일정 불명) 대기 기간을 판단할 수 없으므로 자리를 남김(fail-closed).
+        nxt = _next_session(schedule, out[-1].week_end_session)
+        if nxt is not None and as_of < datetime.combine(nxt, time(0, 0)):
+            out.pop()
+        else:
+            out[-1] = _placeholder(out[-1].week_start, out[-1].week_end_session, out[-1].session_closed_at,
+                                   out[-1].available_at, out[-1].availability_basis,
+                                   f"DATA_NOT_READY:OVERDUE(next_session={nxt})", out[-1].gap_weeks_before)
     return out
+
+
+def _next_session(schedule: WeekSchedule, last: date, max_weeks: int = 4) -> date | None:
+    """last 다음 거래일 (일정 불명이면 None)."""
+    monday = _monday(last) + timedelta(days=7)
+    for _ in range(max_weeks):
+        ss = schedule.sessions_in_week(monday)
+        if ss is None:
+            return None
+        if ss:
+            return ss[0]
+        monday += timedelta(days=7)
+    return None
 
 
 @dataclass(frozen=True)

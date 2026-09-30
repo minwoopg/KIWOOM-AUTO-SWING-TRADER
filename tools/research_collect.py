@@ -69,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--codes", help="쉼표로 구분한 종목코드만 (새 작업을 만들 때)")
     b.add_argument("--no-index", action="store_true")
     b.add_argument("--new", action="store_true", help="열린 작업이 없을 때만 새 작업 생성")
+    b.add_argument("--recheck-shortfall", action="store_true",
+                   help="이력이 짧게 끝난 시계열(HISTORY_END·PAGE_CAP)만 새 작업으로 다시 받음(검증 후 교체)")
     up = sub.add_parser("update")
     up.add_argument("--limit", type=int)
     up.add_argument("--skip-universe", action="store_true")
@@ -135,7 +137,15 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                 print(f"열린 작업 이어서: {job_id} (base_dt={open_jobs[0]['base_dt']} 고정) {store.job_counts(job_id)}")
             else:
                 codes = [c.strip() for c in args.codes.split(",")] if args.codes else None
-                job_id = col.create_backfill_job(now=now(), codes=codes, include_index=not args.no_index)
+                sids = None
+                if args.recheck_shortfall:
+                    sids = [r[0] for r in store.conn.execute(
+                        "SELECT series_id FROM series WHERE coverage IN ('HISTORY_END','PAGE_CAP') ORDER BY series_id")]
+                    if not sids:
+                        print("다시 받을 HISTORY_END·PAGE_CAP 시계열이 없음")
+                        return 0
+                job_id = col.create_backfill_job(now=now(), codes=codes, include_index=not args.no_index,
+                                                 series_ids=sids)
                 job = store.get_job(job_id)
                 print(f"새 작업: {job_id} base_dt={job['base_dt']} required_from={job['required_from']} "
                       f"{store.job_counts(job_id)}")
@@ -157,7 +167,7 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                     print(f"  {p['n']}/{p['of']} {p['series_id']} {p['action']} {p.get('reason', '')}")
             res = col.run_update(now=now, limit=args.limit, progress=prog)
             print_json(res)
-            return 0 if res["tally"].get("ERROR", 0) == 0 else 1
+            return 0 if res["failed"] == 0 else 1
 
         if args.cmd == "status":
             snap = store.latest_snapshot()
@@ -172,7 +182,12 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                    "bars": store.conn.execute("SELECT COUNT(*) FROM bar").fetchone()[0],
                    "no_trades_bars": store.conn.execute("SELECT COUNT(*) FROM bar WHERE quality='NO_TRADES'").fetchone()[0],
                    "invalid_bars": store.conn.execute("SELECT COUNT(*) FROM bar WHERE quality LIKE 'INVALID%'").fetchone()[0],
-                   "rebases": store.conn.execute("SELECT COUNT(*) FROM series_event WHERE event='REBASE'").fetchone()[0]}
+                   "rebases": store.conn.execute("SELECT COUNT(*) FROM series_event WHERE event='REBASE'").fetchone()[0],
+                   "integrity": {k: v for k, v in store.conn.execute(
+                       "SELECT integrity, COUNT(*) FROM series GROUP BY integrity")},
+                   "verify_failed_events": store.conn.execute(
+                       "SELECT COUNT(*) FROM series_event WHERE event='VERIFY_FAILED'").fetchone()[0],
+                   "schema": store.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]}
             print_json(out)
             return 0
 
@@ -181,7 +196,7 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
             if meta is None:
                 print("[중단] KOSPI 지수 시계열이 없음 — 먼저 backfill")
                 return 2
-            k = [sb.raw.date for sb in store.load_bars("INDEX:KOSPI:001")]
+            k = [sb.raw.date for sb in store.load_bars("INDEX:KOSPI:001")]  # 현재 revision 전체
             q = [sb.raw.date for sb in store.load_bars("INDEX:KOSDAQ:101")] if store.get_series("INDEX:KOSDAQ:101") else None
             res = holiday_candidates(k, date(args.from_year, 1, 1), date(args.to_year, 12, 31), q)
             out = Path(args.out)

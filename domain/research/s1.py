@@ -16,7 +16,8 @@ RS·시장 조건을 UNKNOWN(AS_OF_MISMATCH)으로 두고, 수익률 구간 날�
 SESSION_ALIGNMENT_MISMATCH입니다.
 지수 원천 정합 (A13-Q1): **기본 경로는 market=None** — RS에 쓴 같은 index View로 시장을 판정합니다.
 외부 시장 판정을 넘기면 index.source_id와 market.index_id가 둘 다 있고 같아야 하며, 아니면
-시장 조건 UNKNOWN(INDEX_SOURCE_MISMATCH). Eligibility.market_index_id(종목의 당시 소속 시장 지수)를
+시장 조건 UNKNOWN(INDEX_SOURCE_MISMATCH). 식별자·기준일이 같아도 **같은 index View로 다시 계산한 판정과
+모든 값이 같아야** 씁니다(Q-R1, 다르면 MARKET_INPUT_MISMATCH) — 캐시는 검증된 경우에만 통과. Eligibility.market_index_id(종목의 당시 소속 시장 지수)를
 주면 index.source_id와 같아야 하고, 다르면 RS·시장 조건 UNKNOWN(INDEX_NOT_STOCK_MARKET).
 
 눌림 정의 (8.3)
@@ -238,6 +239,11 @@ def evaluate_s1(symbol: str, stock: SeriesView, index: SeriesView, market: Marke
         mk = Check("MARKET_REGIME", Tri.UNKNOWN, market.state,
                    f"AS_OF_MISMATCH:stock={t.isoformat()},index={index.t.isoformat()},"
                    f"market={market.as_of.isoformat() if market.as_of else None}")
+    elif external_market and market != (recomputed := classify_market(index)):
+        # Q-R1: 같은 지수·같은 날짜라도 다른 입력(다른 revision·다른 봉)으로 만든 판정은 쓰지 않음
+        mk = Check("MARKET_REGIME", Tri.UNKNOWN, market.state,
+                   f"MARKET_INPUT_MISMATCH:given={market.state}/close={market.close},"
+                   f"recomputed={recomputed.state}/close={recomputed.close}")
     elif market.state == MKT_UNKNOWN:
         mk = Check("MARKET_REGIME", Tri.UNKNOWN, market.state, market.reason)
     else:

@@ -13,6 +13,9 @@ from __future__ import annotations
 호출 간격: 모든 요청을 이 객체 하나로 통과시켜 `min_interval_sec`(기본 1초 — 0.5초 간격에서 429 실측)를 지킵니다.
 429·전송 실패는 대기 후 재시도(조회 전용이라 안전), HTTP 401은 한 번 재인증 후 재시도.
 그 밖의 HTTP 오류·return_code≠0·목록 없음은 재시도하지 않고 `ResearchApiError`.
+
+응답 계약 (A2-R3): return_code가 **있고 0**이어야 성공. cont-yn 헤더는 Y 또는 N이어야 하고,
+Y이면 next-key가 있어야 합니다. 어기면 `ResearchApiError`(이력 끝으로 해석하지 않음).
 """
 
 import time
@@ -165,10 +168,18 @@ class ReadOnlyResearchClient:
         received_at = self.now()
         if status != 200 or not isinstance(body, dict):
             raise ResearchApiError(f"{api_id} {payload}: HTTP {status}")
-        if body.get("return_code") not in (0, None):
-            raise ResearchApiError(f"{api_id} {payload}: return_code={body.get('return_code')} "
-                                   f"{body.get('return_msg', '')}")
+        rc = body.get("return_code")
+        if rc is None or isinstance(rc, bool) or str(rc).strip() != "0":
+            # A2-R3: 성공 코드(0)가 있어야 성공. 없거나 다르면 오류 (누락을 성공으로 보지 않음)
+            raise ResearchApiError(f"{api_id} {payload}: return_code={rc!r} {body.get('return_msg', '')}")
         rows = body.get(list_key)
         if not isinstance(rows, list):
             raise ResearchApiError(f"{api_id} {payload}: 응답에 {list_key} 목록 없음")
-        return Page(rows, h.get("cont-yn", "").upper(), h.get("next-key", ""), received_at)
+        cont = h.get("cont-yn", "").strip().upper()
+        nkey = h.get("next-key", "").strip()
+        if cont not in ("Y", "N"):
+            raise ResearchApiError(f"{api_id} {payload}: cont-yn 헤더가 Y/N이 아님 ({cont!r})")
+        if cont == "Y" and not nkey:
+            # A2-R3: 이어진다고 하면서 다음 키가 없음 → '이력 끝'으로 해석하지 않고 오류
+            raise ResearchApiError(f"{api_id} {payload}: cont-yn=Y인데 next-key 없음")
+        return Page(rows, cont, nkey if cont == "Y" else "", received_at)

@@ -302,6 +302,18 @@ check("10-2) 기준일 자체가 거래 없는 봉 → 신호 UNKNOWN", r10b.eli
       and all(c.result != Tri.PASS for c in r10b.checks if c.name == "HISTORY"))
 check("10-3) 정상 기준선(거래 없는 봉 없음) 결과 유지", run(*scenario()).eligible_signal == Tri.PASS)
 
+# ── 11. Q-R1: 같은 지수·같은 날짜의 다른 입력 시장 캐시 ─────────────
+up_same_id = classify_market(SeriesView(up_idx, S, t, source_id=IDX_ID))      # 다른 입력(상승 봉), 같은 이름·날짜
+cached_bad = evaluate_s1("005930", SeriesView(bars, S, t), iv_down, up_same_id, OK)
+check("11-1) [Q-R1 재현] 같은 INDEX:KOSPI:001·같은 날짜라도 다른 입력의 상승 판정을 하락 View에 넘기면 "
+      "UNKNOWN(MARKET_INPUT_MISMATCH) — FAIL이 PASS로 바뀌지 않음",
+      up_same_id.index_id == IDX_ID and up_same_id.as_of == t and base_same.eligible_signal == Tri.FAIL
+      and cached_bad.market_pass == Tri.UNKNOWN and cached_bad.eligible_signal != Tri.PASS
+      and "MARKET_INPUT_MISMATCH" in cached_bad.check("MARKET_REGIME").detail)
+cached_ok = evaluate_s1("005930", SeriesView(bars, S, t), iv_down, classify_market(iv_down), OK)
+check("11-2) 같은 View에서 만든 캐시는 통과 — 기본 경로(market=None)와 결과 동일",
+      cached_ok.to_dict() == base_same.to_dict())
+
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:

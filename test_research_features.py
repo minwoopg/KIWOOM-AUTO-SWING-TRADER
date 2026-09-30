@@ -376,6 +376,27 @@ wk_halt = [w for w in w11 if w.week_start <= S11[300] <= w.week_start + timedelt
 check("11-8) 주봉은 거래 없는 봉을 합산하고 no_trade_days로 표시(완성 유지)",
       wk_halt.complete and wk_halt.no_trade_days >= 1)
 
+# ── 12. Q-R2: 가장 최근에 끝난 주의 장애 지연 ─────────────────────
+R12 = dict(R2)
+R12[fri] = DT(2025, 9, 15, 20, 0)                            # 9/5 종료 주가 다음 주 월요일 밤에야 확보
+w_tue = weekly_bars(wb2, SCHED2, DT(2025, 9, 9, 20, 0), mode="OBSERVED", data_ready_at=R12)
+check("12-1) [Q-R2 재현] 화요일(9/9) 평가에 9/5 종료 주가 미확보 → 그 주를 지우지 않고 OVERDUE 자리 → 추세 UNKNOWN",
+      w_tue[-1].week_end_session == fri and w_tue[-1].reason.startswith("DATA_NOT_READY:OVERDUE")
+      and weekly_trend(w_tue).state == "UNKNOWN")
+w_sat = weekly_bars(wb2, SCHED2, DT(2025, 9, 6, 12, 0), mode="OBSERVED", data_ready_at=R12)
+check("12-2) 다음 거래일 전(토요일)은 정상 대기 — 그 주만 잘라내고 직전 주까지로 정상 추세",
+      w_sat[-1].week_end_session == date(2025, 8, 29) and weekly_trend(w_sat).state == UP_PROXY)
+w_mon0 = weekly_bars(wb2, SCHED2, DT(2025, 9, 8, 0, 30), mode="OBSERVED", data_ready_at=R12)
+check("12-3) 다음 거래일(월) 0시가 지나면 장애 지연으로 봄", weekly_trend(w_mon0).state == "UNKNOWN")
+w_ok = weekly_bars(wb2, SCHED2, DT(2025, 9, 15, 21, 0), mode="OBSERVED", data_ready_at=R12)
+check("12-4) 확보된 뒤에는 정상 회복(9/5 주 포함 UP_PROXY)",
+      [w for w in w_ok if w.week_end_session == fri][0].complete and weekly_trend(w_ok).state == UP_PROXY)
+END = date(2025, 9, 7)
+SCHED_END = ExplicitWeekSchedule([d for d in weekdays(date(2025, 1, 6), 600) if d <= END], [], END)
+w_unk = weekly_bars(wb2, SCHED_END, DT(2025, 9, 6, 12, 0), mode="OBSERVED", data_ready_at=R12)
+check("12-5) 다음 거래일을 모르면(일정 불명) 정상 대기인지 판단 못 함 → 자리 유지(UNKNOWN)",
+      w_unk[-1].reason.startswith("DATA_NOT_READY:OVERDUE") and weekly_trend(w_unk).state == "UNKNOWN")
+
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
 if failed:

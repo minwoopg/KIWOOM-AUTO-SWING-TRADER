@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import sqlite3
 import os
 import shutil
 import sys
@@ -18,15 +19,18 @@ from pathlib import Path
 sys.path.insert(0, ".")
 
 from domain.research.holiday_candidates import holiday_candidates, to_yaml_snippet
+from domain.research.s1 import COMMON as S1_COMMON, Eligibility, evaluate_s1
 from domain.research.series import SeriesView
 from domain.research.universe import (
     COMMON, ETF, ETN, FOREIGN, PREFERRED, REIT, SPAC, UniversePolicy, classify_row, classify_rows, summarize,
 )
-from domain.research.weekly import CalendarWeekSchedule, weekly_bars
-from infra.research.collector import ResearchCollector, completion, load_probe_list, stock_series_id
+from domain.research.weekly import CalendarWeekSchedule, weekly_bars, weekly_trend
+from infra.research.collector import CollectError, ResearchCollector, completion, load_probe_list, stock_series_id
 from infra.research.kiwoom_readonly import RESEARCH_API, ReadOnlyResearchClient, ResearchApiError, ResearchConfigError
 from infra.research.kiwoom_rows import INDEX_DAILY, NO_TRADES, STOCK_DAILY, RowError, parse_row, to_research_bar
-from infra.research.store import BACKFILL, DONE, ERROR, FORWARD, PENDING, SHORTFALL, ResearchStore
+from infra.research.store import (
+    BACKFILL, DONE, ERROR, FORWARD, PENDING, SHORTFALL, FetchedBar, IntegrityError, ResearchStore,
+)
 from utils.trading_calendar import TradingCalendar
 
 passed = 0
@@ -97,6 +101,8 @@ class FakeKiwoom:
         self.fail: dict[str, list[str]] = {}
         self.tokens = 0
         self.token_bodies: list = []
+        self.tick = timedelta(0)
+        self.force_off: dict[str, int] = {}
 
     def add(self, code, start, *, index=False, base=10_000, no_trades=(), removed=(), split=None, end=None):
         self.series[code] = {"start": start, "index": index, "base": base, "no_trades": set(no_trades),
@@ -139,28 +145,56 @@ class FakeKiwoom:
         self.calls.append({"url": url, "api": api, "payload": dict(json), "cont": headers["cont-yn"],
                            "key": headers["next-key"], "auth": headers["authorization"], "code": code})
         acts = self.fail.get(code)
-        if acts:
-            act = acts.pop(0)
-            if act == "429":
-                return Resp(429, {"return_code": 5, "return_msg": "too many"})
-            if act == "401":
-                return Resp(401, {"return_code": 3, "return_msg": "token"})
-            if act == "RC":
-                return Resp(200, {"return_code": 1, "return_msg": "업무 오류"})
-            if act == "INTERRUPT":
-                raise KeyboardInterrupt
-            if act == "TRANSPORT":
-                import requests
-                raise requests.ConnectionError("boom")
+        act = acts.pop(0) if acts else None
+        if act == "429":
+            return Resp(429, {"return_code": 5, "return_msg": "too many"})
+        if act == "401":
+            return Resp(401, {"return_code": 3, "return_msg": "token"})
+        if act == "RC":
+            return Resp(200, {"return_code": 1, "return_msg": "업무 오류"})
+        if act == "INTERRUPT":
+            raise KeyboardInterrupt
+        if act == "TRANSPORT":
+            import requests
+            raise requests.ConnectionError("boom")
+        self.clock.t += self.tick                          # 페이지마다 수신 시각이 달라지게 (A2-R1 시험용)
         if api == "ka10099":
-            return Resp(200, {"list": self.list_rows[json["mrkt_tp"]], "return_code": 0}, {"cont-yn": "N", "next-key": ""})
-        rows = self._rows(code, date(int(json["base_dt"][:4]), int(json["base_dt"][4:6]), int(json["base_dt"][6:])))
-        off = int(headers["next-key"].split(":")[1]) if headers["cont-yn"] == "Y" else 0
+            body = {"list": self.list_rows[json["mrkt_tp"]], "return_code": 0}
+            hdr = {"cont-yn": "N", "next-key": ""}
+            if act == "Y_NO_KEY":
+                hdr = {"cont-yn": "Y", "next-key": ""}
+            return Resp(200, body, hdr)
+        base_dt = date(int(json["base_dt"][:4]), int(json["base_dt"][4:6]), int(json["base_dt"][6:]))
+        rows = self._rows(code, base_dt)
+        if headers["cont-yn"] == "Y" and code in self.force_off:
+            off = self.force_off.pop(code)                   # 같은 키로 와도 다음 페이지를 줌(키 반복만 시험)
+        else:
+            off = int(headers["next-key"].split(":")[1]) if headers["cont-yn"] == "Y" else 0
         page = rows[off:off + self.PAGE]
         more = off + self.PAGE < len(rows)
+        nkey = f"{code}:{off + self.PAGE}" if more else ""
         key = "stk_dt_pole_chart_qry" if api == "ka10081" else "inds_dt_pole_qry"
-        return Resp(200, {key: page, "return_code": 0},
-                    {"cont-yn": "Y" if more else "N", "next-key": f"{code}:{off + self.PAGE}" if more else ""})
+        if act == "EMPTY":                                   # 빈 응답
+            page, more, nkey = [], False, ""
+        elif act == "ONE_ROW":                               # 한 행만 오고 끝
+            page, more, nkey = page[:1], False, ""
+        elif act == "SAME_KEY" and headers["cont-yn"] == "Y":  # 다음 키 반복 (행은 정상 진행)
+            nkey = headers["next-key"]
+            self.force_off[code] = off + self.PAGE
+        elif act == "NO_PROGRESS":                           # 같은 페이지를 다시 줌
+            page, more, nkey = rows[:self.PAGE], True, f"{code}:{off + self.PAGE}"
+        elif act == "FUTURE_ROW":                            # base_dt 뒤 날짜
+            fut = dict(page[0], dt=(base_dt + timedelta(days=1)).strftime("%Y%m%d"))
+            page = [fut] + page
+        body = {key: page, "return_code": 0}
+        hdr = {"cont-yn": "Y" if more else "N", "next-key": nkey}
+        if act == "Y_NO_KEY":
+            hdr = {"cont-yn": "Y", "next-key": ""}
+        elif act == "NO_RC":
+            body.pop("return_code")
+        elif act == "BAD_CONT":
+            hdr = {"cont-yn": "", "next-key": ""}
+        return Resp(200, body, hdr)
 
 
 def lrow(code, name, mc="0", *, audit="정상", state="증거금40%|담보대출|신용가능", ow="0", cls="", reg="20000101"):
@@ -172,7 +206,16 @@ def lrow(code, name, mc="0", *, audit="정상", state="증거금40%|담보대출
 sleeps: list[float] = []
 
 
+def fill_lists(fake: FakeKiwoom) -> None:
+    """시장별 목록이 비면 원천 이상으로 보므로(빈 페이지 오류) 수집 대상이 아닌 행을 하나씩 채움."""
+    if not fake.list_rows["0"]:
+        fake.list_rows["0"] = [lrow("069500", "KODEX 200", "8")]
+    if not fake.list_rows["10"]:
+        fake.list_rows["10"] = [lrow("900990", "외국더미", "10", cls="외국기업")]
+
+
 def make(clock: Clock, fake: FakeKiwoom, db: Path, **kw):
+    fill_lists(fake)
     client = ReadOnlyResearchClient(fake, "https://mockapi.kiwoom.com", "APPKEY-XYZ", "SECRET-XYZ",
                                     now=clock, monotonic=lambda: 0.0, sleep=sleeps.append)
     store = ResearchStore(db)
@@ -242,7 +285,7 @@ sm = summarize(list(rec.values()))
 check("2-8) 요약: 수집 대상 = 보통주 전체, 현재 자격 = 위험 없는 보통주",
       sm["collect"] == 8 and sm["collect_risk_flagged"] == 6 and sm["eligible_now"] == 2)
 check("2-9) 분류 정책 버전·해시 — 정책을 바꾸면 해시가 바뀜",
-      UniversePolicy().policy_version.startswith("u1:")
+      UniversePolicy().policy_version.startswith("u2:")
       and UniversePolicy().policy_hash() != UniversePolicy(foreign_class_names=()).policy_hash())
 try:
     classify_rows([lrow("005930", "a"), lrow("005930", "b")])
@@ -318,7 +361,7 @@ cl, st, col = make(ck, fk, db)
 snap = col.snapshot_universe()
 check("4-1) [보완6] 스냅숏에 snapshot_date·observed_at(수신 시각)·장 단계·정책 버전 저장",
       st.latest_snapshot()["observed_at"] == "2026-09-30T19:00:00" and snap["market_phase"] == "POST_CLOSE"
-      and st.latest_snapshot()["policy_version"].startswith("u1:") and snap["collect"] == 5)
+      and st.latest_snapshot()["policy_version"].startswith("u2:") and snap["collect"] == 5)
 job = col.create_backfill_job(now=ck())
 items = st.job_items(job)
 check("4-2) [보완2] 백필 대상 = 지수 2 + 보통주 전체(현재 투자주의 포함), 우선주·ETF·외국기업 제외",
@@ -340,14 +383,18 @@ check("4-5) [보완1] 거래 없는 봉 3개가 NO_TRADES로 저장·집계, 원
       all(b5930[d].raw.quality == NO_TRADES and b5930[d].raw.volume == 0
           for d in (date(2018, 4, 30), date(2018, 5, 2), date(2018, 5, 3)))
       and st.get_series("STOCK:005930").no_trades_count == 3)
-check("4-6) 백필 봉은 run_type=BACKFILL, ready_at 없음", all(sb.run_type == BACKFILL and sb.ready_at is None
-                                                           for sb in b5930.values()))
-rbars, ready, meta = st.research_series("STOCK:005930")
+act5930 = st.revisions("STOCK:005930")[0]["activated_at"]
+check("4-6) [A2-R1] 백필 봉도 실제 수신 시각(received_at) 기록, 사용 가능 시각 = revision 활성 시각, run_type=BACKFILL",
+      all(sb.run_type == BACKFILL and sb.received_at == datetime(2026, 9, 30, 19, 0)
+          and sb.available_at.isoformat() == act5930 and sb.first_ready_at == sb.received_at for sb in b5930.values()))
+rs5930 = st.research_series("STOCK:005930")
+rbars = rs5930.bars
 v = SeriesView(rbars, [b.date for b in rbars], date(2018, 5, 10), source_id="STOCK:005930")
 check("4-7) 연구 봉: 거래대금 원(원천×1e6), 거래 없는 봉이 든 창은 UNKNOWN(NO_TRADES)",
-      rbars[-1].trade_value == b5930[rbars[-1].date].raw.trade_value_raw * 1_000_000 and not ready
+      rbars[-1].trade_value == b5930[rbars[-1].date].raw.trade_value_raw * 1_000_000
+      and set(rs5930.available_at) == {b.date for b in rbars}
       and v.window(20)[1] == "NO_TRADES:2018-04-30")
-kospi, _, _ = st.research_series("INDEX:KOSPI:001")
+kospi = st.research_series("INDEX:KOSPI:001").bars
 check("4-8) 지수 시계열 ÷100 적용(소수 둘째 자리)", abs(kospi[-1].close * 100 - round(kospi[-1].close * 100)) < 1e-6
       and kospi[-1].close != int(kospi[-1].close))
 res2 = col.run_backfill(job, now=ck)
@@ -480,15 +527,30 @@ check("5-1) [보완6] 18:10 전 갱신: 당일 봉은 저장 안 함(UNCHANGED, 
 ck.t = datetime(2026, 10, 1, 19, 5)
 r = col.update_series("STOCK:000660", "STOCK", "000660", now=ck)
 last = st.load_bars("STOCK:000660")[-1]
-check("5-2) 18:10 뒤 갱신: 새 봉 FORWARD, ready_at = 그 응답 수신 시각, 앞 봉은 BACKFILL 그대로",
+check("5-2) 18:10 뒤 갱신: 새 봉 FORWARD, 수신·사용 가능·최초 확보 시각 = 그 응답 수신 시각, 앞 봉은 BACKFILL 그대로",
       r["action"] == "APPEND" and last.raw.date == date(2026, 10, 1) and last.run_type == FORWARD
-      and last.ready_at == datetime(2026, 10, 1, 19, 5) and st.load_bars("STOCK:000660")[-2].run_type == BACKFILL)
+      and last.received_at == last.available_at == last.first_ready_at == datetime(2026, 10, 1, 19, 5)
+      and st.load_bars("STOCK:000660")[-2].run_type == BACKFILL)
 check("5-3) 장중 값(거래량 절반)은 한 번도 저장되지 않음 — 최종 값만",
       last.raw.volume == int(fk._rows("000660", date(2026, 10, 1))[0]["trde_qty"]))
 check("5-4) 겹친 구간이 같으면 확인 기준일(verified_base_dt) 갱신, 조정 기준 revision 유지",
       st.get_series("STOCK:000660").verified_base_dt == "20261001" and st.get_series("STOCK:000660").revision == 1)
 r = col.update_series("STOCK:005930", "STOCK", "005930", now=ck)
+col.update_series("INDEX:KOSPI:001", "INDEX", "001", now=ck)
 fwd_1001 = st.load_bars("STOCK:005930")[-1]
+AS_1001 = datetime(2026, 10, 1, 20, 0)
+seen_1001 = st.research_series("STOCK:005930", as_of=AS_1001)       # 10/1 밤에 본 그대로 (재현 기준)
+idx_1001 = st.research_series("INDEX:KOSPI:001", as_of=AS_1001)
+
+
+def s1_at(rs_stock, rs_index, t: date) -> dict:
+    sess = [b.date for b in rs_index.bars if b.date <= t]
+    sv = SeriesView(rs_stock.bars, sess, t, source_id="STOCK:005930")
+    iv = SeriesView(rs_index.bars, sess, t, source_id="INDEX:KOSPI:001")
+    return evaluate_s1("005930", sv, iv, None, Eligibility(S1_COMMON, "OK", market_index_id="INDEX:KOSPI:001")).to_dict()
+
+
+s1_orig_1001 = s1_at(seen_1001, idx_1001, date(2026, 10, 1))        # 10/1 밤의 원래 평가
 ck.t = datetime(2026, 10, 2, 19, 0)                               # 분할 반영일: 과거 가격이 ½로 다시 계산됨
 r = col.update_series("STOCK:005930", "STOCK", "005930", now=ck)
 m = st.get_series("STOCK:005930")
@@ -504,9 +566,13 @@ check("5-7) 이전 값은 bar_history(revision 1)에 전부 보존, 변경 기�
       and st.events("STOCK:005930")[-1]["event"] == "REBASE" and st.events("STOCK:005930")[-1]["detail"]["sample"])
 b1001 = [sb for sb in cur if sb.raw.date == date(2026, 10, 1)][0]
 b1002 = cur[-1]
-check("5-8) 재수집 뒤에도 그 날짜의 처음 완성 확보 시각(ready_at)·run_type 유지, 새 날짜는 FORWARD",
-      b1001.run_type == FORWARD and b1001.ready_at == fwd_1001.ready_at and b1001.raw.close_raw != fwd_1001.raw.close_raw
-      and b1002.raw.date == date(2026, 10, 2) and b1002.run_type == FORWARD and b1002.ready_at == datetime(2026, 10, 2, 19, 0))
+check("5-8) [A2-R1] 정정된 10/1 값의 사용 가능 시각 = 새 revision 활성 시각(10/2 19:00) — 10/1 19:05가 아님. "
+      "최초 확보 시각(first_ready_at)·run_type은 기록으로만 보존, 새 날짜는 FORWARD",
+      b1001.run_type == FORWARD and b1001.raw.close_raw != fwd_1001.raw.close_raw
+      and b1001.available_at == datetime(2026, 10, 2, 19, 0) and b1001.received_at == datetime(2026, 10, 2, 19, 0)
+      and b1001.first_ready_at == fwd_1001.first_ready_at == datetime(2026, 10, 1, 19, 5)
+      and b1002.raw.date == date(2026, 10, 2) and b1002.run_type == FORWARD
+      and b1002.available_at == datetime(2026, 10, 2, 19, 0))
 fk.series["000660"]["removed"].add(date(2026, 8, 3))
 r = col.update_series("STOCK:000660", "STOCK", "000660", now=ck)
 check("5-9) 저장된 날짜가 원천에서 사라져도 재수집(MISSING)", r["action"] == "REFETCH_REBASE" and "MISSING" in r["reason"])
@@ -527,20 +593,28 @@ check("5-10) 매일 갱신: 열린 백필 작업에 남은 종목은 건너뜀, 
 for dd in (date(2026, 10, 7), date(2026, 10, 8)):
     ck.t = datetime.combine(dd, datetime.min.time()).replace(hour=19, minute=0)
     col.update_series("STOCK:000660", "STOCK", "000660", now=ck)
-bars6, ready6, _ = st.research_series("STOCK:000660")
-wk = weekly_bars(bars6, CalendarWeekSchedule(CAL), datetime(2026, 10, 10, 12, 0), mode="OBSERVED",
-                 data_ready_at=ready6)
+rs6 = st.research_series("STOCK:000660")
+wk = weekly_bars(rs6.bars, CalendarWeekSchedule(CAL), datetime(2026, 10, 10, 12, 0), mode="OBSERVED",
+                 data_ready_at=rs6.available_at)
 w1005 = [w for w in wk if w.week_start == date(2026, 10, 5)][0]
 w0928 = [w for w in wk if w.week_start == date(2026, 9, 28)][0]
 check("5-11) FORWARD 봉만 있는 주(10/6~8)는 OBSERVED 완성, available_at = 가장 늦은 확보 시각",
       w1005.complete and w1005.available_at == datetime(2026, 10, 8, 19, 0))
-check("5-12) BACKFILL(확보 시각 없음)이 섞인 주는 관측 모드에서 불완전(READY_TIME_UNKNOWN)",
-      not w0928.complete and w0928.reason.startswith("READY_TIME_UNKNOWN"))
+check("5-12) [A2-R1] 백필 봉도 실제 사용 가능 시각이 있으므로 수집 뒤 평가에서는 OBSERVED 완성 "
+      "(9/28 주 = 10/2 19:00 재수집 활성 시각)", w0928.complete and w0928.available_at == datetime(2026, 10, 2, 19, 0))
+PAST = datetime(2026, 9, 11, 20, 0)                               # 백필(9/30) 전 시점
+rsk = st.research_series("INDEX:KOSPI:001")
+past = weekly_bars(rsk.bars, CalendarWeekSchedule(CAL), PAST, mode="OBSERVED", data_ready_at=rsk.available_at)
+check("5-12b) 수집 전 과거 시점을 OBSERVED로 보면 미확보 → 추세 UNKNOWN, 시점 조회도 빈 값. "
+      "과거 재현은 현재 revision + ASSUMED_DELAY(가정 분석)로 따로",
+      weekly_trend(past).state == "UNKNOWN" and st.research_series("INDEX:KOSPI:001", as_of=PAST).bars == []
+      and weekly_trend(weekly_bars(rsk.bars, CalendarWeekSchedule(CAL), PAST)).state != "UNKNOWN")
 fk.series["000660"]["removed"].add(date(2026, 10, 14))       # 수요일 봉이 원천에서 늦게 나타남
 for dd in (date(2026, 10, 13), date(2026, 10, 14), date(2026, 10, 15), date(2026, 10, 16)):
     ck.t = datetime.combine(dd, datetime.min.time()).replace(hour=19, minute=0)
     col.update_series("STOCK:000660", "STOCK", "000660", now=ck)
-b660, r660, _ = st.research_series("STOCK:000660")
+rs660 = st.research_series("STOCK:000660")
+b660, r660 = rs660.bars, rs660.available_at
 w_fri = [w for w in weekly_bars(b660, CalendarWeekSchedule(CAL), datetime(2026, 10, 16, 20, 0), mode="OBSERVED",
                                 data_ready_at=r660) if w.week_start == date(2026, 10, 12)][0]
 check("5-13) 원천에 빠진 날(10/14)은 저장 안 됨 → 그 주 주봉은 금요일 밤에도 불완전",
@@ -549,14 +623,271 @@ fk.series["000660"]["removed"].discard(date(2026, 10, 14))
 ck.t = datetime(2026, 10, 19, 19, 0)
 r = col.update_series("STOCK:000660", "STOCK", "000660", now=ck)
 b14 = [sb for sb in st.load_bars("STOCK:000660") if sb.raw.date == date(2026, 10, 14)][0]
-check("5-14) 누락 봉이 나중에 나타나면 재수집, 그 봉은 FORWARD·ready_at = 복구 조회 시각(10/19 19:00)",
-      "EXTRA" in r["reason"] and b14.run_type == FORWARD and b14.ready_at == datetime(2026, 10, 19, 19, 0))
-b660, r660, _ = st.research_series("STOCK:000660")
+check("5-14) 누락 봉이 나중에 나타나면 재수집, 그 봉은 FORWARD·사용 가능 시각 = 복구 조회 시각(10/19 19:00)",
+      "EXTRA" in r["reason"] and b14.run_type == FORWARD and b14.available_at == datetime(2026, 10, 19, 19, 0))
+rs660 = st.research_series("STOCK:000660")
+b660, r660 = rs660.bars, rs660.available_at
 w_mon = [w for w in weekly_bars(b660, CalendarWeekSchedule(CAL), datetime(2026, 10, 19, 20, 0), mode="OBSERVED",
                                 data_ready_at=r660) if w.week_start == date(2026, 10, 12)][0]
 check("5-15) 복구 뒤 그 주 주봉 완성, available_at = 복구 조회 시각(주 전체 확보 시각 중 최댓값)",
       w_mon.complete and w_mon.available_at == datetime(2026, 10, 19, 19, 0))
+
+# ── 9. A2-R1: 값 revision과 사용 가능 시각, 시점 조회 ─────────────
+again_1001 = st.research_series("STOCK:005930", as_of=AS_1001)
+check("9-1) [A2-R1] 10/2 정정 뒤에도 10/1 20:00 시점 조회는 revision 1의 원래 값 그대로(10/1 봉 포함)",
+      again_1001.revision == 1 and again_1001.bars == seen_1001.bars and again_1001.bars[-1].date == date(2026, 10, 1)
+      and again_1001.bars[-1].close == fwd_1001.raw.close_raw and again_1001.basis.base_dt == "20260930")
+check("9-2) 10/1 재평가(S1)가 10/1 당시 평가와 완전히 같음 — 10/2에 정정한 값이 들어가지 않음",
+      s1_at(again_1001, st.research_series("INDEX:KOSPI:001", as_of=AS_1001), date(2026, 10, 1)) == s1_orig_1001)
+check("9-3) 반대로 현재 revision(정정 값)으로 10/1을 보면 결과가 달라짐 — 시점 조회가 필요한 이유",
+      s1_at(st.research_series("STOCK:005930"), st.research_series("INDEX:KOSPI:001"), date(2026, 10, 1)) != s1_orig_1001)
+r_before = st.research_series("STOCK:005930", as_of=datetime(2026, 10, 2, 18, 59))
+r_after = st.research_series("STOCK:005930", as_of=datetime(2026, 10, 2, 19, 0))
+check("9-4) 새 revision 활성 시각 전(10/2 18:59)은 revision 1, 활성 시각(19:00)부터 revision 2(10/2 봉 포함)",
+      r_before.revision == 1 and r_before.bars[-1].date == date(2026, 10, 1)
+      and r_after.revision == 2 and r_after.bars[-1].date == date(2026, 10, 2))
+check("9-5) revision 기록: 조정 기준·활성·대체 시각",
+      [(x["revision"], x["base_dt"], x["activated_at"], x["superseded_at"]) for x in st.revisions("STOCK:005930")]
+      == [(1, "20260930", "2026-09-30T19:00:00", "2026-10-02T19:00:00"), (2, "20261002", "2026-10-02T19:00:00", None)])
 st.close()
+
+# ── 9(계속). 페이지별 수신 시각 ────────────────────────────────
+ck = Clock(datetime(2026, 9, 30, 19, 0))
+fk = FakeKiwoom(ck)
+fk.add("005930", date(2016, 6, 1))
+fk.list_rows["0"] = [lrow("005930", "삼성전자")]
+cl, st2, col2 = make(ck, fk, TMP / "pages.sqlite3")
+col2.snapshot_universe()
+fk.tick = timedelta(minutes=5)                                       # 호출마다 5분씩 늦게 도착
+job = col2.create_backfill_job(now=ck(), include_index=False)
+col2.run_backfill(job, now=ck)
+b2 = st2.load_bars("STOCK:005930")
+newest, p2 = b2[-1], b2[-601]
+act2 = st2.revisions("STOCK:005930")[0]["activated_at"]
+check("9-6) [A2-R1] 행마다 그 페이지 수신 시각 — 첫 페이지 봉 19:05, 둘째 페이지 봉 19:10 (첫 페이지 시각으로 덮지 않음)",
+      newest.received_at == datetime(2026, 9, 30, 19, 5) and p2.received_at == datetime(2026, 9, 30, 19, 10)
+      and act2 == max(sb.received_at for sb in b2).isoformat())
+check("9-7) 새 시계열은 마지막 페이지 수신 뒤 활성 — 19:07 평가에는 19:10에 받은 봉을 포함해 아무것도 쓰지 않음",
+      st2.research_series("STOCK:005930", as_of=datetime(2026, 9, 30, 19, 7)).bars == []
+      and len(st2.research_series("STOCK:005930", as_of=datetime.fromisoformat(act2)).bars) == len(b2))
+st2.close()
+
+# ── 10. A2-R2: 재수집 후보 검증 ────────────────────────────────
+SID = "STOCK:005930"
+
+
+def split_store(name: str):
+    c = Clock(datetime(2026, 9, 30, 19, 0))
+    f = FakeKiwoom(c)
+    f.add("005930", date(2016, 6, 1), split=(date(2026, 10, 1), 2, date(2026, 10, 1)))   # 10/1부터 과거가 ½
+    f.add("001", date(2016, 6, 1), index=True, base=2000)
+    f.add("101", date(2016, 6, 1), index=True, base=700)
+    f.list_rows["0"] = [lrow("005930", "삼성전자")]
+    _, s_, c_ = make(c, f, TMP / name)
+    c_.snapshot_universe()
+    c_.run_backfill(c_.create_backfill_job(now=c(), include_index=False), now=c)
+    c.t = datetime(2026, 10, 1, 19, 0)
+    return c, f, s_, c_
+
+
+def frozen(s_):
+    m = s_.get_series(SID)
+    return ([(sb.raw.values(), sb.revision, sb.available_at) for sb in s_.load_bars(SID)],
+            (m.revision, m.adj_base_dt, m.verified_base_dt, m.first_date, m.last_date))
+
+
+ck, fk, st3, col3 = split_store("r2_empty.sqlite3")
+before = frozen(st3)
+fk.fail["005930"] = ["PASS", "EMPTY"]                     # 첫 페이지 정상(변경 발견) → 재수집 응답이 빔
+try:
+    col3.update_series(SID, "STOCK", "005930", now=ck)
+    raised = False
+except CollectError:
+    raised = True
+m3 = st3.get_series(SID)
+check("10-1) [A2-R2] 변경 감지 뒤 재수집이 빈 응답 → 값·조정 기준일·확인 기준일·revision 그대로, REBASE_REQUIRED 기록",
+      raised and frozen(st3) == before and m3.integrity == "REBASE_REQUIRED"
+      and st3.events(SID)[-1]["event"] == "VERIFY_FAILED")
+try:
+    st3.append_forward(series_id=SID, bars=[FetchedBar(parse_row(fk._rows("005930", date(2026, 10, 1))[0]), ck())],
+                       verified_base_dt="20261001", verified_at=ck())
+    check("10-2) REBASE_REQUIRED 동안은 새 날짜를 기존 기준 데이터에 붙이지 않음(IntegrityError)", False)
+except IntegrityError:
+    check("10-2) REBASE_REQUIRED 동안은 새 날짜를 기존 기준 데이터에 붙이지 않음(IntegrityError)",
+          frozen(st3) == before)
+ck.t = datetime(2026, 10, 2, 19, 0)
+r = col3.update_series(SID, "STOCK", "005930", now=ck)
+m3 = st3.get_series(SID)
+cur3 = st3.load_bars(SID)
+check("10-3) 다음 갱신은 첫 페이지 붙이기 없이 바로 재수집 → 검증 통과 뒤에만 revision 2·새 조정 기준 활성, 이전 값 보존",
+      r["action"] == "REFETCH_REBASE" and r["reason"] == "RETRY_REBASE_REQUIRED" and m3.revision == 2
+      and m3.adj_base_dt == "20261002" and m3.integrity == "OK" and {sb.revision for sb in cur3} == {2}
+      and len(st3.load_history(SID)) == len(before[0]))
+check("10-4) 재수집으로 들어온 10/1·10/2는 FORWARD, 사용 가능 시각 = 활성 시각",
+      [(sb.raw.date, sb.run_type, sb.available_at) for sb in cur3[-2:]]
+      == [(date(2026, 10, 1), FORWARD, datetime(2026, 10, 2, 19, 0)), (date(2026, 10, 2), FORWARD, datetime(2026, 10, 2, 19, 0))])
+st3.close()
+
+ck, fk, st3, col3 = split_store("r2_one.sqlite3")
+before = frozen(st3)
+old_0930 = [sb.raw.close_raw for sb in st3.load_bars(SID) if sb.raw.date == date(2026, 9, 30)][0]
+fk.fail["005930"] = ["PASS", "ONE_ROW"]                   # 재수집이 10/1 한 행만 주고 끝
+r = col3.update_series(SID, "STOCK", "005930", now=ck)
+check("10-5) [A2-R2 재현] 재수집이 한 행이면 EXTEND가 아니라 REBASE_FAILED — 9/30 가격·조정 기준일 그대로",
+      r["action"] == "REBASE_FAILED" and any(p.startswith("SHORT_HISTORY") for p in r["problems"])
+      and any(p.startswith("EXPECTED_MISMATCH") for p in r["problems"]) and frozen(st3) == before
+      and [sb.raw.close_raw for sb in st3.load_bars(SID) if sb.raw.date == date(2026, 9, 30)][0] == old_0930
+      and st3.get_series(SID).adj_base_dt == "20260930")
+st3.close()
+
+ck, fk, st3, col3 = split_store("r2_cap.sqlite3")
+before = frozen(st3)
+col3.max_pages = 2                                        # 재수집이 페이지 상한으로 2019년까지만
+r = col3.update_series(SID, "STOCK", "005930", now=ck)
+check("10-6) 재수집이 페이지 상한에 걸려 필요한 시작일에 못 미치면 REBASE_FAILED, 기존 값·메타 유지",
+      r["action"] == "REBASE_FAILED" and any(p.startswith("SHORT_HISTORY") for p in r["problems"])
+      and frozen(st3) == before and st3.get_series(SID).integrity == "REBASE_REQUIRED")
+col3.max_pages = 8
+fk.fail["005930"] = ["ONE_ROW"]                           # 재검증 필요 상태 → 바로 재수집 → 또 한 행
+res = col3.run_update(now=ck)
+check("10-7) 매일 갱신 집계: 검증 실패(REBASE_FAILED)는 정상 갱신이 아니라 failed로 셈(종료 코드 1)",
+      res["tally"].get("REBASE_FAILED") == 1 and res["failed"] == 1 and frozen(st3) == before)
+st3.close()
+
+ck, fk, st3, col3 = split_store("r2_job.sqlite3")
+before = frozen(st3)
+job = col3.create_backfill_job(now=ck(), include_index=False, series_ids=[SID])
+fk.fail["005930"] = ["ONE_ROW"]
+res = col3.run_backfill(job, now=ck)
+it = st3.job_items(job)[0]
+check("10-8) 기존 시계열을 다시 받는 백필도 같은 검증 — 부족하면 SHORTFALL 저장이 아니라 ERROR(REBASE_FAILED), 값 그대로",
+      it["status"] == ERROR and "REBASE_FAILED" in it["reason"] and frozen(st3) == before)
+st3.close()
+
+# ── 11. A2-R3: 응답·연속조회 계약 ──────────────────────────────
+ck = Clock(datetime(2026, 9, 30, 19, 0))
+fk = FakeKiwoom(ck)
+fk.add("005930", date(2016, 6, 1))
+fk.add("000660", date(2016, 6, 1))
+fk.list_rows["0"] = [lrow("005930", "삼성전자"), lrow("000660", "SK하이닉스")]
+cl, st4, col4 = make(ck, fk, TMP / "contract.sqlite3")
+PAY = {"stk_cd": "005930", "base_dt": "20260930", "upd_stkpc_tp": "1"}
+bad = []
+for act in ("Y_NO_KEY", "NO_RC", "BAD_CONT"):
+    fk.fail["005930"] = [act]
+    try:
+        cl.fetch_page("ka10081", PAY, "stk_dt_pole_chart_qry")
+        bad.append(act)
+    except ResearchApiError:
+        pass
+check("11-1) [A2-R3] cont-yn=Y인데 next-key 없음·return_code 누락·cont-yn 이상 → ResearchApiError", not bad)
+bad = []
+for acts in (["EMPTY"], ["PASS", "EMPTY"], ["PASS", "SAME_KEY"], ["PASS", "NO_PROGRESS"], ["FUTURE_ROW"]):
+    fk.fail["005930"] = list(acts)
+    try:
+        col4.fetch_full(STOCK_DAILY, "005930", "20260930", date(2017, 1, 2))
+        bad.append(acts)
+    except CollectError:
+        pass
+check("11-2) 빈 첫 응답·빈 연속 페이지·다음 키 반복·과거로 진행 안 함·base_dt 뒤 날짜 → CollectError", not bad)
+col4.snapshot_universe()
+job = col4.create_backfill_job(now=ck(), include_index=False)
+fk.fail["005930"] = ["PASS", "Y_NO_KEY"]
+col4.run_backfill(job, now=ck)
+it = {i["series_id"]: i for i in st4.job_items(job)}
+check("11-3) 원천 계약 위반 종목은 작업 ERROR, 시계열을 만들지 않음(이력 끝으로 오인하지 않음), 다른 종목은 정상",
+      it["STOCK:005930"]["status"] == ERROR and "next-key" in it["STOCK:005930"]["reason"]
+      and st4.get_series("STOCK:005930") is None and it["STOCK:000660"]["status"] == DONE)
+col4.run_backfill(job, now=ck)
+check("11-4) 다시 실행하면 정상 연속조회로 완료(REACHED)", st4.get_series("STOCK:005930").coverage == "OK"
+      and st4.get_job(job)["status"] == "DONE")
+n_snap = st4.conn.execute("SELECT COUNT(*) FROM universe_snapshot").fetchone()[0]
+fk.fail["LIST0"] = ["Y_NO_KEY"]
+try:
+    col4.snapshot_universe()
+    check("11-5) 목록 조회도 같은 계약 — 모순 응답이면 스냅숏을 저장하지 않음", False)
+except ResearchApiError:
+    check("11-5) 목록 조회도 같은 계약 — 모순 응답이면 스냅숏을 저장하지 않음",
+          st4.conn.execute("SELECT COUNT(*) FROM universe_snapshot").fetchone()[0] == n_snap)
+st4.close()
+
+# ── 12. A2-R4: 빈 state·state에만 있는 위험 표시 ─────────────────
+cases = {"   ": "STATE_MISSING", "": "STATE_MISSING", "투자주의": "STATE:투자주의",
+         "증거금100%|투자주의환기종목": "STATE:투자주의환기종목", "투자경고": "STATE:투자경고",
+         "증거금40%|단기과열": "STATE:단기과열", "정리매매": "STATE:정리매매", "증거금40%|새토큰": "STATE_UNRECOGNIZED:새토큰"}
+recs = {k: classify_row(lrow("123450", "x", state=k)) for k in cases}
+check("12-1) [A2-R4] 빈·공백 state는 보류, state에만 있는 투자주의·환기·경고·단기과열·정리매매도 위험, 모르는 토큰도 보류",
+      all(recs[k].risk_flags == (v,) and not recs[k].eligible_now for k, v in cases.items()))
+check("12-2) 위험 자격만 막고 수집 대상(collect)은 유지 — 현재 상태가 백필 선택에 개입하지 않음",
+      all(r.collect for r in recs.values()))
+check("12-3) 정상 토큰(증거금N%·담보대출·신용가능)만 있으면 통과, 정책 u2",
+      classify_row(lrow("123450", "x", state="증거금20%|담보대출|신용가능")).eligible_now
+      and UniversePolicy().policy_version.startswith("u2:"))
+
+# ── 13. r1 → r2 저장소 이전 ────────────────────────────────────
+R1_DDL = """
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE series(series_id TEXT PRIMARY KEY, kind TEXT NOT NULL, code TEXT NOT NULL, api_id TEXT NOT NULL,
+  price_scale INTEGER NOT NULL, trade_value_unit INTEGER NOT NULL, volume_unit TEXT NOT NULL,
+  revision INTEGER NOT NULL, adj_upd_stkpc_tp TEXT, adj_base_dt TEXT NOT NULL, fetched_at TEXT NOT NULL,
+  job_id TEXT, verified_base_dt TEXT NOT NULL, verified_at TEXT NOT NULL,
+  first_date TEXT, last_date TEXT, required_from TEXT, coverage TEXT NOT NULL, coverage_detail TEXT NOT NULL,
+  no_trades_count INTEGER NOT NULL, invalid_count INTEGER NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE bar(series_id TEXT NOT NULL, date TEXT NOT NULL,
+  open_raw INTEGER, high_raw INTEGER, low_raw INTEGER, close_raw INTEGER, volume INTEGER, trade_value_raw INTEGER,
+  quality TEXT NOT NULL, run_type TEXT NOT NULL, ready_at TEXT, fetched_at TEXT NOT NULL, revision INTEGER NOT NULL,
+  PRIMARY KEY(series_id, date)) WITHOUT ROWID;
+CREATE TABLE bar_history(series_id TEXT NOT NULL, revision INTEGER NOT NULL, date TEXT NOT NULL,
+  open_raw INTEGER, high_raw INTEGER, low_raw INTEGER, close_raw INTEGER, volume INTEGER, trade_value_raw INTEGER,
+  quality TEXT NOT NULL, run_type TEXT NOT NULL, ready_at TEXT, fetched_at TEXT NOT NULL,
+  superseded_at TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(series_id, revision, date)) WITHOUT ROWID;
+CREATE TABLE job(job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at TEXT NOT NULL, base_dt TEXT NOT NULL,
+  upd_stkpc_tp TEXT NOT NULL, required_from TEXT NOT NULL, max_pages INTEGER NOT NULL,
+  snapshot_id INTEGER, status TEXT NOT NULL, params_json TEXT NOT NULL);
+CREATE TABLE job_item(job_id TEXT NOT NULL, series_id TEXT NOT NULL, seq INTEGER NOT NULL, kind TEXT NOT NULL,
+  code TEXT NOT NULL, reg_day TEXT, status TEXT NOT NULL, pages INTEGER NOT NULL, first_date TEXT, last_date TEXT,
+  reason TEXT NOT NULL, attempts INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(job_id, series_id)) WITHOUT ROWID;
+"""
+mdb = TMP / "r1.sqlite3"
+con = sqlite3.connect(mdb)
+con.executescript(R1_DDL)
+con.execute("INSERT INTO meta VALUES('schema_version','r1')")
+con.execute("INSERT INTO series VALUES('STOCK:005930','STOCK','005930','ka10081',1,1000000,'SHARES',2,'1','20260930',"
+            "'2026-09-30T14:13:00','j1','20261001','2026-10-01T19:05:00','2026-09-28','2026-10-01','2017-01-02','OK','',"
+            "0,0,'2026-10-01T19:05:00')")
+for d, rt, ready, fetched in (("2026-09-28", "BACKFILL", None, "2026-09-30T14:13:00"),
+                              ("2026-09-29", "BACKFILL", None, "2026-09-30T14:13:00"),
+                              ("2026-10-01", "FORWARD", "2026-10-01T19:05:00", "2026-10-01T19:05:00")):
+    con.execute("INSERT INTO bar VALUES('STOCK:005930',?,100,110,90,105,1000,1,'',?,?,?,2)", (d, rt, ready, fetched))
+con.execute("INSERT INTO bar_history VALUES('STOCK:005930',1,'2026-09-28',200,220,180,210,500,1,'','BACKFILL',NULL,"
+            "'2026-09-29T20:00:00','2026-09-30T14:13:00','REBASE')")
+con.execute("INSERT INTO job VALUES('j1','BACKFILL','2026-09-30T14:12:47','20260930','1','2017-01-02',8,1,'OPEN','{}')")
+con.execute("INSERT INTO job_item VALUES('j1','STOCK:005930',0,'STOCK','005930',NULL,'DONE',4,'2026-09-28',"
+            "'2026-09-29','',1,'2026-09-30T14:13:00')")
+con.commit()
+con.close()
+st5 = ResearchStore(mdb)
+mb = {sb.raw.date: sb for sb in st5.load_bars("STOCK:005930")}
+check("13-1) r1 DB를 열면 자동으로 r2 이전: 봉·작업 보존, 스키마 r2",
+      st5.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r2"
+      and len(mb) == 3 and st5.job_counts("j1") == {"DONE": 1} and st5.get_series("STOCK:005930").integrity == "OK")
+check("13-2) 시각 이전: received_at = 기존 fetched_at, available_at = max(fetched_at, series.updated_at)(보수적), "
+      "first_ready_at = ready_at 또는 fetched_at",
+      mb[date(2026, 9, 28)].received_at == datetime(2026, 9, 30, 14, 13)
+      and mb[date(2026, 9, 28)].available_at == datetime(2026, 10, 1, 19, 5)
+      and mb[date(2026, 9, 28)].first_ready_at == datetime(2026, 9, 30, 14, 13)
+      and mb[date(2026, 10, 1)].first_ready_at == datetime(2026, 10, 1, 19, 5))
+check("13-3) revision 행 생성(현재·이전 판), 이전 판 봉은 bar_history에 시각과 함께",
+      [(x["revision"], x["reason"], x["superseded_at"]) for x in st5.revisions("STOCK:005930")]
+      == [(1, "MIGRATED_R1_HISTORY", "2026-09-30T14:13:00"), (2, "MIGRATED_R1", None)]
+      and st5.load_history("STOCK:005930")[0]["received_at"] == "2026-09-29T20:00:00")
+st5.close()
+st5 = ResearchStore(mdb)
+check("13-4) 다시 열어도 그대로(이전은 한 번만), 시점 조회 동작",
+      len(st5.load_bars("STOCK:005930")) == 3
+      and len(st5.research_series("STOCK:005930", as_of=datetime(2026, 10, 1, 19, 5)).bars) == 3
+      and st5.research_series("STOCK:005930", as_of=datetime(2026, 9, 30, 12, 0)).revision == 1)
+st5.close()
 
 # ── 6. 과거 휴장일 후보 ─────────────────────────────────────
 days = [date(2026, 1, 1) + timedelta(days=i) for i in range(273)]
@@ -583,6 +914,7 @@ fk.add("001", date(2016, 6, 1), index=True, base=2000)
 fk.add("101", date(2016, 6, 1), index=True, base=700)
 fk.add("005930", date(2016, 6, 1))
 fk.list_rows["0"] = [lrow("005930", "삼성전자")]
+fill_lists(fk)
 cli_client = ReadOnlyResearchClient(fk, "https://mockapi.kiwoom.com", "k", "s", now=ck, monotonic=lambda: 0.0,
                                     sleep=lambda s: None)
 cdb = str(TMP / "cli.sqlite3")

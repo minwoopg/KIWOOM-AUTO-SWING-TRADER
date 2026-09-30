@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-"""종목 목록 분류 — 수집 대상과 현재 신호 자격을 분리 (A2, universe_policy = u1).
+"""종목 목록 분류 — 수집 대상과 현재 신호 자격을 분리 (A2, universe_policy = u2).
+
+u1 → u2 (A2-R4): 빈·공백 state는 STATE_MISSING(보류). state 토큰도 합의한 위험 범주 전체(관리·정지·투자주의·
+환기·경고·위험·단기과열·정리매매)로 검사하고, 정상 토큰(증거금N%·담보대출·신용가능)이 아닌 모르는 토큰은
+STATE_UNRECOGNIZED로 보류합니다. 수집 대상(collect)은 증권 유형만으로 정하므로 바뀌지 않습니다.
 
 원천: ka10099 종목정보 리스트(mrkt_tp 0=KOSPI, 10=KOSDAQ). A1 실측(2026-09-30 12:31) 필드:
 code, name, marketCode, marketName, kind, auditInfo, state, orderWarning, companyClassName,
@@ -20,18 +24,20 @@ regDay, listCount, lastPrice, upName, upSizeName, nxtEnable.
 
 현재 위험 표시 (세 필드가 서로 어긋나므로 **합집합**, 원래 값은 그대로 보존)
 - auditInfo가 '정상'이 아니면 AUDIT:<원래 값> — 투자주의·투자주의환기종목 포함(사용자 결정: 초기 제외).
-- state를 '|'로 나눈 토큰에 관리종목·거래정지가 있으면 STATE:<토큰>.
+- state를 '|'로 나눈 토큰에 위험 범주 단어(관리종목·거래정지·투자주의·환기·투자경고·투자위험·단기과열·정리매매)가
+  있으면 STATE:<토큰>. 정상 토큰(증거금N%·담보대출·신용가능)이 아닌 모르는 토큰은 STATE_UNRECOGNIZED:<토큰>.
 - orderWarning이 '0'이 아니면 ORDER_WARNING:<원래 숫자>. **숫자를 관리·정지 등으로 번역하지 않습니다**
   (A2 보완 3 — 공식 설명과 실측 상관을 코드 의미로 단정하지 않음).
-- 필드가 없거나 비어 있으면 *_MISSING — 모르면 위험으로 봅니다(fail-closed).
+- 필드가 없거나 비어 있거나 공백뿐이면 *_MISSING — 모르면 위험으로 봅니다(fail-closed).
 """
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import date
 
-UNIVERSE_POLICY_ID = "u1"
+UNIVERSE_POLICY_ID = "u2"
 
 COMMON, PREFERRED, SPAC, FOREIGN = "COMMON", "PREFERRED", "SPAC", "FOREIGN"
 ETF, ETN, REIT, INFRA, MUTUAL, OTHER = "ETF", "ETN", "REIT", "INFRA", "MUTUAL", "OTHER"
@@ -50,7 +56,9 @@ class UniversePolicy:
     spac_class_names: tuple[str, ...] = ("스팩",)
     foreign_class_names: tuple[str, ...] = ("외국기업",)
     audit_ok_values: tuple[str, ...] = ("정상",)
-    state_risk_tokens: tuple[str, ...] = ("관리종목", "거래정지")
+    state_risk_keywords: tuple[str, ...] = ("관리종목", "거래정지", "투자주의", "환기", "투자경고", "투자위험",
+                                            "단기과열", "정리매매")
+    state_normal_patterns: tuple[str, ...] = (r"증거금\d+%", "담보대출", "신용가능")
     order_warning_ok_values: tuple[str, ...] = ("0",)
 
     @property
@@ -133,12 +141,16 @@ def risk_flags_of(row: dict, policy: UniversePolicy) -> tuple[str, ...]:
     elif audit not in policy.audit_ok_values:
         flags.append(f"AUDIT:{audit}")
     state = _s(row, "state")
-    if state is None:
+    if not state:                                   # None·빈 값·공백 — 보류 (A2-R4)
         flags.append("STATE_MISSING")
     else:
         for tok in (t.strip() for t in state.split("|")):
-            if tok in policy.state_risk_tokens:
+            if not tok:
+                continue
+            if any(k in tok for k in policy.state_risk_keywords):
                 flags.append(f"STATE:{tok}")
+            elif not any(re.fullmatch(p, tok) for p in policy.state_normal_patterns):
+                flags.append(f"STATE_UNRECOGNIZED:{tok}")
     ow = _s(row, "orderWarning")
     if not ow:
         flags.append("ORDER_WARNING_MISSING")
