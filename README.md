@@ -106,6 +106,8 @@ python -m app.main --check-only   # 기동 점검만
 python run_regression_tests.py
 ```
 
+`test_multiday_integration.py`(9단계)는 4거래일을 이어서 돌리며 분할매도·장중 재시작·복구 명령·API 장애·상태 파일 저장 실패를 한 번에 검증합니다.
+
 GitHub Actions가 main 푸시마다 Windows·Ubuntu에서 같은 테스트를 돌립니다(실측 fixture가 필요한 `test_broker_order_status.py`만 제외).
 
 `test_broker_order_status.py`는 실측 fixture가 필요합니다. 단타 레포 로컬의
