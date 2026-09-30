@@ -61,12 +61,18 @@ def ret(v: SeriesView, n: int, off: int = 0) -> FV:
 
 
 def rs(stock: SeriesView, index: SeriesView, n: int, off: int = 0) -> FV:
-    a, b = ret(stock, n, off), ret(index, n, off)
-    if not a.ok:
-        return a
-    if not b.ok:
-        return FV.unknown(f"INDEX:{b.reason}")
-    return FV(a.value - b.value)
+    """A13-R1: 기준일이 같고, 수익률 구간의 실제 날짜 배열이 같을 때만 계산."""
+    if stock.t != index.t:
+        return FV.unknown(f"AS_OF_MISMATCH:stock={stock.t.isoformat()},index={index.t.isoformat()}")
+    sb, why = stock.window(n + 1, off)
+    if sb is None:
+        return FV.unknown(why)
+    ib, iwhy = index.window(n + 1, off)
+    if ib is None:
+        return FV.unknown(f"INDEX:{iwhy}")
+    if [b.date for b in sb] != [b.date for b in ib]:
+        return FV.unknown("SESSION_ALIGNMENT_MISMATCH")
+    return FV((sb[-1].close / sb[0].close - 1) - (ib[-1].close / ib[0].close - 1))
 
 
 def _trs(bars: list[ResearchBar]) -> list[float]:

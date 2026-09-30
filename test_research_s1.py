@@ -165,8 +165,10 @@ r = run(flat, S[209])
 check("4-3) ATR 0 → ATR_POS FAIL, 과열 판정 UNKNOWN(분모 0)",
       res_of(r, "ATR_POS") == Tri.FAIL and res_of(r, "NOT_EXTENDED") == Tri.UNKNOWN)
 r = run(*scenario(), cfg=replace(S1Config(), stop_atr_buffer=10_000.0))
-check("4-4) 참고 손절가 ≤ 0 → INVALID_STOP (위험 비율 계산 안 함)",
-      r.levels["stop_status"] == "INVALID_STOP" and r.levels["risk_ratio_at_cap"] is None)
+check("4-4) [A13-R4] 참고 손절가 ≤ 0 → INVALID_STOP, 패턴·자격·시장은 보존, 최종 후보는 보류(FAIL)",
+      r.levels["stop_status"] == "INVALID_STOP" and r.levels["risk_ratio_at_cap"] is None
+      and r.pattern_pass == Tri.PASS and r.eligibility_pass == Tri.PASS and r.market_pass == Tri.PASS
+      and r.stop_valid == Tri.FAIL and r.eligible_signal == Tri.FAIL)
 
 # ── 5. 미래 데이터·재현성 ────────────────────────────────────
 bars, t = scenario()
@@ -199,6 +201,55 @@ src = " ".join(p.read_text(encoding="utf-8") for p in Path("domain/research").gl
 check("7-1) 연구 계층은 브로커·주문 실행부·원장·네트워크를 쓰지 않음",
       not any(w in src for w in ("infra.broker", "order_executor", "place_order", "fill_ledger",
                                  "requests", "OrderIntent", "import os")))
+
+# ── 8. A13 경계 ──────────────────────────────────────────────
+import json  # noqa: E402
+
+from domain.research.market import classify_market as cm  # noqa: E402
+from domain.research.series import ResearchBarError  # noqa: E402
+
+bars, t = scenario()
+t_i = S.index(t)
+base = run(bars, t)
+changed_idx = [bar(b.date, b.close * (3.0 if b.date > t else 1.0), up=0.005, dn=0.005, tv=None) for b in IDX]
+sv = SeriesView(bars, S, t)
+iv_future = SeriesView(changed_idx, S, S[259])                      # 미래 기준일의 지수 View
+r = evaluate_s1("005930", sv, iv_future, cm(iv_future), OK)
+check("8-1) [A13-R1 재현] 미래 기준일 지수 View·시장 판정 → RS·시장 UNKNOWN(AS_OF_MISMATCH), PASS/FAIL로 바뀌지 않음",
+      res_of(r, "RS60_POS") == Tri.UNKNOWN and "AS_OF_MISMATCH" in r.check("RS60_POS").detail
+      and r.market_pass == Tri.UNKNOWN and "AS_OF_MISMATCH" in r.check("MARKET_REGIME").detail
+      and r.eligible_signal == Tri.UNKNOWN)
+iv_ok = SeriesView(changed_idx, S, t)
+r = evaluate_s1("005930", sv, iv_ok, cm(iv_future), OK)
+check("8-2) 지수 View는 맞는데 다른 날짜의 시장 판정만 전달 → 시장 UNKNOWN(AS_OF_MISMATCH)",
+      r.market_pass == Tri.UNKNOWN and "AS_OF_MISMATCH" in r.check("MARKET_REGIME").detail
+      and res_of(r, "RS60_POS") == Tri.PASS)
+r = evaluate_s1("005930", sv, iv_ok, None, OK)
+check("8-3) 시장 판정을 안 넘기면 같은 기준일 지수로 직접 판정 → 기존 결과와 동일(미래 지수 변경 무관)",
+      r.to_dict() == base.to_dict())
+S_skip = [d for d in S if d != S[t_i - 30]]
+idx_skip = [b for b in IDX if b.date != S[t_i - 30]]
+r2 = evaluate_s1("005930", SeriesView(bars, S, t), SeriesView(idx_skip, S_skip, t), None, OK)
+check("8-4) 지수 세션 목록에서 날짜 하나를 빼면 RS 구간 불일치 → UNKNOWN(SESSION_ALIGNMENT_MISMATCH)",
+      r2.check("RS60_POS").detail == "SESSION_ALIGNMENT_MISMATCH" and res_of(r2, "RS60_POS") == Tri.UNKNOWN)
+short = bars[-159:]
+dup_s = S[:S.index(short[0].date)] + [short[0].date] + S[S.index(short[0].date):]
+try:
+    run(short, t, sessions=dup_s)
+    dup_passed = True
+except ResearchBarError:
+    dup_passed = False
+check("8-5) [A13-R3 재현] 159개 봉 + 중복 세션으로 HISTORY 160을 통과할 수 없음(입력 오류)", not dup_passed)
+check("8-6) 정상 결과는 NaN·무한대 없이 표준 JSON 직렬화", bool(json.dumps(base.to_dict(), allow_nan=False)))
+check("8-7) 시장 판정에 기준일·지수 식별자 기록", base.market["as_of"] == t.isoformat() and "index_id" in base.market)
+bad_cfg = []
+for kw in ({"pullback_min": 0}, {"pullback_max": 25}, {"stop_atr_buffer": -1.0}, {"entry_cap_atr": float("nan")}):
+    try:
+        S1Config(**kw)
+        bad_cfg.append(False)
+    except ValueError:
+        bad_cfg.append(True)
+check("8-8) 잘못된 설정(0·범위 역전·음수·NaN) 거부", all(bad_cfg))
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")

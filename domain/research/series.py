@@ -12,8 +12,9 @@ from __future__ import annotations
     구분해 UNKNOWN을 돌려줍니다. 앞뒤 봉을 당겨 채우지 않습니다.
 """
 
+import math
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Iterable, Sequence
 
 from domain.research.types import FV
@@ -34,13 +35,18 @@ class ResearchBar:
     trade_value: int | None = None   # 실제 거래대금(원). 원천에 없으면 None
 
     def __post_init__(self) -> None:
+        # A13-R5: 날짜 타입, 유한한 양수 가격, bool이 아닌 정수 수량만 허용
+        if not isinstance(self.date, date) or isinstance(self.date, datetime):
+            raise ResearchBarError(f"date는 date 타입이어야 함 — {self.date!r}")
         for name in ("open", "high", "low", "close"):
             v = getattr(self, name)
-            if not isinstance(v, (int, float)) or isinstance(v, bool) or not v > 0:
-                raise ResearchBarError(f"{self.date}: {name}는 양수여야 함 — {v!r}")
-        if not isinstance(self.volume, int) or self.volume < 0:
+            if (not isinstance(v, (int, float)) or isinstance(v, bool)
+                    or not math.isfinite(v) or not v > 0):
+                raise ResearchBarError(f"{self.date}: {name}는 유한한 양수여야 함 — {v!r}")
+        if not isinstance(self.volume, int) or isinstance(self.volume, bool) or self.volume < 0:
             raise ResearchBarError(f"{self.date}: volume은 0 이상 정수 — {self.volume!r}")
-        if self.trade_value is not None and (not isinstance(self.trade_value, int) or self.trade_value < 0):
+        if self.trade_value is not None and (not isinstance(self.trade_value, int)
+                                             or isinstance(self.trade_value, bool) or self.trade_value < 0):
             raise ResearchBarError(f"{self.date}: trade_value는 0 이상 정수(원) 또는 None — {self.trade_value!r}")
         if self.high < max(self.open, self.close, self.low) or self.low > min(self.open, self.close, self.high):
             raise ResearchBarError(f"{self.date}: 가격 관계 모순")
@@ -57,6 +63,16 @@ def bars_from_daily(daily_bars: Iterable, trade_values: dict[date, int] | None =
                         tv.get(b.date)) for b in daily_bars]
 
 
+def validate_sessions(sessions: Sequence[date], what: str = "sessions") -> None:
+    """A13-R3: 세션 날짜는 date 타입·엄격한 오름차순(중복 없음). 조용히 고치지 않고 오류."""
+    for d in sessions:
+        if not isinstance(d, date) or isinstance(d, datetime):
+            raise ResearchBarError(f"{what}: date 타입이 아님 — {d!r}")
+    for a, b in zip(sessions, list(sessions)[1:]):
+        if b <= a:
+            raise ResearchBarError(f"{what}: 오름차순·중복 없음이 아님 ({a} → {b})")
+
+
 class SeriesView:
     """기준일 t에서 본 한 종목(또는 지수)의 일봉."""
 
@@ -64,6 +80,9 @@ class SeriesView:
         dates = [b.date for b in bars]
         if any(b <= a for a, b in zip(dates, dates[1:])):
             raise ResearchBarError("일봉 날짜가 오름차순·중복 없음이 아님")
+        validate_sessions(sessions)
+        if not isinstance(t, date) or isinstance(t, datetime):
+            raise ResearchBarError(f"기준일 t는 date 타입이어야 함 — {t!r}")
         self.t = t
         self.sessions = [s for s in sessions if s <= t]          # 미래 세션 차단
         self.by_date = {b.date: b for b in bars if b.date <= t}  # 미래 봉 차단
@@ -95,7 +114,7 @@ class SeriesView:
         st = self.status()
         if st:
             return None, st
-        if n <= 0:
+        if not isinstance(n, int) or not isinstance(end_offset, int) or n <= 0 or end_offset < 0:
             return None, "BAD_WINDOW"
         end = self.t_index - end_offset
         start = end - n + 1
@@ -109,6 +128,8 @@ class SeriesView:
                     return None, "INSUFFICIENT_HISTORY"
                 return None, f"DATA_GAP:{d.isoformat()}"
             out.append(b)
+        if len(out) != n:                       # 방어: 세션 검증이 있으므로 도달하지 않음
+            return None, "WINDOW_LENGTH_MISMATCH"
         return out, ""
 
     def fv_window(self, n: int, end_offset: int = 0):

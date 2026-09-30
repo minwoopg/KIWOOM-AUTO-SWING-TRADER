@@ -6,8 +6,14 @@ from __future__ import annotations
 - pattern_pass     : 이력·추세·상대강도·눌림·회복·과열 (가격 패턴)
 - eligibility_pass : 증권 유형·위험 상태·유동성 (종목 자격)
 - market_pass      : 시장 환경 RISK_ON만 PASS (MIXED·RISK_OFF는 FAIL=보류, UNKNOWN은 UNKNOWN)
-- eligible_signal  : 세 묶음 모두 PASS
+- stop_valid       : 참고 손절가가 유효(>0)한가 (A13-R4)
+- eligible_signal  : 네 묶음 모두 PASS — 다음날 확인 후보는 이 값만 봅니다.
+  (INVALID_STOP이면 패턴·자격 결과는 보존하되 최종 후보는 FAIL로 보류)
 각 조건은 PASS/FAIL/UNKNOWN과 값·사유를 남깁니다. 한 조건이 UNKNOWN이어도 나머지는 계산합니다.
+
+기준일 정합 (A13-R1): 종목·지수 View와 시장 판정의 기준일이 모두 같아야 합니다. 다르면
+RS·시장 조건을 UNKNOWN(AS_OF_MISMATCH)으로 두고, 수익률 구간 날짜가 다르면
+SESSION_ALIGNMENT_MISMATCH입니다. market을 넘기지 않으면 index로 직접 판정합니다.
 
 눌림 정의 (8.3)
   p = t-20..t-1 중 고가 최대 봉(동률이면 최근), 조정 구간 = p 다음 봉 ~ t-1 (2~10개),
@@ -23,7 +29,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date
 
 from domain.research import features as F
-from domain.research.market import RISK_ON, UNKNOWN as MKT_UNKNOWN, MarketRegime
+from domain.research.market import RISK_ON, UNKNOWN as MKT_UNKNOWN, MarketRegime, classify_market
 from domain.research.series import SeriesView
 from domain.research.types import FV, Check, Tri, combine, compare
 
@@ -44,6 +50,19 @@ class S1Config:
     max_extension20: float = 2.0
     stop_atr_buffer: float = 0.2
     entry_cap_atr: float = 0.5
+
+    def __post_init__(self) -> None:
+        ints = ("min_history", "min_trade_value_20", "pivot_lookback", "pullback_min", "pullback_max")
+        for name in ints:
+            v = getattr(self, name)
+            if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+                raise ValueError(f"S1Config.{name}는 양의 정수 — {v!r}")
+        for name in ("max_extension20", "stop_atr_buffer", "entry_cap_atr"):
+            v = getattr(self, name)
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not (v == v and abs(v) != float("inf")) or v < 0:
+                raise ValueError(f"S1Config.{name}는 0 이상 유한수 — {v!r}")
+        if self.pullback_min > self.pullback_max or self.pullback_max >= self.pivot_lookback:
+            raise ValueError("pullback_min ≤ pullback_max < pivot_lookback 이어야 함")
 
     def config_hash(self) -> str:
         raw = json.dumps({"strategy": f"{STRATEGY_ID}_{STRATEGY_VERSION}", **asdict(self)}, sort_keys=True)
@@ -68,6 +87,7 @@ class S1Result:
     pattern_pass: Tri = Tri.UNKNOWN
     eligibility_pass: Tri = Tri.UNKNOWN
     market_pass: Tri = Tri.UNKNOWN
+    stop_valid: Tri = Tri.UNKNOWN
     eligible_signal: Tri = Tri.UNKNOWN
     checks: list[Check] = field(default_factory=list)
     market: dict | None = None
@@ -87,7 +107,8 @@ class S1Result:
             "symbol": self.symbol, "signal_date": self.signal_date.isoformat(), "strategy": self.strategy,
             "feature_version": self.feature_version, "config_hash": self.config_hash,
             "pattern_pass": self.pattern_pass.value, "eligibility_pass": self.eligibility_pass.value,
-            "market_pass": self.market_pass.value, "eligible_signal": self.eligible_signal.value,
+            "market_pass": self.market_pass.value, "stop_valid": self.stop_valid.value,
+            "eligible_signal": self.eligible_signal.value,
             "checks": [c.to_dict() for c in self.checks], "market": self.market,
             "pullback": self.pullback, "levels": self.levels, "observations": self.observations,
         }
@@ -137,10 +158,12 @@ def _find_pullback(v: SeriesView, cfg: S1Config) -> tuple[list[Check], dict]:
     return [Check(name, Tri.PASS, len(segment), f"len={n_seg}")], info
 
 
-def evaluate_s1(symbol: str, stock: SeriesView, index: SeriesView, market: MarketRegime,
+def evaluate_s1(symbol: str, stock: SeriesView, index: SeriesView, market: MarketRegime | None,
                 eligibility: Eligibility, cfg: S1Config | None = None) -> S1Result:
     cfg = cfg or S1Config()
     t = stock.t
+    if market is None:
+        market = classify_market(index)
     r = S1Result(symbol, t, config_hash=cfg.config_hash(), market=market.to_dict())
     pattern: list[Check] = []
 
@@ -196,17 +219,15 @@ def evaluate_s1(symbol: str, stock: SeriesView, index: SeriesView, market: Marke
     elig.append(compare("LIQUIDITY_TV20", tv20, ">=", float(cfg.min_trade_value_20)))
 
     # ── 시장 ──
-    if market.state == MKT_UNKNOWN:
+    if index.t != t or market.as_of != t:
+        mk = Check("MARKET_REGIME", Tri.UNKNOWN, market.state,
+                   f"AS_OF_MISMATCH:stock={t.isoformat()},index={index.t.isoformat()},"
+                   f"market={market.as_of.isoformat() if market.as_of else None}")
+    elif market.state == MKT_UNKNOWN:
         mk = Check("MARKET_REGIME", Tri.UNKNOWN, market.state, market.reason)
     else:
         mk = Check("MARKET_REGIME", Tri.PASS if market.state == RISK_ON else Tri.FAIL, market.state,
                    "" if market.state == RISK_ON else "MARKET_HOLD")
-
-    r.checks = pattern + elig + [mk]
-    r.pattern_pass = combine(x.result for x in pattern)
-    r.eligibility_pass = combine(x.result for x in elig)
-    r.market_pass = mk.result
-    r.eligible_signal = combine([r.pattern_pass, r.eligibility_pass, r.market_pass])
 
     # ── 참고 가격 (분석용) ──
     bar_t = stock.bar_at(0)
@@ -217,8 +238,19 @@ def evaluate_s1(symbol: str, stock: SeriesView, index: SeriesView, market: Marke
                     "stop_status": "INVALID_STOP" if stop <= 0 else "OK",
                     "risk_ratio_at_cap": (cap - stop) / cap if stop > 0 else None}
         pb["depth_atr"] = (pb["pivot_high"] - pb["pullback_low"]) / atr14.value if atr14.value > 0 else None
+        stop_check = Check("STOP_VALID", Tri.PASS if stop > 0 else Tri.FAIL, stop,
+                           "" if stop > 0 else "INVALID_STOP(참고 손절가 ≤ 0)")
     else:
-        r.levels = {"stop_status": "UNKNOWN", "reason": atr14.reason if not atr14.ok else "NO_PULLBACK"}
+        why = atr14.reason if not atr14.ok else "NO_PULLBACK"
+        r.levels = {"stop_status": "UNKNOWN", "reason": why}
+        stop_check = Check("STOP_VALID", Tri.UNKNOWN, None, why)
+
+    r.checks = pattern + elig + [mk, stop_check]
+    r.pattern_pass = combine(x.result for x in pattern)
+    r.eligibility_pass = combine(x.result for x in elig)
+    r.market_pass = mk.result
+    r.stop_valid = stop_check.result
+    r.eligible_signal = combine([r.pattern_pass, r.eligibility_pass, r.market_pass, r.stop_valid])
 
     # ── 관찰값 (조건 아님) ──
     ma120_dist = F.ratio(c.value - ma120.value, atr14, what="ATR14") if (c.ok and ma120.ok) else ma120

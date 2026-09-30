@@ -159,38 +159,127 @@ check("7-3b) 상승 후 급락(MA120 아래·MA60 하락 전환) → RISK_OFF �
 check("7-4) 기준일 지수 봉 없음 → UNKNOWN", classify_market(SeriesView(up[:129], S, S[129])).state == UNKNOWN)
 check("7-5) 이력 부족 → UNKNOWN", classify_market(SeriesView(up[:100], S, S[99])).state == UNKNOWN)
 
-# ── 8. 주봉 ─────────────────────────────────────────────────
-fri_holiday = date(2025, 3, 7)                              # 금요일 휴장 가정
+# ── 8. 주봉 (w2: 예정 일정·사용 가능 시각) ──────────────────────
+from datetime import datetime as DT, time as TM  # noqa: E402
+
+from domain.research.weekly import (  # noqa: E402
+    ExplicitWeekSchedule, ScheduleCoverageError, weekly_bars, weekly_trend,
+)
+
+fri_holiday = date(2025, 3, 7)                              # 금요일 휴장(확인된 일정)
 WS = weekdays(date(2025, 1, 6), 300, skip={fri_holiday})
+KNOWN = date(2026, 12, 31)
+FULL = weekdays(date(2025, 1, 6), 600, skip={fri_holiday})
+FULL = [d for d in FULL if d <= KNOWN]
+SCHED = ExplicitWeekSchedule(FULL, [fri_holiday], KNOWN)
 wb = bars_from(WS, [100.0 + i for i in range(300)])
 wed = date(2025, 3, 5)
-weeks_wed = weekly_bars(wb, WS, wed, schedule_known_through=date(2026, 12, 31))
-check("8-1) 수요일 기준: 진행 중인 주 제외 (마지막 완성 주 = 직전 주 금요일)",
+weeks_wed = weekly_bars(wb, SCHED, DT.combine(wed, TM(20, 0)))
+check("8-1) 수요일 저녁: 월·화·수 봉이 다 있어도 진행 중인 주는 제외 (마지막 = 직전 주 금요일)",
       weeks_wed[-1].week_end_session == date(2025, 2, 28))
+try:
+    ExplicitWeekSchedule([d for d in FULL if d <= wed], [fri_holiday], KNOWN)
+    truncated_ok = True
+except ScheduleCoverageError:
+    truncated_ok = False
+check("8-2) [A13-R2 재현] 수요일까지 잘린 세션 목록을 연말까지 안다고 넘기면 오류(수요일을 주 마지막으로 오인 불가)",
+      not truncated_ok)
 thu = date(2025, 3, 6)
-weeks_thu = weekly_bars(wb, WS, thu, schedule_known_through=date(2026, 12, 31))
-check("8-2) 금요일 휴장 주는 목요일 마감에 완성", weeks_thu[-1].week_end_session == thu and weeks_thu[-1].complete)
-check("8-3) 달력이 그 주 끝까지 확정 안 됐으면 완성으로 보지 않음",
-      weekly_bars(wb, WS, thu, schedule_known_through=date(2025, 3, 6))[-1].week_end_session == date(2025, 2, 28))
-wk = [w for w in weeks_thu if w.week_start == date(2025, 2, 24)][0]
-check("8-4) 주봉 OHLC: 시가=첫 세션, 종가=마지막 세션, 거래량 합",
+at = lambda h, m=0: DT.combine(thu, TM(h, m))
+w_close = weekly_bars(wb, SCHED, at(16, 0))
+check("8-3) 금요일 휴장 주: 목요일 마감+30분(16:00)에 완성·사용 가능, 기록 필드 분리",
+      w_close[-1].week_end_session == thu and w_close[-1].complete
+      and w_close[-1].session_closed_at == at(15, 30) and w_close[-1].available_at == at(16, 0)
+      and w_close[-1].availability_basis == "ASSUMED_DELAY")
+check("8-4) 목요일 장중(14:00)에는 그 주 제외", weekly_bars(wb, SCHED, at(14, 0))[-1].week_end_session == date(2025, 2, 28))
+check("8-5) 목요일 마감 직후(15:40, 데이터 확보 여유 전)도 제외 — 장중과 같은 결과",
+      weekly_bars(wb, SCHED, at(15, 40))[-1].week_end_session == date(2025, 2, 28))
+obs = weekly_bars(wb, SCHED, at(17, 0), data_ready_at={thu: at(16, 45)})
+check("8-6) 실제 확보 시각을 주면 OBSERVED(16:45)로 기록, 그 전(16:30)이면 제외",
+      obs[-1].available_at == at(16, 45) and obs[-1].availability_basis == "OBSERVED"
+      and weekly_bars(wb, SCHED, at(16, 30), data_ready_at={thu: at(16, 45)})[-1].week_end_session != thu)
+short = ExplicitWeekSchedule([d for d in FULL if d <= date(2025, 3, 5)], [], date(2025, 3, 2))
+check("8-7) 일정이 확정되지 않은 주는 완성으로 보지 않음",
+      all(w.week_start < date(2025, 3, 3) for w in weekly_bars(wb, short, at(20, 0)) if w.complete))
+wk = [w for w in w_close if w.week_start == date(2025, 2, 24)][0]
+check("8-8) 주봉 OHLC: 시가=첫 세션, 종가=마지막 세션, 거래량 합",
       wk.open == wb[WS.index(date(2025, 2, 24))].open and wk.close == wb[WS.index(date(2025, 2, 28))].close
       and wk.volume == 5000)
 holed = [b for b in wb if b.date != date(2025, 2, 26)]
-wh = weekly_bars(holed, WS, thu, schedule_known_through=date(2026, 12, 31))
-check("8-5) 일봉 빠진 주는 불완전(건너뛰어 압축하지 않음)",
+wh = weekly_bars(holed, SCHED, at(16, 0))
+check("8-9) 일봉 빠진 주는 불완전(건너뛰어 압축하지 않음)",
       any(w.week_start == date(2025, 2, 24) and not w.complete for w in wh))
 t_end = WS[-1]
-full_weeks = weekly_bars(wb, WS, t_end, date(2026, 12, 31))
+as_end = DT.combine(t_end, TM(20, 0))
+full_weeks = weekly_bars(wb, SCHED, as_end)
 tr = weekly_trend(full_weeks)
-check("8-6) 상승 주봉 → UP_PROXY", tr.state == UP_PROXY and tr.slope4w > 0)
+check("8-10) 상승 주봉 → UP_PROXY, 기준 주 사용 가능 시각 기록", tr.state == UP_PROXY and tr.slope4w > 0
+      and tr.available_at is not None)
 dn = bars_from(WS, [1000.0 - i for i in range(300)])
-check("8-7) 하락 주봉 → DOWN_PROXY", weekly_trend(weekly_bars(dn, WS, t_end, date(2026, 12, 31))).state == DOWN_PROXY)
-check("8-8) 34주 안에 불완전 주 → UNKNOWN", weekly_trend(weekly_bars(
-    [b for b in wb if b.date != WS[-10]], WS, t_end, date(2026, 12, 31))).state == "UNKNOWN")
+check("8-11) 하락 주봉 → DOWN_PROXY", weekly_trend(weekly_bars(dn, SCHED, as_end)).state == DOWN_PROXY)
+check("8-12) 34주 안에 불완전 주 → UNKNOWN", weekly_trend(weekly_bars(
+    [b for b in wb if b.date != WS[-10]], SCHED, as_end)).state == "UNKNOWN")
 sma150 = F.sma(SeriesView(wb, WS, t_end), 150).value
-check("8-9) SMA30W와 일봉 SMA150은 다른 표본(값이 다름)", tr.sma30w is not None and tr.sma30w != sma150)
-check("8-10) 주봉 34개 미만 → UNKNOWN", weekly_trend(full_weeks[:33]).state == "UNKNOWN")
+check("8-13) SMA30W와 일봉 SMA150은 다른 표본(값이 다름)", tr.sma30w is not None and tr.sma30w != sma150)
+check("8-14) 주봉 34개 미만 → UNKNOWN", weekly_trend(full_weeks[:33]).state == "UNKNOWN")
+from domain.research.weekly import CalendarWeekSchedule  # noqa: E402
+from utils.trading_calendar import TradingCalendar  # noqa: E402
+
+cal_s = CalendarWeekSchedule(TradingCalendar.load())
+check("8-15) 실제 달력 어댑터: 2026년 추석 주(9/21~25)는 월·화·수 세션, 목·금 휴장 → 마지막 세션 수요일",
+      cal_s.sessions_in_week(date(2026, 9, 21))[-1] == date(2026, 9, 23))
+check("8-16) 달력이 다루지 않는 해는 일정 불명(None)", cal_s.sessions_in_week(date(2019, 1, 7)) is None)
+check("8-17) 특수 운영일 마감 시각 반영(2026-01-02 15:30)", cal_s.close_at(date(2026, 1, 2)) == DT(2026, 1, 2, 15, 30))
+
+# ── 9. A13 경계 (R1·R3·R5) ───────────────────────────────────
+import json  # noqa: E402
+
+from domain.research.series import ResearchBarError as RBE  # noqa: E402
+
+dup = S[:20] + [S[19]] + S[20:40]
+try:
+    SeriesView(bars_from(S[:40], [100.0] * 40), dup, S[39])
+    dup_ok = True
+except RBE:
+    dup_ok = False
+check("9-1) [A13-R3] 중복 세션 목록은 오류(조용히 고치지 않음)", not dup_ok)
+try:
+    SeriesView(bars_from(S[:40], [100.0] * 40), list(reversed(S[:40])), S[39])
+    rev_ok = True
+except RBE:
+    rev_ok = False
+check("9-2) 역순 세션 목록도 오류", not rev_ok)
+vv = SeriesView(bars_from(S[:40], [100.0] * 40), S, S[39])
+check("9-3) 창 인자 음수·0 → BAD_WINDOW", vv.window(0)[1] == "BAD_WINDOW" and vv.window(5, -1)[1] == "BAD_WINDOW")
+bad_vals = []
+for val in (float("inf"), float("nan"), -1.0):
+    try:
+        ResearchBar(S[0], val, val, val, val, 1)
+        bad_vals.append(False)
+    except RBE:
+        bad_vals.append(True)
+check("9-4) [A13-R5] +무한대·NaN·음수 가격 봉 거부", all(bad_vals))
+bool_ok = []
+for kw in ({"volume": True}, {"trade_value": True}):
+    try:
+        ResearchBar(S[0], 1.0, 1.0, 1.0, 1.0, **({"volume": 1} | kw))
+        bool_ok.append(False)
+    except RBE:
+        bool_ok.append(True)
+check("9-5) 거래량·거래대금에 bool 거부", all(bool_ok))
+check("9-6) 정상 주봉 추세 결과는 NaN 없이 표준 JSON 직렬화", bool(json.dumps(tr.to_dict(), allow_nan=False)))
+iv_future = SeriesView(bars_from(S[:120], [2500.0 + i for i in range(120)]), S, S[119])
+sv_past = SeriesView(bars_from(S[:120], [100.0 + i for i in range(120)]), S, S[99])
+check("9-7) [A13-R1] 종목·지수 기준일이 다르면 RS UNKNOWN(AS_OF_MISMATCH)",
+      F.rs(sv_past, iv_future, 60).reason.startswith("AS_OF_MISMATCH"))
+S_missing = [d for d in S if d != S[70]]
+iv_misaligned = SeriesView(bars_from(S_missing[:119], [2500.0 + i for i in range(119)]), S_missing, S[119])
+sv_same = SeriesView(bars_from(S[:120], [100.0 + i for i in range(120)]), S, S[119])
+check("9-8) 기준일은 같아도 수익률 구간 날짜가 다르면 UNKNOWN(SESSION_ALIGNMENT_MISMATCH)",
+      F.rs(sv_same, iv_misaligned, 60).reason == "SESSION_ALIGNMENT_MISMATCH")
+iv_same = SeriesView(bars_from(S[:120], [2500.0 + i for i in range(120)]), S, S[119])
+check("9-9) 같은 기준일·같은 날짜 구간이면 정상 계산",
+      approx(F.rs(sv_same, iv_same, 60).value, (219 / 159 - 1) - (2619 / 2559 - 1)))
 
 print()
 print(f"총 {passed + failed}건 중 통과 {passed}건, 실패 {failed}건")
