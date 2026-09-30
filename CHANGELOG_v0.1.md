@@ -761,4 +761,60 @@ GPT 재검토: R1~R5 주요 수정 확인(회귀 28/28·연구 118/118·동등�
 ### 전달 파일
 - 패치 0001 (feat), 0002 (docs)
 
+## 2026-09-30 — A2-R1~R4·Q-R1·Q-R2: 값 revision·사용 가능 시각, 재수집 검증, 연속조회 계약, state 위험 (GPT 재검토 `166585b`)
+
+### 배경
+GPT 재검토: A2 주요 기능 확인(회귀 29/29·수집 67/67·지표 86/86·S1 47/47·동등성 18/18), 새 문제 4건 + 기존 2건 재현.
+- A2-R1(P1): REBASE한 새 값에 이전 ready_at을 그대로 붙임 → 10/2에 정정한 값을 10/1에 알았던 것처럼 평가 가능.
+  여러 페이지의 수신 시각도 첫 페이지 시각으로 덮음.
+- A2-R2(P1): 변경 감지 후 재수집이 빈 응답·한 행이면 REFETCH_EXTEND로 처리하고 조정 기준일만 새 날짜로 바꿈.
+- A2-R3(P2): cont-yn=Y인데 next-key가 없으면 이력 끝으로 해석, return_code 누락도 성공으로 봄.
+- A2-R4(P2): 빈 state와 state에만 있는 투자주의·환기·경고·단기과열이 현재 자격을 통과.
+- Q-R1(P1): 같은 지수 ID·같은 날짜의 다른 입력으로 만든 시장 캐시가 통과.
+- Q-R2(P1): 최신 종료 주가 다음 주까지 미확보여도 그 주를 지우고 이전 34주로 정상 추세.
+
+### 변경 내용
+| ID | 파일 | 내용 |
+|---|---|---|
+| R1 | `infra/research/store.py` (스키마 r1→r2) | 봉마다 `received_at`(그 페이지 수신 시각)·`available_at`(= max(수신, revision 활성 시각))·`first_ready_at`(기록용). `series_revision`(조정 기준·활성·대체 시각). `research_series(sid, as_of=X)` — X에 활성이던 revision의 available_at ≤ X 봉만. 반환은 `ResearchSeries`(bars·available_at·revision·basis·integrity) |
+| R1 | `infra/research/collector.py` | 행마다 페이지 수신 시각 보존(`FetchedBar`), 새 revision 활성 시각 = 마지막 페이지 수신 시각 |
+| R2 | `store.py`, `collector.py` | `init_series`(새 시계열, 부족해도 저장)와 `replace_series`(기존 시계열, **후보 검증 후** EXTEND/REBASE) 분리. 검증: 비어 있지 않음·저장 마지막 날짜 포함·필요 시작일(또는 저장 첫 날짜) 포함·변경을 발견한 첫 페이지 값 재현. 실패·재수집 조회 실패 → 값·메타 그대로, integrity=REBASE_REQUIRED·VERIFY_FAILED, append 거부, 다음 갱신 때 바로 재수집. update 집계 `failed`(종료 코드 1) |
+| R3 | `infra/research/kiwoom_readonly.py`, `collector.py` | return_code 있고 0, cont-yn Y/N, Y면 next-key 필수. 페이지 안 내림차순·다음 페이지 과거 진행·base_dt 뒤 날짜 없음·키 반복 없음·빈 첫 응답/빈 연속 페이지 금지 → 오류(ERROR, 저장 안 함). 목록 스냅숏도 같은 계약 |
+| R4 | `domain/research/universe.py` (u1→u2) | 빈·공백 state → STATE_MISSING, state 토큰도 위험 범주 전체(관리·정지·투자주의·환기·경고·위험·단기과열·정리매매), 모르는 토큰 → STATE_UNRECOGNIZED. collect는 그대로 |
+| Q-R1 | `domain/research/s1.py` | 외부 시장 판정은 같은 index View로 재계산한 판정과 모든 값이 같을 때만 사용(아니면 MARKET_INPUT_MISMATCH) |
+| Q-R2 | `domain/research/weekly.py` (w3→w4) | 가장 최근 종료 주 미확보는 다음 거래일 0시 전에만 잘라냄(정상 대기). 그 뒤엔 `DATA_NOT_READY:OVERDUE` 자리 → 추세 UNKNOWN. 다음 거래일 모르면 자리 유지 |
+| 도구 | `tools/research_collect.py` | `backfill --recheck-shortfall`(HISTORY_END·PAGE_CAP만 재수집·검증), status에 integrity·VERIFY_FAILED·스키마, update 실패 집계 |
+| 문서 | `docs/research_a_stage.md` | 시각 세 가지·시점 조회·과거는 ASSUMED(가정 분석), 재수집 검증·REBASE_REQUIRED, 첫 페이지 범위 정합 검사 표현, 연속조회 계약, state u2, 시장 캐시 재계산, 최근 주 OVERDUE, NO_TRADES HISTORY UNKNOWN 표현 정정, A4로 넘길 규칙, 기존 DB 이전 방침 |
+
+### 테스트 및 검증
+- `test_research_collect` 66→94건(실측 파일 지정 시 95): 10/1 확보→10/2 정정→10/1 시점 조회 값·S1 결과가 당시와 동일,
+  현재 revision으로는 달라짐, 활성 시각 전후 revision 전환, revision 기록, 페이지별 수신 시각(19:05/19:10)과 19:07 평가 미사용,
+  빈 응답·한 행·페이지 상한 재수집 → 값·조정 기준일·revision 그대로·REBASE_REQUIRED, 그 상태 append 거부, 다음 갱신에
+  정상 재수집 후에만 revision 2, 실패는 failed 집계, 기존 시계열 백필 실패는 ERROR, cont-yn=Y+빈 키·return_code 누락·
+  cont-yn 이상·빈 첫/연속 페이지·키 반복·진행 없음·base_dt 뒤 날짜, 계약 위반 종목 ERROR·재실행 정상, 목록 스냅숏 미저장,
+  빈/공백 state·state-only 위험·모르는 토큰(수집 대상 유지), r1 DB 자동 이전(시각 보수적 이전·revision 행·재오픈·시점 조회).
+  기존 5-8은 "정정 값의 사용 가능 시각 = 새 revision 활성 시각, 최초 확보 시각은 기록으로 보존"으로 수정.
+- `test_research_s1` 47→49(Q-R1 재현·같은 View 캐시 통과), `test_research_features` 86→91(Q-R2 재현·정상 대기·월요일 0시·확보 후 회복·일정 불명).
+- 실측 원문 집계 u2에서도 2,544 / 257 / 2,287 / 84 / 82 그대로.
+- 실제 r1 코드로 만든 DB(열린 백필 작업 포함)를 새 코드로 열어 자동 이전 → 같은 base_dt로 이어서 완료 → 매일 갱신 확인.
+- 변이 확인 16종(정정 값에 이전 시각·시점 조회 무시·첫 페이지 시각 덮기·후보 검증 제거·조회 실패 표시 제거·
+  재검증 중 append·Y+빈 키·return_code 누락·키 반복·진행 검사·빈 연속 페이지·빈 state·state 위험 축소·시장 재계산 제거·
+  최근 주 항상 잘라냄·이전 시 available=fetched) — 모두 새 테스트가 잡음.
+- `run_regression_tests.py --skip test_broker_order_status.py`: 29개 전부 통과. 단타 원본 동등성 18/18. 테스트 후 `git status` 깨끗, `commands/`·`data/` 생성 없음.
+
+### 변경하지 않은 것
+- S1 가격 패턴·임계값, NO_TRADES 정책(f2), 완성 기준 160분(잠정), 주문 경로·운영 원장.
+
+### 기존 DB 처리 방침
+- 새 코드가 `data/research/research.sqlite3`(r1)를 열 때 자동으로 r2로 이전(한 트랜잭션, 한 번만). 열린 백필 작업은 이어서 진행.
+- **이전 전에 옛 버전 수집 프로세스를 끝내야 함**(끝까지 두거나 Ctrl+C). 두 버전이 같은 DB를 동시에 쓰면 옛 프로세스가 오류로 멈춤.
+- r1 시절 HISTORY_END·PAGE_CAP 시계열은 `backfill --recheck-shortfall`로 새 계약에서 다시 받아 검증 가능.
+
+### 다음 작업
+- 사용자: 전체 백필 완료 → 패치 적용(자동 이전) → `status` → 18:10 이후 `update` → `holidays` 후보 확인.
+- 완성 시각 실측(장 마감 후 여러 시각·다음 거래일 대조), A4 스캔(시점 조회·REBASE_REQUIRED·기대 세션 검사·보류 사유 집계).
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (docs)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

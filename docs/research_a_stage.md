@@ -31,25 +31,29 @@ C 전 필수 후속: 원장 정정 도구, ERROR·orphan 종목 guard 이중 차
     - `OBSERVED`(앞으로 쌓는 기록): max(마지막 세션 종료, **그 주 모든 세션 봉의 실제 확보 시각**).
       하나라도 없으면 `READY_TIME_UNKNOWN`, 확보 시각이 그 세션 종료 전이면 `READY_BEFORE_SESSION_CLOSE`
       (장중 미완성 봉) — 둘 다 불완전 주. 30분 가정으로 메우지 않음.
-  * 진행 중인 주는 제외. **끝났지만 입력이 준비 안 된 주는 `DATA_NOT_READY` 불완전 자리로 남김**
-    (가장 최근에 끝난 주 하나만 "아직 도착 전"으로 잘라냄). 중간 주를 빼고 더 오래된 주로 34주를 채우지 않음.
+  * 진행 중인 주는 제외. **끝났지만 입력이 준비 안 된 주는 `DATA_NOT_READY` 불완전 자리로 남김**.
+    가장 최근에 끝난 주 하나만, **다음 거래일 0시 전**이면 "아직 도착 전"(정상 대기)으로 잘라냄. 다음 거래일이
+    시작됐는데도 미확보면 `DATA_NOT_READY:OVERDUE`(장애 지연)로 남아 추세 UNKNOWN. 다음 거래일을 모르면(일정 불명)
+    판단할 수 없으므로 자리를 남김(w4, Q-R2). 중간 주를 빼고 더 오래된 주로 34주를 채우지 않음.
   * 한 주 전체가 예정 휴장이면 항목 없이 다음 주에 `gap_weeks_before`로 기록. `weekly_trend`는 34주 창 안의
     주 시작 간격이 7×(1+gap_weeks_before)일이 아니면 `WEEK_SEQUENCE_GAP`, 불완전 주가 있으면 `INCOMPLETE_WEEK`로 UNKNOWN.
-- **A2 수집기가 넘겨야 할 확보 시각 (A13-Q2)**
-  * 일봉마다 `ready_at` = 그 봉이 **완성 봉으로 처음 들어온 조회 응답의 수신 시각**(Asia/Seoul naive).
-    장중 조회 응답에 포함된 당일 봉(ka10081은 장중에도 당일 봉을 줌)은 완성 봉이 아니므로 ready_at으로 쓰지 않음 —
-    그 세션 종료 후 다시 받은 응답의 시각을 씀. 누락 봉을 나중에 복구하면 복구한 조회 시각이 그 봉의 ready_at.
-  * 저장: 봉 값과 함께 `ready_at`·`run_type`(BACKFILL / FORWARD)을 보존. 한 번 기록한 ready_at은 덮어쓰지 않음.
-  * 평가: FORWARD 기록은 `weekly_bars(..., mode="OBSERVED", data_ready_at={날짜: ready_at})`,
-    BACKFILL 기록은 `mode="ASSUMED_DELAY"`(ready_at 미전달). 한 주에 두 종류가 섞이면 OBSERVED로 계산해
-    백필 봉은 확보 시각 없음 → 불완전으로 처리(가정 시각을 섞지 않음).
+- **A2 수집기가 넘기는 확보 시각 (A13-Q2 → A2-R1에서 정정)** — 값마다 세 가지 시각을 따로 둡니다.
+  * `received_at`: **그 값**(그 revision의 그 날짜 봉)이 들어 있던 응답 페이지의 수신 시각. BACKFILL도 기록.
+    장중 응답의 당일 봉(미완성)은 저장하지 않으므로 이 시각이 될 수 없음.
+  * `available_at` = max(received_at, 그 revision의 활성 시각) — **주봉 OBSERVED의 data_ready_at으로 쓰는 값**.
+    재수집으로 바뀐 값은 새 revision이 활성화된 뒤에만 사용 가능. 누락 봉을 나중에 복구하면 복구 조회 시각.
+  * `first_ready_at`: 그 날짜의 완성 봉을 처음 확보한 시각(모든 revision). **기록용** — 새 값의 사용 가능 시각으로 쓰지 않음.
+  * 평가: 수집 이후 시점(현재·앞으로)은 `research_series(sid, as_of=X)`로 X에 활성이던 revision의 값만 받아
+    `weekly_bars(..., mode="OBSERVED", data_ready_at=available_at)`. 수집 전 과거 시점은 확보 시각이 모두 X 뒤이므로
+    OBSERVED로는 UNKNOWN — 과거 재현은 현재 revision + `mode="ASSUMED_DELAY"`로 하고 **가정 분석**으로 표시.
 - **시장 조건과 지수 원천 (A13-Q1)**
   * 스캐너 기본 경로는 `evaluate_s1(..., market=None)` — RS에 쓴 지수 View로 시장 조건을 직접 계산.
   * 지수 View는 `SeriesView(..., source_id="INDEX:KOSPI:001" / "INDEX:KOSDAQ:101")`처럼 원천 식별자를 붙임.
   * 종목의 당시 소속 시장 지수는 `Eligibility.market_index_id`로 넘김 — 지수 View와 다르면 RS·시장 조건 UNKNOWN
     (`INDEX_NOT_STOCK_MARKET`). 당시 소속을 모르는 백필은 None(가정 표시).
   * 시장 판정을 캐시해 `market=`로 넘길 때는 `MarketRegime.index_id`와 View `source_id`가 둘 다 있고 같아야 함 —
-    아니면 `INDEX_SOURCE_MISMATCH`로 UNKNOWN. `classify_market(view, index_id)`에 View와 다른 식별자를 주면 오류.
+    아니면 `INDEX_SOURCE_MISMATCH`로 UNKNOWN. 이름·날짜가 같아도 **같은 View로 다시 계산한 판정과 모든 값이 같아야**
+    사용(다르면 `MARKET_INPUT_MISMATCH`, Q-R1). `classify_market(view, index_id)`에 View와 다른 식별자를 주면 오류.
 - EMA: 최초 N개 종가 SMA로 시작값 → **추가 5N번 갱신 후부터 유효**(필요 봉 수 6N: EMA20=120, EMA50=300).
   `계산 버전 · 입력 시작일 · 입력 해시 · 평가 기준일 · 기록 시각` 보존.
 - 첫 재접촉 사건: 매 스캔 처음부터 순차 재계산. **사건 ID = 종목 + 시작 사건 날짜 + 규칙 버전**(입력 해시는 별도 필드). 최초 기록 보존.
@@ -64,10 +68,10 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
 | `series.py` | `ResearchBar`(유한한 양수 가격·bool 아닌 정수 수량·실제 거래대금 원/None, 거래량 0 = `no_trades`), `SeriesView`(t 이후 차단, 세션 목록 오름차순·중복 검증, 세션 기준 창, INSUFFICIENT_HISTORY / DATA_GAP / **NO_TRADES** 구분) | — |
 | `features.py` | SMA·기울기·ret·RS·ATR14(단순평균)·extension·close_location·volume_ratio·거래대금 평균·tr_contraction·volume_dryup(t 제외)·high/low252·return_atr·narrow_range7·EMA(6N). f2: 거래 없는 봉 정책 | f2 |
 | `market.py` | UNKNOWN → RISK_OFF → RISK_ON → MIXED 우선순위 | m1 |
-| `universe.py` | 종목 목록 분류(증권 유형·현재 위험 표시 합집합·수집 대상/현재 자격 분리), 정책 버전·해시 | u1 |
+| `universe.py` | 종목 목록 분류(증권 유형·현재 위험 표시 합집합·수집 대상/현재 자격 분리), 정책 버전·해시. u2: 빈 state 보류, state 위험 범주 전체·모르는 토큰 보류 | u2 |
 | `holiday_candidates.py` | 지수 날짜 → 과거 휴장일 후보·추정 이름(사람 확인용 초안) | — |
-| `weekly.py` | 완성 주봉(주 단위 예정 일정, 가정/관측 모드별 사용 가능 시각 — 관측은 주 전체 봉 확보 시각, 불완전·일정 불명·준비 안 된 주 자리 유지, 전체 휴장 주 간격), SMA30W·slope4W(34주 연속성 검사), UP/DOWN_PROXY, 비유한값 UNKNOWN | w3 |
-| `s1.py` | pattern / eligibility / market / **stop_valid** / eligible_signal(네 묶음 모두 PASS) — 다음날 확인 후보는 eligible_signal만 사용. 종목·지수·시장 판정 **기준일 일치 필수**(불일치 AS_OF_MISMATCH, 수익률 구간 날짜 불일치 SESSION_ALIGNMENT_MISMATCH → UNKNOWN). 시장 조건은 기본적으로 같은 지수 View에서 계산, 외부 판정은 원천 식별자 일치 필수(INDEX_SOURCE_MISMATCH / INDEX_NOT_STOCK_MARKET). 조건별 값·사유, 참고 손절가·진입 상한·위험 비율, 관찰값, 결정적 후보 정렬, 설정 검증·해시 | s1_pullback_v0.1 |
+| `weekly.py` | 완성 주봉(주 단위 예정 일정, 가정/관측 모드별 사용 가능 시각 — 관측은 주 전체 봉 확보 시각, 불완전·일정 불명·준비 안 된 주 자리 유지, 전체 휴장 주 간격), SMA30W·slope4W(34주 연속성 검사), UP/DOWN_PROXY, 비유한값 UNKNOWN. w4: 최근 주 장애 지연은 OVERDUE 자리 | w4 |
+| `s1.py` | pattern / eligibility / market / **stop_valid** / eligible_signal(네 묶음 모두 PASS) — 다음날 확인 후보는 eligible_signal만 사용. 종목·지수·시장 판정 **기준일 일치 필수**(불일치 AS_OF_MISMATCH, 수익률 구간 날짜 불일치 SESSION_ALIGNMENT_MISMATCH → UNKNOWN). 시장 조건은 기본적으로 같은 지수 View에서 계산, 외부 판정은 원천 식별자 일치·재계산 값 일치 필수(INDEX_SOURCE_MISMATCH / MARKET_INPUT_MISMATCH / INDEX_NOT_STOCK_MARKET). 조건별 값·사유, 참고 손절가·진입 상한·위험 비율, 관찰값, 결정적 후보 정렬, 설정 검증·해시 | s1_pullback_v0.1 |
 
 ## A2 수집 (`infra/research/`, `tools/research_collect.py`) — 2026-09-30
 
@@ -76,7 +80,7 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
 |---|---|
 | 지수 가격 | ka20006 OHLC 모두 **÷100** (공식 명세: 소수점 뺀 100배 값). KOSPI 실제 값 독립 확인은 별도 |
 | 투자주의·투자주의환기종목 | 초기 S1 후보에서 제외(auditInfo≠정상이면 위험). 원래 값·제외 사유 보존 |
-| 외국기업 | 초기 S1·수집 대상 제외(유형 FOREIGN). 분류 정책 u1(버전·해시)로 기록 |
+| 외국기업 | 초기 S1·수집 대상 제외(유형 FOREIGN). 분류 정책(u2, 버전·해시)으로 기록 |
 
 ### 원천·단위
 - ka10099 종목 목록(mrkt_tp 0/10, 한 페이지에 전체), ka10081 종목 일봉(upd_stkpc_tp=1), ka20006 지수 일봉. 이 셋만 허용.
@@ -88,15 +92,20 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
 ### 수집 대상과 신호 자격 분리 (보완 2)
 - 수집 대상 = 보통주 전체(**현재 위험 표시 종목 포함**) + 지수 2개. 현재 상태로 과거 표본을 고르지 않음.
 - 현재 자격(eligible_now)은 그 스냅숏을 관측한 시점에만 유효. 백필 날짜의 위험 상태는 UNKNOWN.
-- 위험 표시 = auditInfo≠정상 ∪ state 토큰(관리종목·거래정지) ∪ orderWarning≠0. **orderWarning은 원래 숫자로만 기록**
-  (ORDER_WARNING:5 등) — 관리·정지 등으로 번역하지 않음(보완 3). 필드가 없으면 *_MISSING(위험으로 봄).
+- 위험 표시 = auditInfo≠정상 ∪ state 토큰 ∪ orderWarning≠0. **orderWarning은 원래 숫자로만 기록**
+  (ORDER_WARNING:5 등) — 관리·정지 등으로 번역하지 않음(보완 3).
+- state(u2, A2-R4): '|'로 나눈 토큰에 합의한 위험 범주(관리종목·거래정지·투자주의·환기·투자경고·투자위험·단기과열·
+  정리매매)가 있으면 STATE:<토큰>. 정상 토큰(증거금N%·담보대출·신용가능)이 아닌 모르는 토큰은 STATE_UNRECOGNIZED(보류).
+- 필드가 없거나 비어 있거나 공백뿐이면 *_MISSING(보류). 모두 현재 자격만 막고 수집 대상(collect)은 바꾸지 않음.
+  2026-09-30 실측 집계(2,544 / 257 / 2,287)는 u1과 u2가 같음(실측 state 토큰은 모두 정상·관리·정지).
 - 백필 작업에 선정 기준·생존 편향(현재 상장 종목만) 문구를 남김.
 
 ### 거래 없는 봉 (보완 1)
 - 거래량 0인 봉은 원본대로 저장하고 quality=NO_TRADES로 표시(예: 삼성전자 2018-04-30·05-02·05-03, OHLC 53,000).
   거래정지로 단정하지 않음.
 - 계산 정책(feature f2): 기준일이면 NO_TRADES_AT_T(그날 신호·체결 가정 없음), 창 안에 있으면 UNKNOWN(NO_TRADES:<날짜>),
-  EMA 연속 구간도 끊김. → S1은 최근 160세션 안에 거래 없는 봉이 있으면 HISTORY UNKNOWN. 완화는 버전을 올려 별도로.
+  EMA 연속 구간도 끊김. → S1은 최근 160세션 안에 거래 없는 봉이 있으면 **HISTORY 조건이 UNKNOWN**(다른 조건이
+  FAIL이면 최종은 FAIL일 수 있음). A4 보고서에 이 정책 때문에 보류된 종목·사건 수를 따로 집계. 완화는 버전을 올려 별도로.
 - 주봉은 종가 기반 관찰값이라 합산하고 no_trade_days로 표시.
 - 다음날 확인(A5)에서 거래 없는 날의 진입·체결은 가정하지 않음.
 
@@ -119,18 +128,47 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
 - 한 종목은 모든 페이지를 한 번에 받아 한 트랜잭션에 저장 — 중간에 끊기면 그 종목은 저장되지 않음.
 - series에 조정 기준(upd_stkpc_tp·base_dt)·조회 시각·revision, 매일 확인한 기준일(verified_base_dt) 저장.
 - 매일 갱신: 첫 페이지를 오늘 base_dt로 받아 저장분과 겹치는 구간을 비교. **모두 같을 때만** 새 날짜를 FORWARD로 추가.
-  값 변경·날짜 소실·새 날짜 출현이 있으면 새 기준으로 전체를 다시 받아 **통째로 교체**(revision+1), 이전 값은 bar_history에 보존.
-  한 시계열 안에 서로 다른 조정 기준이 섞이지 않음.
+  이것은 **첫 페이지 범위(약 600거래일) 안의 정합 검사**이며, 그보다 오래된 과거 정정까지 확인한 것은 아님
+  (필요하면 별도 주기의 전체 재검증을 둠).
+- 값 변경·날짜 소실·새 날짜 출현이 있으면 새 기준으로 전체를 다시 받고, **후보를 검증한 뒤에만** 교체(A2-R2):
+  비어 있지 않음 · 저장된 마지막 날짜까지 포함 · 필요한 시작일(또는 저장된 첫 날짜)까지 포함 · 변경을 발견한 첫 페이지
+  값과 일치. 통과하면 겹친 값이 같을 때 EXTEND(없는 날짜만 추가), 다르면 REBASE(통째 교체, revision+1, 이전 값 보존).
+- 검증 실패·재수집 조회 실패: 값·조정 기준일·확인 기준일·revision을 **그대로 두고** integrity=REBASE_REQUIRED,
+  VERIFY_FAILED 기록. 정상 갱신으로 세지 않음(update 종료 코드 1). 그 상태에서는 새 날짜를 붙이지 않고(append 거부),
+  다음 갱신 때 바로 전체 재수집을 다시 시도. A4는 REBASE_REQUIRED 시계열을 UNKNOWN으로 다뤄야 함.
+- 새 시계열의 첫 저장(INIT)은 부족해도 받은 만큼 저장(SHORTFALL). 기존 시계열을 다시 받는 백필은 위 검증을 거치며
+  실패하면 SHORTFALL이 아니라 ERROR(REBASE_FAILED).
 - base_dt 고정은 재현성을 위한 기록입니다. 원천이 base_dt와 무관하게 최신 조정을 적용하더라도 일관성은
   "한 종목 = 한 번의 연속 조회" + "매일 겹침 구간 전체 비교"로 보장됩니다(어긋나면 재수집·교체).
 - **수정가격 ≠ 과거 실제 체결가격.** 분할·증자 등으로 과거 가격이 다시 계산된 값이므로, 과거 호가·체결 가능 여부·
   금액 기준(최소 주문금액 등)을 수정가격으로 판단하면 안 됨. 거래대금(원)은 조정되지 않은 실제 금액.
   앞으로 A4가 스캔 당시 관측한 가격을 따로 남기면 나중에 조정 비율로 대조.
 
-### 확보 시각(ready_at)과 run_type
-- BACKFILL 봉: ready_at 없음 → 주봉 ASSUMED_DELAY. FORWARD 봉: ready_at = 완성 봉으로 처음 들어온 응답 수신 시각.
-- 재수집(REBASE) 뒤에도 그 날짜의 run_type·ready_at은 유지(값만 새 기준). 매일 갱신 구간에서 누락됐다가 나중에 나타난
-  봉은 FORWARD·ready_at = 복구 조회 시각 → 그 주 주봉은 복구 뒤에야 사용 가능.
+### 값 revision과 시각 (A2-R1, 저장소 스키마 r2)
+- 수정 기준일(base_dt)·수집 종류(run_type)·실제 값 확보 시각은 서로 다른 정보로 따로 저장.
+- `received_at`(행마다 그 페이지의 수신 시각, BACKFILL 포함) / `available_at`(= max(received_at, revision 활성 시각)) /
+  `first_ready_at`(그 날짜 완성 봉 최초 확보, 기록용). 새 revision의 활성 시각 = 재수집 마지막 페이지 수신 시각.
+- 재수집(REBASE)으로 바뀐 값은 새 revision 활성 전 평가에 쓰이지 않음(10/2에 정정한 값이 10/1 평가에 들어가지 않음).
+  run_type·first_ready_at은 날짜의 이력으로 보존.
+- `research_series(sid, as_of=X)`: X에 활성이던 revision(series_revision)을 골라 available_at ≤ X인 봉만 반환
+  → 10/1 재평가는 이전 값·이전 revision으로 당시와 같은 결과. `as_of=None`은 현재 revision 전체(가정 분석용).
+- 매일 갱신 구간에서 누락됐다가 나중에 나타난 봉은 FORWARD·사용 가능 시각 = 복구 조회 시각.
+- **기존 DB(r1)**: 새 코드가 열 때 자동 이전(한 트랜잭션). r1의 봉별 fetched_at(첫 페이지 수신 시각) → received_at,
+  max(fetched_at, series.updated_at) → available_at(실제보다 늦을 수는 있어도 이르지 않은 보수적 값), ready_at 또는
+  fetched_at → first_ready_at, 현재·이전 판마다 series_revision 행 생성. 열린 백필 작업은 그대로 이어서 진행.
+
+### 응답·연속조회 계약 (A2-R3)
+- return_code가 **있고 0**이어야 성공(누락을 성공으로 보지 않음). cont-yn 헤더는 Y/N, Y이면 next-key 필수.
+- 페이지 안 날짜 엄격한 내림차순, 다음 페이지는 이전 페이지보다 과거, base_dt 뒤 날짜 없음, 다음 키 반복 없음,
+  첫 응답·이어지는 페이지가 비어 있지 않음. 어기면 오류 — 백필 항목 ERROR(재시도 대상), 시계열·스냅숏을 만들거나 바꾸지 않음.
+  정상적인 cont-yn=N 종료만 SOURCE_END(→ LISTED_AFTER_START / HISTORY_END).
+- r1 시절 받은 HISTORY_END·PAGE_CAP 시계열은 `backfill --recheck-shortfall`로 다시 받아 검증할 수 있음.
+
+### A4로 넘길 규칙 (GPT A2 검토 정책 항목)
+- 18:10(정규장 종료+160분)은 확인된 완성 시각이 아닌 잠정 수집 기준 — 장 마감 후 여러 시각·다음 거래일에 같은 날짜
+  OHLCV·거래대금을 대조해 TR이 포함하는 장 구간을 확인.
+- 호출 성공과 최신 날짜 확보는 별개: update가 UNCHANGED/NO_DATA여도 최신 완료 세션이 없을 수 있음. A4는 기대 세션·
+  last_date·available_at·integrity를 검사해 이전 신호를 오늘 신호처럼 재사용하지 않음.
 
 ### 실행 (PowerShell, 레포 루트 — 저장: data/research/research.sqlite3, git 제외)
 1. `python tools/research_collect.py universe` — 목록 스냅숏.
@@ -138,4 +176,5 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
 3. 매일 18:10 이후 `python tools/research_collect.py update` (목록 스냅숏 + 새 봉). 열린 백필 작업의 남은 종목은 건너뜀.
 4. `python tools/research_collect.py holidays` — 2017~2025 휴장일 후보 초안(reports/research/) → 사람이 확인해
    `config/krx_calendar.yaml`에 추가.
-5. `python tools/research_collect.py status` — 스냅숏·작업·커버리지·거래 없는 봉·재수집 횟수.
+5. `python tools/research_collect.py status` — 스냅숏·작업·커버리지·거래 없는 봉·재수집 횟수·integrity·스키마.
+6. (선택) `python tools/research_collect.py backfill --recheck-shortfall` — HISTORY_END·PAGE_CAP 시계열만 다시 받아 검증.
