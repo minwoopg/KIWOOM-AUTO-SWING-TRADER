@@ -713,4 +713,52 @@ GPT 재검토: R1~R5 주요 수정 확인(회귀 28/28·연구 118/118·동등�
 ### 전달 파일
 - 패치 0001 (fix), 0002 (docs)
 
+## 2026-09-30 — A2: 연구 데이터 수집 (목록 스냅숏·재개 가능한 백필·매일 갱신, 조회 전용)
+
+### 배경
+- 사용자 결정(GPT 권고 동의): 지수 OHLC ÷100(공식 명세), 투자주의·투자주의환기종목 초기 S1 제외, 외국기업 초기 S1 제외.
+- GPT A2 보완 여섯 가지: ① 거래량 0 봉 표시·계산 정책 ② 현재 위험 종목도 과거 수집(수집 대상·신호 자격 분리)
+  ③ orderWarning 숫자 번역 금지 ④ 수정주가 기준 저장·혼합 금지 ⑤ 페이지 수가 아닌 날짜로 종료·종목별 부족 사유
+  ⑥ 장중 스냅숏과 완성 데이터 구분(observed_at), 거래대금 반올림 오차 단정 삭제.
+- A1 원시 응답 재계산: 주식 2,740 → 수집 대상 2,544 / 현재 위험 257 / 현재 자격 2,287, state만 관리종목 전체 84(주식 82).
+
+### 변경 내용
+| 구분 | 파일 | 내용 |
+|---|---|---|
+| ① | `domain/research/series.py`, `features.py`(f1→f2), `weekly.py` | `ResearchBar.no_trades`(거래량 0). 기준일이면 NO_TRADES_AT_T, 창 안이면 UNKNOWN(NO_TRADES:날짜), EMA 연속 구간도 끊김. 주봉은 합산하고 `no_trade_days` 표시 |
+| ②③ | `domain/research/universe.py` (u1) | 증권 유형(코드 끝 우선주 추정·스팩·외국기업·ETF/ETN/리츠 등), 위험 표시 합집합(auditInfo·state 토큰·orderWarning 원래 숫자), 필드 없으면 *_MISSING. collect(보통주 전체)와 eligible_now 분리, 정책 버전·해시 |
+| 원천 | `infra/research/kiwoom_readonly.py` | 모의 도메인 전용·허용 TR 3개(ka10099·ka10081·ka20006) 조회 클라이언트. 1초 간격, 429·전송 실패 재시도, 401 재인증 1회 |
+| ①⑥ | `infra/research/kiwoom_rows.py` | 행 해석: 부호 제거, 지수 ÷100, 거래대금 백만원→원, NO_TRADES / INVALID:사유(원래 행 보존), 날짜 불명 행은 RowError |
+| ④ | `infra/research/store.py` (SQLite, `data/research/`) | 날짜별 스냅숏(observed_at·장 단계·정책·원문 gzip), 시계열 조정 기준·revision·verified_base_dt, 겹침 구간이 다르면 통째 교체+bar_history 보존, run_type(BACKFILL/FORWARD)·ready_at, 백필 작업·항목 |
+| ④⑤⑥ | `infra/research/collector.py` | 필요 시작일(2017-01-02) 도달로 종료, LISTED_AFTER_START / HISTORY_END / PAGE_CAP, 작업별 base_dt 고정·종목 단위 트랜잭션·재개, 완성 봉 기준(정규장 종료+160분), 매일 갱신 겹침 비교·재수집, 누락 복구 봉 ready_at = 복구 시각, 열린 백필 종목 건너뜀, 새 상장 INIT |
+| 달력 | `domain/research/holiday_candidates.py` | 지수 날짜 → 과거 휴장일 후보·추정 이름·지수 간 날짜 차이(사람 확인용 초안, 달력 파일은 안 고침) |
+| 도구 | `tools/research_collect.py` | `universe`(프로브 파일 오프라인 확인 포함) · `backfill` · `update` · `status` · `holidays` |
+| 문서 | `docs/research_a_stage.md`, `README.md` | A2 절: 결정·단위·분리 원칙·거래 없는 봉·완성 기준·종료 조건·수정주가(수정가격 ≠ 과거 실제 체결가)·ready_at·실행 순서 |
+
+### 테스트 및 검증
+- 신규 `test_research_collect.py` 66건(실측 파일 지정 시 67건): 삼성전자 2018-04-30 실측 행 NO_TRADES, 지수 ÷100, 거래대금 원 환산,
+  INVALID 사유, 유형·위험 합집합·orderWarning 원래 값·필드 누락, 위험 종목 수집 포함, 도메인·TR 차단, 재시도·재인증,
+  날짜 기준 종료(원천에 더 있어도 5페이지에서 멈춤), 페이지마다 같은 base_dt, 상장 늦음/이력 짧음/상한 구분,
+  장중 12:31 당일 봉 제외·18:10 기준, 중단 후 이틀 뒤 재개(같은 base_dt·DONE 재조회 없음), 트랜잭션 원자성, ERROR 재시도,
+  매일 갱신 FORWARD·ready_at, 장중 값 미저장, 분할 재계산 → REBASE(현재 봉 전부 새 revision·이전 값 보존·ready_at 유지),
+  날짜 소실·누락 복구, 주봉 OBSERVED 연결(FORWARD 주 완성·BACKFILL 섞인 주 불완전·복구 시각 반영), 휴장일 후보(2026 달력과 일치),
+  CLI 흐름, 연구 계층 import 경계, 운영 폴더·달력 파일 불변.
+- `RESEARCH_PROBE_JSONL`로 A1 원시 응답을 지정하면 2,740 / 2,544 / 257 / 2,287 / 84 확인(이번 검증에서 통과).
+- `test_research_features` 78→86(거래 없는 봉 8건, 3-8 갱신), `test_research_s1` 44→47(거래 없는 봉 3건, 버전 f2).
+- 변이 확인 12종(날짜 종료 제거·완성 기준 제거·겹침 확인 제거·REBASE 제거·위험 종목 수집 제외·재개 base_dt 변경·
+  거래 없는 봉 정책 제거·지수 배율 제거·orderWarning 번역·재수집 ready_at 초기화·외국기업 보통주 처리·복구 봉 FORWARD 제거) — 모두 새 테스트가 잡음.
+- `run_regression_tests.py --skip test_broker_order_status.py`: 29개 전부 통과. 단타 원본 동등성 18/18. 테스트 후 `git status` 깨끗, `commands/`·`data/` 생성 없음.
+
+### 변경하지 않은 것
+- S1 임계값·패턴, 운영 브로커·주문 실행부·원장·복구 경로, `config/krx_calendar.yaml`(과거 연도는 사람 확인 후 추가).
+- 운영용 `tools/update_daily_bars.py`·`infra/market_data/`(주문 계좌 설정 기반)는 그대로 — 연구 수집은 별도 경로.
+
+### 다음 작업
+- 실측 순서: `universe` → `backfill --limit 20` 확인 → `backfill` 전부(약 3시간, 재개 가능) → `holidays` 후보 확인·달력 추가.
+- 장 마감 후 시각별(15:40·16:10·18:10) 당일 봉 비교로 완성 기준 160분 조정 여부 확인.
+- A4 스캔·저장·보고: 스냅숏 적용 범위(t일 장 마감 뒤 관측분), 백필 자격(과거 위험 UNKNOWN) 처리, 주봉 지연 값 연결.
+
+### 전달 파일
+- 패치 0001 (feat), 0002 (docs)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
