@@ -273,6 +273,9 @@
       "source_path": "test_minute_bar_diagnostics.py",
       "source_sha256": "1f445a7ebd4d5cc1f8d107cd40dc5790894abf298062f69462b6a394ef9fff7c"
     },
+    "test_multiday_integration.py": {
+      "status": "new"
+    },
     "test_order_executor.py": {
       "status": "new"
     },
