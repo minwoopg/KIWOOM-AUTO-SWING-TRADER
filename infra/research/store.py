@@ -35,9 +35,15 @@ from __future__ import annotations
   → 한 시계열(한 revision) 안에 서로 다른 조정 기준이 섞이지 않음.
 - 수정주가는 과거 실제 체결가격이 아닙니다(분할·증자 등으로 과거 가격이 다시 계산된 값).
 
-r1 → r2 이전: 기존 DB를 열면 자동으로 바꿉니다(한 트랜잭션). r1의 봉별 fetched_at(첫 페이지 수신 시각)을
-received_at으로, max(fetched_at, series.updated_at)을 available_at으로(보수적 — 실제보다 늦을 수는 있어도
-이르지 않음), ready_at 또는 fetched_at을 first_ready_at으로 옮기고, 현재 revision 행을 만듭니다.
+정합성 이력 (series_integrity, r3): 재수집 실패(REBASE_REQUIRED)·복구(OK)를 시각과 함께 남깁니다.
+시점 조회는 그 시각의 상태를 돌려주므로, 나중에 복구돼도 실패 당시 평가는 보류(UNKNOWN)로 재현됩니다.
+
+기존 DB 이전 (열 때 자동, 한 트랜잭션씩)
+- r1 → r2: 봉별 fetched_at(첫 페이지 수신 시각) → received_at, 임시 available_at, revision 행 생성.
+- r2 → r3 (이미 r2로 이전된 DB 포함): r1에서 옮겨 온 판의 활성 시각을 **r1이 저장 때마다 남긴 변경 기록
+  (INIT·REBASE)** 으로 복원하고, 봉 available_at = max(활성 시각, 그 봉 수신 시각 이후 첫 저장 기록 시각)으로
+  다시 계산합니다(첫 페이지 수신 시각을 사용 가능 시각으로 쓰지 않음). revision 구간이 겹치거나 기록이 없어
+  입증할 수 없으면 time_basis=UNPROVEN — 시점 조회에서 보류. 정합성 이력도 VERIFY_FAILED 기록에서 다시 만듭니다.
 """
 
 import gzip
@@ -52,7 +58,10 @@ from typing import Iterable
 from domain.research.series import ResearchBar
 from infra.research.kiwoom_rows import NO_TRADES, RawBar, SourceSpec, to_research_bar
 
-SCHEMA_VERSION = "r2"
+SCHEMA_VERSION = "r3"
+WRITE_EVENTS = ("INIT", "REBASE", "EXTEND", "APPEND")      # 봉을 실제로 저장한 기록
+OBSERVED_TIME, MIGRATED_TIME, UNPROVEN_TIME = "OBSERVED", "MIGRATED", "UNPROVEN"
+NO_REVISION = "NO_REVISION"
 BACKFILL, FORWARD = "BACKFILL", "FORWARD"
 COVERAGE_OK, LISTED_AFTER_START, HISTORY_END, PAGE_CAP = "OK", "LISTED_AFTER_START", "HISTORY_END", "PAGE_CAP"
 PENDING, DONE, SHORTFALL, ERROR = "PENDING", "DONE", "SHORTFALL", "ERROR"
@@ -119,8 +128,16 @@ CREATE TABLE IF NOT EXISTS bar_history(
   superseded_at TEXT NOT NULL, reason TEXT NOT NULL,
   PRIMARY KEY(series_id, revision, date)) WITHOUT ROWID;
 """
-_COLS = ("open_raw, high_raw, low_raw, close_raw, volume, trade_value_raw, quality, run_type, received_at, "
-         "available_at, first_ready_at")
+_COLS_R2 = ("open_raw, high_raw, low_raw, close_raw, volume, trade_value_raw, quality, run_type, received_at, "
+            "available_at, first_ready_at")
+_COLS = _COLS_R2 + ", time_basis"
+_SCHEMA_R3 = """
+CREATE TABLE IF NOT EXISTS series_integrity(
+  log_id INTEGER PRIMARY KEY AUTOINCREMENT, series_id TEXT NOT NULL, at TEXT NOT NULL, status TEXT NOT NULL,
+  detail TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_integrity_series_at ON series_integrity(series_id, at);
+CREATE INDEX IF NOT EXISTS ix_event_series ON series_event(series_id, event_id);
+"""
 
 
 def _ts(dt: datetime | None) -> str | None:
@@ -169,6 +186,7 @@ class StoredBar:
     available_at: datetime
     first_ready_at: datetime
     revision: int
+    time_basis: str = OBSERVED_TIME   # OBSERVED(새 기록) / MIGRATED(이전 버전 기록, 저장 기록으로 시각 복원) / UNPROVEN
 
 
 @dataclass(frozen=True)
@@ -207,16 +225,30 @@ class SeriesMeta:
 
 @dataclass(frozen=True)
 class ResearchSeries:
-    """연구 계산 입력. available_at은 주봉 OBSERVED 모드의 data_ready_at으로 그대로 넘깁니다."""
+    """연구 계산 입력. available_at은 주봉 OBSERVED 모드의 data_ready_at으로 그대로 넘깁니다.
+
+    query_mode : CURRENT(현재 revision 전체 — 가정 분석) / AS_OF(그 시각에 알 수 있던 값)
+    integrity  : 그 시각의 정합성 상태 — OK / REBASE_REQUIRED / NO_REVISION(그 시각엔 시계열 없음).
+                 A4는 OK가 아니면 그 종목·지수 판정을 UNKNOWN으로 둡니다.
+    time_proof : OK / UNPROVEN — 확보 시각을 입증하지 못한 봉이 그 revision에 있으면 UNPROVEN.
+                 AS_OF 조회는 그런 봉을 돌려주지 않고 표시만 하므로, A4는 UNPROVEN이면 보류합니다.
+    revision_info : 조회에 쓴 revision의 기록(조정 기준·활성·대체 시각·사유) — 그 시점의 메타.
+    current_meta  : **현재** 시계열 메타(지금 상태). 과거 시점 판단에 쓰지 않습니다.
+    """
     bars: list[ResearchBar]
     available_at: dict[date, datetime]
     first_ready_at: dict[date, datetime]
     run_type: dict[date, str]
     revision: int | None
     basis: AdjustmentBasis | None
-    integrity: str                  # 현재 조회: series.integrity / 시점 조회: "AS_OF"(당시 활성 revision)
+    query_mode: str
+    integrity: str
+    integrity_detail: str
+    time_proof: str
+    unproven_bars: int
     as_of: datetime | None
-    meta: SeriesMeta = field(repr=False, default=None)
+    revision_info: dict | None = None
+    current_meta: SeriesMeta = field(repr=False, default=None)
 
 
 class ResearchStore:
@@ -230,13 +262,18 @@ class ResearchStore:
         cur = self.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
         if cur is None:
             self.conn.executescript(_SCHEMA_R2)
-            self.conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', ?)", (SCHEMA_VERSION,))
-        elif cur[0] == "r1":
-            self._migrate_r1_to_r2()
-        elif cur[0] != SCHEMA_VERSION:
-            raise RuntimeError(f"연구 저장소 스키마 {cur[0]} ≠ {SCHEMA_VERSION}: {self.path}")
+            self.conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', 'r2')")
+            version = "r2"
         else:
-            self.conn.executescript(_SCHEMA_R2)
+            version = cur[0]
+        if version == "r1":
+            self._migrate_r1_to_r2()
+            version = "r2"
+        if version == "r2":
+            self._upgrade_r2_to_r3()
+            version = "r3"
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(f"연구 저장소 스키마 {version} ≠ {SCHEMA_VERSION}: {self.path}")
 
     def _migrate_r1_to_r2(self) -> None:
         c = self.conn
@@ -251,12 +288,12 @@ class ResearchStore:
                 if stmt.strip():
                     c.execute(stmt)
             c.execute(
-                f"INSERT INTO bar(series_id, date, {_COLS}, revision) SELECT b.series_id, b.date, b.open_raw,"
+                f"INSERT INTO bar(series_id, date, {_COLS_R2}, revision) SELECT b.series_id, b.date, b.open_raw,"
                 " b.high_raw, b.low_raw, b.close_raw, b.volume, b.trade_value_raw, b.quality, b.run_type,"
                 " b.fetched_at, MAX(b.fetched_at, s.updated_at), COALESCE(b.ready_at, b.fetched_at), b.revision"
                 " FROM bar_r1 b JOIN series s ON s.series_id = b.series_id")
             c.execute(
-                f"INSERT INTO bar_history(series_id, revision, date, {_COLS}, superseded_at, reason)"
+                f"INSERT INTO bar_history(series_id, revision, date, {_COLS_R2}, superseded_at, reason)"
                 " SELECT series_id, revision, date, open_raw, high_raw, low_raw, close_raw, volume, trade_value_raw,"
                 " quality, run_type, fetched_at, fetched_at, COALESCE(ready_at, fetched_at), superseded_at, reason"
                 " FROM bar_history_r1")
@@ -267,9 +304,121 @@ class ResearchStore:
                       " adj_base_dt, job_id, 'MIGRATED_R1', updated_at, NULL FROM series")
             c.execute("DROP TABLE bar_r1")
             c.execute("DROP TABLE bar_history_r1")
-            c.execute("UPDATE meta SET value=? WHERE key='schema_version'", (SCHEMA_VERSION,))
+            c.execute("UPDATE meta SET value='r2' WHERE key='schema_version'")
             c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('migrated_from_r1', ?)",
                       (datetime.now().isoformat(timespec="seconds"),))
+
+    # ── r2 → r3: 이전된 판의 시각 복원 + 정합성 이력 ─────────────
+    def _upgrade_r2_to_r3(self) -> None:
+        """A2 2차 재검토 #1·#2. 이미 r2로 이전된 DB도 여기서 보정합니다(한 트랜잭션, 한 번만).
+
+        1. bar·bar_history에 time_basis 열 추가(기존 행 기본값 OBSERVED).
+        2. r1에서 옮겨 온 판(series_revision.reason이 MIGRATED_R1…)은 r1이 저장 때마다 남긴 변경 기록으로 복원:
+           - 활성 시각 = 그 revision을 만든 INIT/REBASE 기록 시각(전체 수집을 마치고 저장한 시각).
+             첫 페이지 수신 시각(r1 fetched_at)이나 MIN(fetched_at)을 쓰지 않습니다.
+           - 대체 시각 = 다음 revision의 활성 시각. 활성 시각이 엄격히 증가하지 않으면(구간 겹침) 두 판 모두 UNPROVEN.
+           - 봉 available_at = max(활성 시각, 그 봉의 수신 시각 이후 첫 저장 기록 시각) → 실제 저장 전에는 쓸 수 없음.
+           - 기록이 없어 입증할 수 없으면 time_basis=UNPROVEN — 시점 조회에서 돌려주지 않고 표시만 합니다.
+        3. series_integrity(정합성 이력)를 VERIFY_FAILED·복구 기록에서 다시 만듭니다.
+        """
+        c = self.conn
+        with self.tx():
+            for table in ("bar", "bar_history"):
+                cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+                if "time_basis" not in cols:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN time_basis TEXT NOT NULL DEFAULT 'OBSERVED'")
+            for stmt in _SCHEMA_R3.split(";"):
+                if stmt.strip():
+                    c.execute(stmt)
+            migrated = [r[0] for r in c.execute(
+                "SELECT DISTINCT series_id FROM series_revision WHERE reason LIKE 'MIGRATED_R1%' ORDER BY series_id")]
+            for sid in migrated:
+                self._repair_migrated_series(sid)
+            for (sid,) in c.execute("SELECT series_id FROM series ORDER BY series_id").fetchall():
+                self._rebuild_integrity_log(sid)
+            c.execute("UPDATE meta SET value=? WHERE key='schema_version'", (SCHEMA_VERSION,))
+            c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_r3', ?)",
+                      (datetime.now().isoformat(timespec="seconds"),))
+
+    def _repair_migrated_series(self, sid: str) -> None:
+        c = self.conn
+        revs = [dict(r) for r in c.execute("SELECT * FROM series_revision WHERE series_id=? ORDER BY revision", (sid,))]
+        events = [(r["at"], r["event"], json.loads(r["detail_json"])) for r in c.execute(
+            "SELECT at, event, detail_json FROM series_event WHERE series_id=? ORDER BY event_id", (sid,))]
+        made: dict[int, str] = {}
+        for at, ev, detail in events:
+            rv = detail.get("revision") if isinstance(detail, dict) else None
+            if ev in ("INIT", "REBASE") and isinstance(rv, int) and not isinstance(rv, bool) and rv not in made:
+                made[rv] = at
+        writes = sorted(at for at, ev, _ in events if ev in WRITE_EVENTS)
+        act, proven, mig = {}, {}, {}
+        for r in revs:
+            rv = r["revision"]
+            mig[rv] = r["reason"].startswith("MIGRATED_R1")
+            if mig[rv]:
+                proven[rv] = rv in made
+                act[rv] = made.get(rv, r["activated_at"])
+            else:
+                proven[rv], act[rv] = True, r["activated_at"]
+        order = [r["revision"] for r in revs]
+        for a, b in zip(order, order[1:]):              # 구간이 겹치면(활성 시각이 증가하지 않으면) 입증 실패
+            if not act[b] > act[a]:
+                proven[a] = proven[b] = False
+        for i, rv in enumerate(order):
+            if not mig[rv]:
+                if i + 1 < len(order):
+                    c.execute("UPDATE series_revision SET superseded_at=? WHERE series_id=? AND revision=?",
+                              (act[order[i + 1]], sid, rv))
+                continue
+            base_reason = revs[i]["reason"].split(":")[0]
+            sup = act[order[i + 1]] if i + 1 < len(order) else None
+            c.execute("UPDATE series_revision SET activated_at=?, superseded_at=?, reason=? WHERE series_id=? AND revision=?",
+                      (act[rv], sup, f"{base_reason}:{'EVENT' if proven[rv] else 'UNPROVEN'}", sid, rv))
+            for table in ("bar", "bar_history"):
+                recvs = [r[0] for r in c.execute(
+                    f"SELECT DISTINCT received_at FROM {table} WHERE series_id=? AND revision=?", (sid, rv))]
+                for recv in recvs:
+                    w = next((t for t in writes if t >= recv), None)
+                    if proven[rv] and w is not None:
+                        c.execute(f"UPDATE {table} SET available_at=?, time_basis=? WHERE series_id=? AND revision=?"
+                                  " AND received_at=?", (max(act[rv], w), MIGRATED_TIME, sid, rv, recv))
+                    else:
+                        c.execute(f"UPDATE {table} SET time_basis=? WHERE series_id=? AND revision=? AND received_at=?",
+                                  (UNPROVEN_TIME, sid, rv, recv))
+
+    def _rebuild_integrity_log(self, sid: str) -> None:
+        c = self.conn
+        if c.execute("SELECT 1 FROM series_integrity WHERE series_id=? LIMIT 1", (sid,)).fetchone():
+            return
+        state = INTEGRITY_OK
+        for r in c.execute("SELECT at, event, detail_json FROM series_event WHERE series_id=? ORDER BY at, event_id",
+                           (sid,)).fetchall():
+            if r["event"] == "VERIFY_FAILED" and state != REBASE_REQUIRED:
+                state = REBASE_REQUIRED
+                c.execute("INSERT INTO series_integrity(series_id, at, status, detail) VALUES(?,?,?,?)",
+                          (sid, r["at"], state, f"REBUILT_FROM_EVENT:{r['detail_json'][:300]}"))
+            elif r["event"] in ("INIT", "REBASE", "EXTEND", "VERIFIED") and state != INTEGRITY_OK:
+                state = INTEGRITY_OK
+                c.execute("INSERT INTO series_integrity(series_id, at, status, detail) VALUES(?,?,?,?)",
+                          (sid, r["at"], state, f"REBUILT_FROM_EVENT:{r['event']}"))
+        cur = c.execute("SELECT integrity, updated_at FROM series WHERE series_id=?", (sid,)).fetchone()
+        if cur is not None and cur["integrity"] != state:          # 기록과 현재 상태가 다르면 현재 상태를 기록(방어)
+            c.execute("INSERT INTO series_integrity(series_id, at, status, detail) VALUES(?,?,?,?)",
+                      (sid, cur["updated_at"], cur["integrity"], "REBUILT_CURRENT_STATE"))
+
+    def _log_integrity(self, series_id: str, at: datetime, status: str, detail: str) -> None:
+        self.conn.execute("INSERT INTO series_integrity(series_id, at, status, detail) VALUES(?,?,?,?)",
+                          (series_id, _ts(at), status, detail[:500]))
+
+    def integrity_at(self, series_id: str, as_of: datetime) -> tuple[str, str]:
+        """그 시각의 정합성 상태 (기록이 없으면 OK)."""
+        r = self.conn.execute("SELECT status, detail FROM series_integrity WHERE series_id=? AND at<=?"
+                              " ORDER BY at DESC, log_id DESC LIMIT 1", (series_id, _ts(as_of))).fetchone()
+        return (r["status"], r["detail"]) if r else (INTEGRITY_OK, "")
+
+    def integrity_log(self, series_id: str) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM series_integrity WHERE series_id=? ORDER BY at, log_id", (series_id,))]
 
     def close(self) -> None:
         self.conn.close()
@@ -355,7 +504,7 @@ class ResearchStore:
         raw = RawBar(date.fromisoformat(r["date"]), r["open_raw"], r["high_raw"], r["low_raw"], r["close_raw"],
                      r["volume"], r["trade_value_raw"], r["quality"])
         return StoredBar(raw, r["run_type"], _dt(r["received_at"]), _dt(r["available_at"]),
-                         _dt(r["first_ready_at"]), r["revision"])
+                         _dt(r["first_ready_at"]), r["revision"], r["time_basis"])
 
     def load_bars(self, series_id: str) -> list[StoredBar]:
         return [self._stored(r) for r in self.conn.execute(
@@ -376,29 +525,43 @@ class ResearchStore:
         return [{**dict(r), "detail": json.loads(r["detail_json"])} for r in self.conn.execute(q + " ORDER BY event_id", a)]
 
     def research_series(self, series_id: str, as_of: datetime | None = None) -> ResearchSeries:
-        """연구 계산 입력. as_of를 주면 그 시각에 활성이던 revision에서 그 시각까지 쓸 수 있던 봉만(A2-R1)."""
+        """연구 계산 입력.
+
+        as_of=None : 현재 revision 전체(가정 분석용). integrity = 현재 상태.
+        as_of=X    : X에 활성이던 revision에서 available_at ≤ X인 봉만(A2-R1). integrity = **X 시각의 상태**
+                     (정합성 이력 series_integrity — 나중에 복구돼도 실패 당시 조회는 REBASE_REQUIRED 그대로).
+                     확보 시각을 입증하지 못한 봉(UNPROVEN)은 돌려주지 않고 time_proof로 표시.
+        """
         meta = self.get_series(series_id)
         if meta is None:
             raise KeyError(series_id)
+        rev_info = None
         if as_of is None:
-            stored, rev, integrity = self.load_bars(series_id), meta.revision, meta.integrity
+            mode = "CURRENT"
+            stored, rev = self.load_bars(series_id), meta.revision
+            integrity, integrity_detail = meta.integrity, meta.integrity_detail
             basis = AdjustmentBasis(meta.adj_upd_stkpc_tp, meta.adj_base_dt)
+            unproven = sum(1 for sb in stored if sb.time_basis == UNPROVEN_TIME)
         else:
+            mode = "AS_OF"
             x = _ts(as_of)
             r = self.conn.execute(
                 "SELECT * FROM series_revision WHERE series_id=? AND activated_at<=? AND"
                 " (superseded_at IS NULL OR superseded_at>?) ORDER BY revision DESC LIMIT 1",
                 (series_id, x, x)).fetchone()
-            integrity = "AS_OF"
             if r is None:
-                return ResearchSeries([], {}, {}, {}, None, None, integrity, as_of, meta)
+                return ResearchSeries([], {}, {}, {}, None, None, mode, NO_REVISION, "그 시각에 활성 revision 없음",
+                                      OBSERVED_TIME, 0, as_of, None, meta)
+            rev_info = dict(r)
             rev, basis = r["revision"], AdjustmentBasis(r["upd_stkpc_tp"], r["base_dt"])
+            integrity, integrity_detail = self.integrity_at(series_id, as_of)
             table = "bar" if rev == meta.revision else "bar_history"
             extra = "" if table == "bar" else " AND revision=?"
-            args = (series_id, x) + (() if table == "bar" else (rev,))
-            stored = [self._stored(q) for q in self.conn.execute(
-                f"SELECT date, {_COLS}, revision FROM {table} WHERE series_id=? AND available_at<=?{extra}"
-                " ORDER BY date", args)]
+            args = (series_id,) + (() if table == "bar" else (rev,))
+            rows = [self._stored(q) for q in self.conn.execute(
+                f"SELECT date, {_COLS}, revision FROM {table} WHERE series_id=?{extra} ORDER BY date", args)]
+            unproven = sum(1 for sb in rows if sb.time_basis == UNPROVEN_TIME)
+            stored = [sb for sb in rows if sb.time_basis != UNPROVEN_TIME and sb.available_at <= as_of.replace(microsecond=0)]
         spec = meta.spec
         bars, avail, first, rtype = [], {}, {}, {}
         for sb in stored:
@@ -407,19 +570,21 @@ class ResearchStore:
                 continue
             bars.append(rb)
             avail[rb.date], first[rb.date], rtype[rb.date] = sb.available_at, sb.first_ready_at, sb.run_type
-        return ResearchSeries(bars, avail, first, rtype, rev, basis, integrity, as_of, meta)
+        return ResearchSeries(bars, avail, first, rtype, rev, basis, mode, integrity, integrity_detail,
+                              UNPROVEN_TIME if unproven else "OK", unproven, as_of, rev_info, meta)
 
     # ── 시계열 쓰기 ──────────────────────────────────────────
     def _insert_bars(self, series_id: str, rows: Iterable[tuple]) -> None:
         self.conn.executemany(
-            f"INSERT INTO bar(series_id, date, {_COLS}, revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            f"INSERT INTO bar(series_id, date, {_COLS}, revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(series_id, *r) for r in rows])
 
     @staticmethod
     def _row(fb: FetchedBar, run_type: str, available: datetime, first_ready: datetime, revision: int) -> tuple:
         b = fb.raw
         return (b.date.isoformat(), b.open_raw, b.high_raw, b.low_raw, b.close_raw, b.volume, b.trade_value_raw,
-                b.quality, run_type, _ts_up(fb.received_at), _ts_up(available), _ts_up(first_ready), revision)
+                b.quality, run_type, _ts_up(fb.received_at), _ts_up(available), _ts_up(first_ready), OBSERVED_TIME,
+                revision)
 
     def _event(self, series_id: str, at: datetime, event: str, detail: dict) -> None:
         self.conn.execute("INSERT INTO series_event(series_id, at, event, detail_json) VALUES(?,?,?,?)",
@@ -466,6 +631,8 @@ class ResearchStore:
                 raise ValueError(f"{series_id}: 이미 봉이 있음 — replace_series로 검증 후 교체")
             meta = self.get_series(series_id)
             revision = meta.revision + 1 if meta else 1
+            if meta and meta.integrity != INTEGRITY_OK:
+                self._log_integrity(series_id, now, INTEGRITY_OK, f"RECOVERED_BY_INIT:{reason}")
             if meta:
                 self.conn.execute("UPDATE series_revision SET superseded_at=? WHERE series_id=? AND revision=?"
                                   " AND superseded_at IS NULL", (_ts_up(activated_at), series_id, meta.revision))
@@ -529,10 +696,13 @@ class ResearchStore:
                 detail = ";".join(problems)
                 self.conn.execute("UPDATE series SET integrity=?, integrity_detail=?, updated_at=? WHERE series_id=?",
                                   (REBASE_REQUIRED, f"{reason}|{detail}"[:500], _ts(now), series_id))
+                self._log_integrity(series_id, now, REBASE_REQUIRED, f"{reason}|{detail}")
                 self._event(series_id, now, "VERIFY_FAILED", {"problems": problems, "reason": reason,
                                                               "candidate_basis": basis.__dict__,
                                                               "candidate_bars": len(candidate)})
                 return {"action": "REBASE_FAILED", "revision": meta.revision, "problems": problems}
+            if meta.integrity != INTEGRITY_OK:               # 재검증 통과 → 정합성 회복 기록
+                self._log_integrity(series_id, now, INTEGRITY_OK, f"RECOVERED:{reason}")
             cand = {fb.date: fb for fb in candidate}
             lo, hi = min(cand), max(cand)
             changed = sorted(d for d in cand if d in old and (old[d].raw.values() != cand[d].raw.values()
@@ -626,6 +796,7 @@ class ResearchStore:
         with self.tx():
             self.conn.execute("UPDATE series SET integrity=?, integrity_detail=?, updated_at=? WHERE series_id=?",
                               (status, detail[:500], _ts(now), series_id))
+            self._log_integrity(series_id, now, status, detail)
             self._event(series_id, now, "VERIFY_FAILED", {"detail": detail[:500], "status": status})
 
     # ── 백필 작업 ────────────────────────────────────────────

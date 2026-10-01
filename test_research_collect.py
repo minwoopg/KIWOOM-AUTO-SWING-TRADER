@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import sqlite3
 import os
 import shutil
@@ -738,6 +739,25 @@ check("10-5) [A2-R2 재현] 재수집이 한 행이면 EXTEND가 아니라 REBAS
       and any(p.startswith("EXPECTED_MISMATCH") for p in r["problems"]) and frozen(st3) == before
       and [sb.raw.close_raw for sb in st3.load_bars(SID) if sb.raw.date == date(2026, 9, 30)][0] == old_0930
       and st3.get_series(SID).adj_base_dt == "20260930")
+ck.t = datetime(2026, 10, 2, 19, 0)                        # 다음 날 정상 재수집으로 복구
+r = col3.update_series(SID, "STOCK", "005930", now=ck)
+q_fail = st3.research_series(SID, as_of=datetime(2026, 10, 1, 20, 0))
+q_before = st3.research_series(SID, as_of=datetime(2026, 9, 30, 20, 0))
+q_after = st3.research_series(SID, as_of=datetime(2026, 10, 2, 20, 0))
+check("14-1) [2차 #2] 9/30 정상 → 10/1 실패 → 10/2 복구 뒤에도 10/1 20:00 시점 조회는 당시 상태 REBASE_REQUIRED",
+      r["action"] == "REFETCH_REBASE" and q_fail.query_mode == "AS_OF" and q_fail.integrity == "REBASE_REQUIRED"
+      and "SHORT_HISTORY" in q_fail.integrity_detail)
+check("14-2) 실패 전(9/30 20:00)·복구 후(10/2 20:00)는 OK, 현재 조회도 OK",
+      q_before.integrity == "OK" and q_after.integrity == "OK" and st3.research_series(SID).integrity == "OK"
+      and st3.research_series(SID).query_mode == "CURRENT")
+check("14-3) 시점 메타와 현재 메타 구분 — 10/1 조회의 revision_info는 revision 1·기준일 20260930, "
+      "current_meta는 revision 2·20261002",
+      q_fail.revision == 1 and q_fail.revision_info["base_dt"] == "20260930" and q_fail.basis.base_dt == "20260930"
+      and q_fail.current_meta.revision == 2 and q_fail.current_meta.adj_base_dt == "20261002"
+      and q_fail.current_meta.integrity == "OK")
+check("14-4) 정합성 이력: 실패 시각·복구 시각 기록",
+      [(x["at"], x["status"]) for x in st3.integrity_log(SID)]
+      == [("2026-10-01T19:00:00", "REBASE_REQUIRED"), ("2026-10-02T19:00:00", "OK")])
 st3.close()
 
 ck, fk, st3, col3 = split_store("r2_cap.sqlite3")
@@ -824,7 +844,7 @@ check("12-3) 정상 토큰(증거금N%·담보대출·신용가능)만 있으면
       classify_row(lrow("123450", "x", state="증거금20%|담보대출|신용가능")).eligible_now
       and UniversePolicy().policy_version.startswith("u2:"))
 
-# ── 13. r1 → r2 저장소 이전 ────────────────────────────────────
+# ── 13. 이전 버전 저장소 이전 (r1 → r2 → r3) ──────────────────────
 R1_DDL = """
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE series(series_id TEXT PRIMARY KEY, kind TEXT NOT NULL, code TEXT NOT NULL, api_id TEXT NOT NULL,
@@ -841,6 +861,8 @@ CREATE TABLE bar_history(series_id TEXT NOT NULL, revision INTEGER NOT NULL, dat
   open_raw INTEGER, high_raw INTEGER, low_raw INTEGER, close_raw INTEGER, volume INTEGER, trade_value_raw INTEGER,
   quality TEXT NOT NULL, run_type TEXT NOT NULL, ready_at TEXT, fetched_at TEXT NOT NULL,
   superseded_at TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(series_id, revision, date)) WITHOUT ROWID;
+CREATE TABLE series_event(event_id INTEGER PRIMARY KEY AUTOINCREMENT, series_id TEXT NOT NULL, at TEXT NOT NULL,
+  event TEXT NOT NULL, detail_json TEXT NOT NULL);
 CREATE TABLE job(job_id TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at TEXT NOT NULL, base_dt TEXT NOT NULL,
   upd_stkpc_tp TEXT NOT NULL, required_from TEXT NOT NULL, max_pages INTEGER NOT NULL,
   snapshot_id INTEGER, status TEXT NOT NULL, params_json TEXT NOT NULL);
@@ -848,46 +870,120 @@ CREATE TABLE job_item(job_id TEXT NOT NULL, series_id TEXT NOT NULL, seq INTEGER
   code TEXT NOT NULL, reg_day TEXT, status TEXT NOT NULL, pages INTEGER NOT NULL, first_date TEXT, last_date TEXT,
   reason TEXT NOT NULL, attempts INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(job_id, series_id)) WITHOUT ROWID;
 """
+MS = "STOCK:005930"
+
+
+def r1_db(path: Path, *, with_events: bool = True, rev2_at: str = "2026-10-01T19:10:00") -> None:
+    """r1 코드가 남기던 그대로: 분할 재계산 두 번(REBASE) + FORWARD 추가 1건.
+    revision 2는 10/1 19:00 첫 페이지 수신 → 19:10 저장(REBASE 기록), revision 3은 10/2 19:00 → 19:10."""
+    con = sqlite3.connect(path)
+    con.executescript(R1_DDL)
+    con.execute("INSERT INTO meta VALUES('schema_version','r1')")
+    con.execute(f"INSERT INTO series VALUES('{MS}','STOCK','005930','ka10081',1,1000000,'SHARES',3,'1','20261002',"
+                "'2026-10-02T19:00:00','j1','20261003','2026-10-03T19:00:00','2026-09-28','2026-10-03','2017-01-02','OK',"
+                "'',0,0,'2026-10-03T19:00:01')")
+    for rev, price, fetched, sup in ((1, 400, "2026-09-30T19:00:00", "2026-10-01T19:10:00"),
+                                     (2, 200, "2026-10-01T19:00:00", "2026-10-02T19:10:00")):
+        for d in ("2026-09-28", "2026-09-29", "2026-09-30") + (("2026-10-01",) if rev == 2 else ()):
+            con.execute(f"INSERT INTO bar_history VALUES('{MS}',?,?,?,?,?,?,1000,1,'','BACKFILL',NULL,?,?,'REBASE')",
+                        (rev, d, price, price + 5, price - 5, price, fetched, sup))
+    for d in ("2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02"):
+        con.execute(f"INSERT INTO bar VALUES('{MS}',?,100,105,95,100,1000,1,'','BACKFILL',NULL,'2026-10-02T19:00:00',3)",
+                    (d,))
+    con.execute(f"INSERT INTO bar VALUES('{MS}','2026-10-03',101,106,96,101,1000,1,'','FORWARD','2026-10-03T19:00:00',"
+                "'2026-10-03T19:00:00',3)")
+    if with_events:
+        for at, ev, det in (("2026-09-30T19:05:00", "INIT", {"revision": 1}),
+                            (rev2_at, "REBASE", {"revision": 2}),
+                            ("2026-10-02T19:10:00", "REBASE", {"revision": 3}),
+                            ("2026-10-03T19:00:01", "APPEND", {"added": 1})):
+            con.execute("INSERT INTO series_event(series_id, at, event, detail_json) VALUES(?,?,?,?)",
+                        (MS, at, ev, json.dumps(det)))
+    con.execute("INSERT INTO job VALUES('j1','BACKFILL','2026-09-30T18:59:00','20260930','1','2017-01-02',8,1,'DONE','{}')")
+    con.execute(f"INSERT INTO job_item VALUES('j1','{MS}',0,'STOCK','005930',NULL,'DONE',4,'2026-09-28',"
+                "'2026-09-30','',1,'2026-09-30T19:05:00')")
+    con.commit()
+    con.close()
+
+
 mdb = TMP / "r1.sqlite3"
-con = sqlite3.connect(mdb)
-con.executescript(R1_DDL)
-con.execute("INSERT INTO meta VALUES('schema_version','r1')")
-con.execute("INSERT INTO series VALUES('STOCK:005930','STOCK','005930','ka10081',1,1000000,'SHARES',2,'1','20260930',"
-            "'2026-09-30T14:13:00','j1','20261001','2026-10-01T19:05:00','2026-09-28','2026-10-01','2017-01-02','OK','',"
-            "0,0,'2026-10-01T19:05:00')")
-for d, rt, ready, fetched in (("2026-09-28", "BACKFILL", None, "2026-09-30T14:13:00"),
-                              ("2026-09-29", "BACKFILL", None, "2026-09-30T14:13:00"),
-                              ("2026-10-01", "FORWARD", "2026-10-01T19:05:00", "2026-10-01T19:05:00")):
-    con.execute("INSERT INTO bar VALUES('STOCK:005930',?,100,110,90,105,1000,1,'',?,?,?,2)", (d, rt, ready, fetched))
-con.execute("INSERT INTO bar_history VALUES('STOCK:005930',1,'2026-09-28',200,220,180,210,500,1,'','BACKFILL',NULL,"
-            "'2026-09-29T20:00:00','2026-09-30T14:13:00','REBASE')")
-con.execute("INSERT INTO job VALUES('j1','BACKFILL','2026-09-30T14:12:47','20260930','1','2017-01-02',8,1,'OPEN','{}')")
-con.execute("INSERT INTO job_item VALUES('j1','STOCK:005930',0,'STOCK','005930',NULL,'DONE',4,'2026-09-28',"
-            "'2026-09-29','',1,'2026-09-30T14:13:00')")
+r1_db(mdb)
+st5 = ResearchStore(mdb)
+revs5 = [(x["revision"], x["activated_at"], x["superseded_at"], x["reason"]) for x in st5.revisions(MS)]
+check("13-1) r1 DB를 열면 r3까지 자동 이전 — 봉·작업 보존, 스키마 r3",
+      st5.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r3"
+      and len(st5.load_bars(MS)) == 6 and len(st5.load_history(MS)) == 7 and st5.job_counts("j1") == {"DONE": 1})
+check("13-2) [2차 #1] 과거 판 활성 시각은 저장 기록(INIT·REBASE) 시각으로 복원 — 첫 페이지 수신 시각 아님, 구간 겹침 없음",
+      revs5 == [(1, "2026-09-30T19:05:00", "2026-10-01T19:10:00", "MIGRATED_R1_HISTORY:EVENT"),
+                (2, "2026-10-01T19:10:00", "2026-10-02T19:10:00", "MIGRATED_R1_HISTORY:EVENT"),
+                (3, "2026-10-02T19:10:00", None, "MIGRATED_R1:EVENT")])
+q1905 = st5.research_series(MS, as_of=datetime(2026, 10, 1, 19, 5))
+check("13-3) [2차 #1 재현] 10/1 19:05(revision 2 첫 페이지 수신 뒤·저장 전) 조회 → revision 1의 가격(400), revision 2 아님",
+      q1905.revision == 1 and {b.close for b in q1905.bars} == {400.0} and q1905.time_proof == "OK")
+check("13-4) 9/30 19:02(첫 페이지 수신 뒤·최초 저장 전)에는 아직 시계열 없음, 10/2 19:05는 revision 2",
+      st5.research_series(MS, as_of=datetime(2026, 9, 30, 19, 2)).integrity == "NO_REVISION"
+      and st5.research_series(MS, as_of=datetime(2026, 10, 2, 19, 5)).revision == 2
+      and len(st5.research_series(MS, as_of=datetime(2026, 10, 2, 19, 5)).bars) == 4)
+mb = {sb.raw.date: sb for sb in st5.load_bars(MS)}
+check("13-5) 봉 사용 가능 시각 = max(판 활성 시각, 수신 뒤 첫 저장 기록) — 재수집 봉 10/2 19:10, FORWARD 추가 봉 19:00:01, "
+      "수신 시각·최초 확보 시각은 원래 값",
+      mb[date(2026, 9, 28)].available_at == datetime(2026, 10, 2, 19, 10)
+      and mb[date(2026, 9, 28)].received_at == datetime(2026, 10, 2, 19, 0)
+      and mb[date(2026, 10, 3)].available_at == datetime(2026, 10, 3, 19, 0, 1)
+      and mb[date(2026, 10, 3)].first_ready_at == datetime(2026, 10, 3, 19, 0)
+      and all(sb.time_basis == "MIGRATED" for sb in mb.values()))
+check("13-6) 이전 판 봉도 같은 규칙(revision 2 봉 = 10/1 19:10)",
+      {h["available_at"] for h in st5.load_history(MS) if h["revision"] == 2} == {"2026-10-01T19:10:00"})
+st5.close()
+st5 = ResearchStore(mdb)
+check("13-7) 다시 열어도 그대로(이전은 한 번만)", [(x["revision"], x["activated_at"]) for x in st5.revisions(MS)]
+      == [(r[0], r[1]) for r in revs5] and len(st5.load_bars(MS)) == 6)
+st5.close()
+
+# 이미 r2로 이전된 DB(이전 버전이 만든 잘못된 시각)도 열 때 보정
+class R2Only(ResearchStore):
+    def _upgrade_r2_to_r3(self) -> None:          # 이전 버전처럼 r2에서 멈춤
+        pass
+
+
+m2 = TMP / "r2_old.sqlite3"
+r1_db(m2)
+R2Only(m2).close()
+con = sqlite3.connect(m2)
+old_rev2 = con.execute(f"SELECT activated_at FROM series_revision WHERE series_id='{MS}' AND revision=2").fetchone()[0]
+con.execute("INSERT INTO series_event(series_id, at, event, detail_json) VALUES(?,?,?,?)",
+            (MS, "2026-10-02T19:00:00", "VERIFY_FAILED", json.dumps({"problems": ["SHORT_HISTORY:x"]})))
 con.commit()
 con.close()
-st5 = ResearchStore(mdb)
-mb = {sb.raw.date: sb for sb in st5.load_bars("STOCK:005930")}
-check("13-1) r1 DB를 열면 자동으로 r2 이전: 봉·작업 보존, 스키마 r2",
-      st5.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r2"
-      and len(mb) == 3 and st5.job_counts("j1") == {"DONE": 1} and st5.get_series("STOCK:005930").integrity == "OK")
-check("13-2) 시각 이전: received_at = 기존 fetched_at, available_at = max(fetched_at, series.updated_at)(보수적), "
-      "first_ready_at = ready_at 또는 fetched_at",
-      mb[date(2026, 9, 28)].received_at == datetime(2026, 9, 30, 14, 13)
-      and mb[date(2026, 9, 28)].available_at == datetime(2026, 10, 1, 19, 5)
-      and mb[date(2026, 9, 28)].first_ready_at == datetime(2026, 9, 30, 14, 13)
-      and mb[date(2026, 10, 1)].first_ready_at == datetime(2026, 10, 1, 19, 5))
-check("13-3) revision 행 생성(현재·이전 판), 이전 판 봉은 bar_history에 시각과 함께",
-      [(x["revision"], x["reason"], x["superseded_at"]) for x in st5.revisions("STOCK:005930")]
-      == [(1, "MIGRATED_R1_HISTORY", "2026-09-30T14:13:00"), (2, "MIGRATED_R1", None)]
-      and st5.load_history("STOCK:005930")[0]["received_at"] == "2026-09-29T20:00:00")
-st5.close()
-st5 = ResearchStore(mdb)
-check("13-4) 다시 열어도 그대로(이전은 한 번만), 시점 조회 동작",
-      len(st5.load_bars("STOCK:005930")) == 3
-      and len(st5.research_series("STOCK:005930", as_of=datetime(2026, 10, 1, 19, 5)).bars) == 3
-      and st5.research_series("STOCK:005930", as_of=datetime(2026, 9, 30, 12, 0)).revision == 1)
-st5.close()
+st6 = ResearchStore(m2)
+check("13-8) 이전 버전 r2 DB는 revision 2 활성 시각이 첫 페이지 수신 시각(10/1 19:00)이었음 → 열면 저장 기록 시각(19:10)으로 보정",
+      old_rev2 == "2026-10-01T19:00:00" and st6.revisions(MS)[1]["activated_at"] == "2026-10-01T19:10:00"
+      and st6.research_series(MS, as_of=datetime(2026, 10, 1, 19, 5)).revision == 1)
+check("13-9) 정합성 이력도 기록(VERIFY_FAILED → 다음 REBASE)에서 복원 — 그 사이 시점 조회는 REBASE_REQUIRED",
+      st6.research_series(MS, as_of=datetime(2026, 10, 2, 19, 5)).integrity == "REBASE_REQUIRED"
+      and st6.research_series(MS, as_of=datetime(2026, 10, 2, 19, 15)).integrity == "OK")
+st6.close()
+
+m3 = TMP / "r1_noevent.sqlite3"
+r1_db(m3, with_events=False)
+st7 = ResearchStore(m3)
+q7 = st7.research_series(MS, as_of=datetime(2026, 10, 3, 20, 0))
+check("13-10) 저장 기록이 없어 시각을 입증할 수 없는 기존 봉은 UNPROVEN — 시점 조회에서 돌려주지 않고 보류 표시",
+      all(sb.time_basis == "UNPROVEN" for sb in st7.load_bars(MS)) and q7.bars == [] and q7.time_proof == "UNPROVEN"
+      and q7.unproven_bars == 6 and st7.research_series(MS).time_proof == "UNPROVEN")
+st7.close()
+
+m4 = TMP / "r1_overlap.sqlite3"
+r1_db(m4, rev2_at="2026-09-30T19:00:00")                     # 기록상 revision 2가 revision 1보다 먼저 — 구간 모순
+st8 = ResearchStore(m4)
+q8 = st8.research_series(MS, as_of=datetime(2026, 10, 1, 19, 5))
+check("13-11) revision 구간이 겹치면(활성 시각이 증가하지 않음) 두 판 모두 UNPROVEN → 그 구간 시점 조회는 보류, "
+      "뒤 판(revision 3)은 정상",
+      [x["reason"] for x in st8.revisions(MS)] == ["MIGRATED_R1_HISTORY:UNPROVEN", "MIGRATED_R1_HISTORY:UNPROVEN",
+                                                   "MIGRATED_R1:EVENT"]
+      and q8.bars == [] and q8.time_proof == "UNPROVEN"
+      and st8.research_series(MS, as_of=datetime(2026, 10, 3, 20, 0)).time_proof == "OK")
+st8.close()
 
 # ── 6. 과거 휴장일 후보 ─────────────────────────────────────
 days = [date(2026, 1, 1) + timedelta(days=i) for i in range(273)]

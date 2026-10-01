@@ -187,6 +187,10 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                        "SELECT integrity, COUNT(*) FROM series GROUP BY integrity")},
                    "verify_failed_events": store.conn.execute(
                        "SELECT COUNT(*) FROM series_event WHERE event='VERIFY_FAILED'").fetchone()[0],
+                   "time_basis": {k: v for k, v in store.conn.execute(
+                       "SELECT time_basis, COUNT(*) FROM bar GROUP BY time_basis")},
+                   "revision_reasons": {k: v for k, v in store.conn.execute(
+                       "SELECT reason, COUNT(*) FROM series_revision GROUP BY reason")},
                    "schema": store.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]}
             print_json(out)
             return 0
