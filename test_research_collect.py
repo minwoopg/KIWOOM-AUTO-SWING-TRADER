@@ -1023,6 +1023,19 @@ codes = [rc.main(["--db", cdb, "universe"], client=cli_client, now=ck, calendar=
          rc.main(["--db", cdb, "holidays", "--out", str(out_yaml)], client=cli_client, now=ck, calendar=CAL)]
 check("7-1) CLI: universe → backfill 일부 → 열린 작업 있으면 --new 거부(2) → 이어서 완료 → status → holidays",
       codes == [0, 0, 2, 0, 0, 0] and out_yaml.exists())
+with ResearchStore(cdb) as cst:
+    n_jobs = cst.conn.execute("SELECT COUNT(*) FROM job").fetchone()[0]
+fk.calls.clear()
+again = rc.main(["--db", cdb, "backfill"], client=cli_client, now=ck, calendar=CAL)
+with ResearchStore(cdb) as cst:
+    n_jobs2 = cst.conn.execute("SELECT COUNT(*) FROM job").fetchone()[0]
+check("7-2) 작업이 끝난 뒤 그냥 backfill을 다시 실행하면 새 전체 작업을 만들지 않음(호출 0회)",
+      again == 0 and n_jobs2 == n_jobs and not fk.calls)
+ck.t = datetime(2026, 10, 1, 19, 0)
+new_job = rc.main(["--db", cdb, "backfill", "--new", "--limit", "1"], client=cli_client, now=ck, calendar=CAL)
+with ResearchStore(cdb) as cst:
+    n_jobs3 = cst.conn.execute("SELECT COUNT(*) FROM job").fetchone()[0]
+check("7-3) 전체를 다시 받을 때만 --new로 새 작업", new_job == 0 and n_jobs3 == n_jobs + 1)
 
 # ── 8. 경계: 연구 수집은 주문·운영 경로와 무관 ─────────────────
 FORBID = ("infra.broker", "app", "domain.service", "domain.position", "domain.risk", "domain.strategy",

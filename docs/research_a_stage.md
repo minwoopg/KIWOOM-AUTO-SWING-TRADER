@@ -181,6 +181,7 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
 ### 실행 (PowerShell, 레포 루트 — 저장: data/research/research.sqlite3, git 제외)
 1. `python tools/research_collect.py universe` — 목록 스냅숏.
 2. `python tools/research_collect.py backfill --limit 20` 시험 → `python tools/research_collect.py backfill` 이어서 전부.
+   작업이 끝난 뒤 `backfill`을 다시 실행하면 아무것도 하지 않음 — 전체를 새로 받을 때만 `--new`.
 3. 매일 18:10 이후 `python tools/research_collect.py update` (목록 스냅숏 + 새 봉). 열린 백필 작업의 남은 종목은 건너뜀.
 4. `python tools/research_collect.py holidays` — 2017~2025 휴장일 후보 초안(reports/research/) → 사람이 확인해
    `config/krx_calendar.yaml`에 추가.

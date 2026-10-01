@@ -5,6 +5,7 @@
     python tools/research_collect.py universe --from-probe logs\\probes\\research_sources_XXXX.jsonl --dry-run
     python tools/research_collect.py backfill --limit 20      # 시험: 20종목만 (작업은 재개 가능)
     python tools/research_collect.py backfill                 # 이어서 전부 (약 2,546종목 × 4~5페이지, 1초 간격 ≈ 3시간)
+        # 끝난 뒤 다시 실행하면 아무것도 하지 않음. 전체를 새로 받을 때만 --new (매일은 update)
     python tools/research_collect.py update                   # 매일 18:10 이후: 목록 스냅숏 + 새 봉 추가
     python tools/research_collect.py status
     python tools/research_collect.py holidays --from-year 2017 --to-year 2025
@@ -68,7 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--limit", type=int)
     b.add_argument("--codes", help="쉼표로 구분한 종목코드만 (새 작업을 만들 때)")
     b.add_argument("--no-index", action="store_true")
-    b.add_argument("--new", action="store_true", help="열린 작업이 없을 때만 새 작업 생성")
+    b.add_argument("--new", action="store_true",
+                   help="새 전체 작업 생성(열린 작업이 없을 때만). 처음 한 번은 없어도 만들어짐")
     b.add_argument("--recheck-shortfall", action="store_true",
                    help="이력이 짧게 끝난 시계열(HISTORY_END·PAGE_CAP)만 새 작업으로 다시 받음(검증 후 교체)")
     up = sub.add_parser("update")
@@ -136,6 +138,12 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                 job_id = open_jobs[0]["job_id"]
                 print(f"열린 작업 이어서: {job_id} (base_dt={open_jobs[0]['base_dt']} 고정) {store.job_counts(job_id)}")
             else:
+                done_jobs = store.conn.execute("SELECT job_id FROM job ORDER BY created_at DESC").fetchall()
+                if done_jobs and not (args.new or args.recheck_shortfall or args.codes):
+                    # 끝난 작업만 있을 때 그냥 backfill을 다시 실행하면 전체를 새로 받지 않음 (약 3시간·1.1만 호출 방지)
+                    print(f"열린 백필 작업 없음 — 마지막 작업 {done_jobs[0][0]} 완료. 새 날짜는 update로 받습니다.\n"
+                          "전체를 정말 다시 받으려면 --new, 짧게 끝난 시계열만은 --recheck-shortfall, 일부 종목은 --codes")
+                    return 0
                 codes = [c.strip() for c in args.codes.split(",")] if args.codes else None
                 sids = None
                 if args.recheck_shortfall:
