@@ -817,4 +817,45 @@ GPT 재검토: A2 주요 기능 확인(회귀 29/29·수집 67/67·지표 86/86�
 ### 전달 파일
 - 패치 0001 (fix), 0002 (docs)
 
+## 2026-10-01 — A2 2차 재검토 #1·#2: 이전된 판의 활성 시각 복원, 시점 조회의 정합성 상태 (GPT 재검토 `e913df1`)
+
+### 배경
+GPT 재검토: 회귀 29/29·수집 95/95·지표 91/91·S1 49/49·동등성 18/18 확인, 응답 계약·state·시장 캐시·OVERDUE 해결 확인.
+A4 시점 재평가에 영향을 주는 P1 2건.
+- #1: r1 → r2 이전에서 보관된 과거 판의 활성 시각을 `MIN(fetched_at)`(첫 페이지 수신 시각)으로, 봉 available_at도 fetched_at으로 둠.
+  revision 2 첫 페이지 10/1 19:00 → 저장 19:10인데 `as_of=10/1 19:05`가 revision 2의 새 가격을 반환, 판 구간도 겹침.
+- #2: `as_of` 조회가 integrity를 항상 "AS_OF"로 돌려주고, 함께 오는 meta.integrity는 현재 값 — 9/30 정상 → 10/1 실패 →
+  10/2 복구 뒤 10/1 재평가에서 당시 보류 상태가 사라짐.
+
+### 변경 내용
+| ID | 파일 | 내용 |
+|---|---|---|
+| #1 | `infra/research/store.py` (스키마 r2→r3) | r1에서 옮겨 온 판의 시각을 **r1이 저장 때마다 남긴 변경 기록**으로 복원: 판 활성 시각 = INIT/REBASE 기록 시각, 대체 시각 = 다음 판 활성 시각, 봉 available_at = max(판 활성, 수신 뒤 첫 저장 기록(INIT·REBASE·EXTEND·APPEND) 시각). 활성 시각이 증가하지 않는(구간 겹침) 판·기록 없는 판은 `time_basis=UNPROVEN` — 시점 조회에서 돌려주지 않고 `time_proof=UNPROVEN` 표시. 봉에 `time_basis`(OBSERVED/MIGRATED/UNPROVEN) |
+| #1 | 같은 파일 | **이미 r2로 이전된 DB도** 열 때 같은 규칙으로 보정(r2→r3, 한 트랜잭션·한 번만). r1 DB는 r1→r2→r3로 이어서 이전 |
+| #2 | 같은 파일 | 정합성 이력 `series_integrity`(재수집 실패 REBASE_REQUIRED·복구 OK를 시각과 함께). `research_series` 반환을 `query_mode`(CURRENT/AS_OF)·`integrity`(그 시각 상태)·`integrity_detail`·`time_proof`·`revision_info`(조회에 쓴 판의 기록)·`current_meta`(현재 메타)로 분리. 그 시각에 판이 없으면 integrity=NO_REVISION. r2→r3에서 VERIFY_FAILED 기록으로 이력 재구성 |
+| 도구 | `tools/research_collect.py` | status에 time_basis·revision 사유별 개수 |
+| 문서 | `docs/research_a_stage.md` | 정합성 이력·시점 조회 반환 구분, 기존 DB 이전 규칙(저장 기록 기반 복원·UNPROVEN 보류·r2 DB 보정) |
+
+### 테스트 및 검증
+- `test_research_collect` 94→105건(실측 파일 지정 시 106): r1 코드가 남기던 형식 그대로 만든 DB(분할 재계산 2회·FORWARD 추가)를
+  열어 r3 이전 — 판 활성 시각 = 저장 기록 시각·구간 겹침 없음, **10/1 19:05(revision 2 첫 페이지 뒤·저장 전) 조회 → revision 1 가격**,
+  9/30 19:02(최초 저장 전) → NO_REVISION, 봉 사용 가능 시각(재수집 봉 = 판 활성, 추가 봉 = 저장 기록), 이전 판 봉 같은 규칙,
+  재오픈 불변, **이전 버전이 만든 r2 DB 보정**(19:00 → 19:10)·정합성 이력 재구성, 기록 없는 DB → UNPROVEN 보류,
+  판 구간 모순 → 두 판 UNPROVEN. 9/30 정상 → 10/1 실패 → 10/2 복구 뒤 **10/1 20:00 조회 = REBASE_REQUIRED**, 실패 전·복구 후 OK,
+  시점 revision_info와 current_meta 구분, 정합성 이력 시각.
+- 실제 r1(166585b)·r2(e913df1) 코드로 만든 DB에서도 확인: 이전 r2는 revision 1 활성 시각이 첫 페이지 수신(19:06)이었고, 새 코드로 열면 저장 기록(19:14)으로 보정.
+- 변이 확인 8종(이전 판 복원 제거·저장 기록 무시·구간 겹침 검사 제거·시점 조회에 현재 정합성·실패/복구 이력 미기록·이력 재구성 제거·UNPROVEN 봉 반환) — 모두 새 테스트가 잡음.
+- 240만 봉 r1 DB 이전 약 7초(사용자 DB 약 600만 봉이면 20초 안팎, 처음 한 번).
+- `run_regression_tests.py --skip test_broker_order_status.py`: 29개 전부 통과. 단타 원본 동등성 18/18. 테스트 후 `git status` 깨끗, `commands/`·`data/` 생성 없음.
+
+### 변경하지 않은 것
+- 수집·재수집 검증·응답 계약·state·시장·주봉 규칙, S1 패턴·임계값, 주문 경로.
+
+### 다음 작업
+- 사용자: 패치 적용 후 `status`로 schema r3·time_basis(MIGRATED/UNPROVEN 개수)·revision 사유 확인 → `update`.
+- A4 스캔: `research_series(as_of=스캔 시각)` + integrity·time_proof·기대 세션 검사, 보류 사유 집계.
+
+### 전달 파일
+- 패치 0001 (fix), 0002 (docs)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

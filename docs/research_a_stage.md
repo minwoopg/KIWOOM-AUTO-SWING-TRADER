@@ -135,7 +135,8 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
   값과 일치. 통과하면 겹친 값이 같을 때 EXTEND(없는 날짜만 추가), 다르면 REBASE(통째 교체, revision+1, 이전 값 보존).
 - 검증 실패·재수집 조회 실패: 값·조정 기준일·확인 기준일·revision을 **그대로 두고** integrity=REBASE_REQUIRED,
   VERIFY_FAILED 기록. 정상 갱신으로 세지 않음(update 종료 코드 1). 그 상태에서는 새 날짜를 붙이지 않고(append 거부),
-  다음 갱신 때 바로 전체 재수집을 다시 시도. A4는 REBASE_REQUIRED 시계열을 UNKNOWN으로 다뤄야 함.
+  다음 갱신 때 바로 전체 재수집을 다시 시도. A4는 REBASE_REQUIRED 시계열을 UNKNOWN으로 다뤄야 하며,
+  시점 재평가에서는 그 시각의 상태(정합성 이력)로 판단함.
 - 새 시계열의 첫 저장(INIT)은 부족해도 받은 만큼 저장(SHORTFALL). 기존 시계열을 다시 받는 백필은 위 검증을 거치며
   실패하면 SHORTFALL이 아니라 ERROR(REBASE_FAILED).
 - base_dt 고정은 재현성을 위한 기록입니다. 원천이 base_dt와 무관하게 최신 조정을 적용하더라도 일관성은
@@ -153,9 +154,16 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
 - `research_series(sid, as_of=X)`: X에 활성이던 revision(series_revision)을 골라 available_at ≤ X인 봉만 반환
   → 10/1 재평가는 이전 값·이전 revision으로 당시와 같은 결과. `as_of=None`은 현재 revision 전체(가정 분석용).
 - 매일 갱신 구간에서 누락됐다가 나중에 나타난 봉은 FORWARD·사용 가능 시각 = 복구 조회 시각.
-- **기존 DB(r1)**: 새 코드가 열 때 자동 이전(한 트랜잭션). r1의 봉별 fetched_at(첫 페이지 수신 시각) → received_at,
-  max(fetched_at, series.updated_at) → available_at(실제보다 늦을 수는 있어도 이르지 않은 보수적 값), ready_at 또는
-  fetched_at → first_ready_at, 현재·이전 판마다 series_revision 행 생성. 열린 백필 작업은 그대로 이어서 진행.
+- **정합성 이력 (스키마 r3)**: 재수집 실패(REBASE_REQUIRED)·복구(OK)를 시각과 함께 `series_integrity`에 남김.
+  `research_series(as_of=X)`는 `query_mode=AS_OF`와 **X 시각의 integrity**를 따로 돌려줌 — 9/30 정상 → 10/1 실패 →
+  10/2 복구 뒤에도 10/1 20:00 조회는 REBASE_REQUIRED(A4는 UNKNOWN으로 보류). 조회에 쓴 revision의 기록은
+  `revision_info`(조정 기준·활성·대체 시각), 지금 상태는 `current_meta` — 과거 판단에 현재 메타를 쓰지 않음.
+- **기존 DB 이전 (열 때 자동, 한 번만)**: r1 → r2 → r3. r1에서 옮겨 온 판은 **r1이 저장 때마다 남긴 변경 기록**으로
+  시각을 복원(2차 재검토 #1): 판 활성 시각 = 그 판을 만든 INIT/REBASE 기록 시각(전체 수집 후 저장한 시각 — 첫 페이지
+  수신 시각이 아님), 대체 시각 = 다음 판 활성 시각, 봉 available_at = max(판 활성 시각, 수신 뒤 첫 저장 기록 시각).
+  활성 시각이 증가하지 않아 구간이 겹치거나 기록이 없어 입증할 수 없는 판·봉은 `time_basis=UNPROVEN` —
+  시점 조회에서 돌려주지 않고 `time_proof=UNPROVEN`으로 보류 표시. **이미 r2로 이전된 DB도 열 때 같은 규칙으로 보정**하고
+  정합성 이력도 VERIFY_FAILED 기록에서 다시 만듦. 열린 백필 작업은 그대로 이어서 진행. 240만 봉 기준 약 7초.
 
 ### 응답·연속조회 계약 (A2-R3)
 - return_code가 **있고 0**이어야 성공(누락을 성공으로 보지 않음). cont-yn 헤더는 Y/N, Y이면 next-key 필수.
