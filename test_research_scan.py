@@ -7,6 +7,8 @@ GPT A4-A 완료 기준: 같은 입력·스캔 시각 재실행 → 같은 판정
 from __future__ import annotations
 
 import ast
+import hashlib
+import json
 import shutil
 import sqlite3
 import sys
@@ -19,7 +21,8 @@ sys.path.insert(0, ".")
 from domain.research.universe import classify_rows, summarize
 from infra.research.kiwoom_rows import INDEX_DAILY, STOCK_DAILY, RawBar
 from infra.research.s1_scanner import S1Scanner, ScanError, expected_session
-from infra.research.scan_store import ABORTED, COMPLETE, FAILED, RUNNING, ScanAbortedError, ScanStore
+from infra.research.scan_store import (ABORTED, COMPLETE, FAILED, RUNNING, ScanAbortedError, ScanStore,
+                                       inspect_final_reset)
 from infra.research.store import AdjustmentBasis, FetchedBar, ResearchStore
 from utils.trading_calendar import TradingCalendar
 
@@ -490,6 +493,76 @@ with ResearchStore(db) as s9:
     n_job2 = s9.conn.execute("SELECT COUNT(*) FROM job").fetchone()[0]
 check("9-3) 실제 조회가 필요할 때는 작업을 만들기 전에 설정 오류를 그대로 알림(종목 ERROR로 남기지 않음)",
       ".env" in raised and n_job2 == n_job)
+
+# ── 11. 이전 버전 관찰 DB(s1) — UNKNOWN이 고정된 대표 기록 (GPT B2) ──────────
+st = build("legacy")
+sc, ss = scanner(st, "legacy")
+first = sc.run(SCAN, now=Clock(datetime(2026, 9, 30, 19, 31)))
+ss.close()
+ldb = TMP / "legacy_scans.sqlite3"
+con = sqlite3.connect(ldb)                  # 이전 버전(f837185)이 남긴 상태: 입력만 정상이면 UNKNOWN도 final=1, 스키마 s1
+con.execute("UPDATE s1_observation SET final=1 WHERE symbol='000600'")
+con.execute("UPDATE s1_eval SET final=1 WHERE symbol='000600'")
+ctx_old = json.loads(con.execute("SELECT context_json FROM scan_run").fetchone()[0])
+ctx_old.pop("final_rule")
+con.execute("UPDATE scan_run SET context_json=?", (json.dumps(ctx_old, ensure_ascii=False),))
+con.execute("DROP TABLE obs_audit")
+con.execute("UPDATE meta SET value='s1' WHERE key='scan_schema'")
+con.commit()
+con.close()
+h_before = hashlib.sha256(ldb.read_bytes()).hexdigest()
+pre = inspect_final_reset(ldb)
+check("11-1) [GPT B2] 읽기 전용 미리 보기: 이전 버전 대표 기록 중 final을 풀 것 1건(UNKNOWN) — DB 그대로",
+      pre["scan_schema"] == "s1" and pre["final_observations"] == 5 and pre["final_to_reset"] == 1
+      and pre["by_signal"] == {"UNKNOWN": 1} and hashlib.sha256(ldb.read_bytes()).hexdigest() == h_before)
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    code_i = rc.main(["--db", str(TMP / "legacy.sqlite3"), "--scan-db", str(ldb), "inspect-unproven"], calendar=CAL)
+out_i = json.loads(buf.getvalue())
+check("11-1b) inspect-unproven(읽기 전용)이 관찰 DB 미리 보기도 함께 출력 — scan_db 풀 기록 1건, 연구 DB(r5)는 재점검 대상 없음"
+      "(시험용 UNPROVEN 1봉은 이전된 판이 아니라 보정 대상 아님), 관찰 DB 그대로",
+      code_i == 0 and out_i["scan_db"]["final_to_reset"] == 1 and out_i["schema"] == "r5"
+      and out_i["recheck_migrated"]["bars"] == 0 and out_i["verdict_bars"] == {"NOT_MIGRATED": 1}
+      and hashlib.sha256(ldb.read_bytes()).hexdigest() == h_before)
+ss = ScanStore(ldb)
+O = {o["symbol"]: o for o in ss.observations("2026-09-30")}
+aud = ss.audit()
+ev_old = {e["symbol"]: e for e in ss.evals(first["run_id"])}
+check("11-2) [GPT B2] 열면 백업 후 s2: UNKNOWN+final=1 대표 기록만 final=0(감사 이력: 바꾸기 전 run·판정·입력 상태), "
+      "PASS·FAIL 확정 기록 4건은 그대로, 당시 실행 판정 행(s1_eval)은 보존",
+      ss.conn.execute("SELECT value FROM meta WHERE key='scan_schema'").fetchone()[0] == "s2"
+      and ss.upgrade_summary["final_reset"] == 1 and ss.upgrade_summary["final_observations"] == 5
+      and O["000600"]["final"] == 0 and O["000600"]["eligible_signal"] == "UNKNOWN"
+      and all(O[s]["final"] == 1 for s in ("000100", "000200", "000300", "100100"))
+      and len(aud) == 1 and aud[0]["action"] == "FINAL_RESET" and aud[0]["before"]["eligible_signal"] == "UNKNOWN"
+      and aud[0]["before"]["run_id"] == first["run_id"] and aud[0]["after"] == {"final": 0}
+      and ev_old["000600"]["final"] == 1
+      and ss.backup_path is not None and len(list(TMP.glob("legacy_scans.sqlite3.bak-s1-*"))) == 1)
+st.replace_series(spec=STOCK_DAILY, series_id="STOCK:000600", code="000600",            # 거래 없는 봉 정정
+                  candidate=[FetchedBar(b, datetime(2026, 10, 1, 8, 0)) for b in pass_bars(UPTO_T)],
+                  basis=AdjustmentBasis("1", "20261001"), activated_at=datetime(2026, 10, 1, 8, 0), job_id=None,
+                  required_from=None, coverage="OK", coverage_detail="", reason="TEST_NO_TRADES_FIX")
+sc = S1Scanner(st, ss, CAL)
+later = sc.run(datetime(2026, 10, 1, 12, 0), now=Clock(datetime(2026, 10, 1, 12, 1)))
+O = {o["symbol"]: o for o in ss.observations("2026-09-30")}
+check("11-3) [GPT B2 재현] 이전 대표 기록 UNKNOWN → 데이터 정정 뒤 최신 스캔 PASS가 대체(대체 1회, 이력 보존), "
+      "확정 기록 4건 유지",
+      O["000600"]["eligible_signal"] == "PASS" and O["000600"]["final"] == 1 and O["000600"]["replaced_count"] == 1
+      and O["000600"]["history"][0]["eligible_signal"] == "UNKNOWN" and O["000600"]["run_id"] == later["run_id"]
+      and later["counts"]["observations"]["kept_final"] == 4 and later["context"]["final_rule"] == "inputs_ok+decided")
+vf = sc.verify(first["run_id"], SCAN)
+check("11-4) 이전 규칙으로 저장된 실행의 재현 검증: 입력·판정·결과는 일치(identical), final 규칙 차이는 따로 1건",
+      vf["identical"] and vf["final_rule_changed"] == 1)
+ss.close()
+ss = ScanStore(ldb)
+check("11-5) 다시 열면 보정·백업 없음(한 번만), 감사 이력 1건 그대로",
+      ss.upgrade_summary is None and ss.backup_path is None and len(ss.audit()) == 1
+      and inspect_final_reset(ldb)["final_to_reset"] == 0)
+ss.close()
+st.close()
 
 # ── 10. 경계 ────────────────────────────────────────────────
 FORBID = ("infra.broker", "app", "domain.service", "domain.position", "domain.risk", "domain.strategy",

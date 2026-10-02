@@ -10,7 +10,7 @@
     python tools/research_collect.py scan                     # S1 스캔만 (지금 시각 기준, 조회 없음)
     python tools/research_collect.py scan --at 2026-10-02T19:30:00 --verify   # 그 시각 스캔 재현·비교
     python tools/research_collect.py status
-    python tools/research_collect.py inspect-unproven         # 읽기 전용: UNPROVEN 봉을 저장 기록과 대조(이전·백업 없음)
+    python tools/research_collect.py inspect-unproven         # 읽기 전용: 시각 보정·관찰 기록 보정 미리 보기(이전·백업 없음)
     python tools/research_collect.py holidays --from-year 2017 --to-year 2025
 
 - 저장: data/research/research.sqlite3 (git 제외). 테스트·수집 모두 commands/·원장과 무관.
@@ -40,7 +40,7 @@ from infra.research.kiwoom_readonly import ReadOnlyResearchClient, ResearchApiEr
 from infra.research.s1_scanner import S1Scanner, ScanError  # noqa: E402
 from infra.research.scan_report import write_report  # noqa: E402
 from infra.research.scan_store import ScanStore  # noqa: E402
-from infra.research.store import ResearchStore  # noqa: E402
+from infra.research.store import SCHEMA_VERSION, ResearchStore  # noqa: E402
 from utils.time_utils import now_local  # noqa: E402
 from utils.trading_calendar import TradingCalendar  # noqa: E402
 
@@ -91,7 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--at", help="스캔 시각(Asia/Seoul, 예 2026-10-02T19:30:00). 기본: 지금")
     sc.add_argument("--verify", action="store_true", help="같은 시각 실행이 이미 있으면 다시 계산해 저장값과 비교")
     sub.add_parser("status")
-    iu = sub.add_parser("inspect-unproven", help="읽기 전용 — 스키마를 올리지 않고 UNPROVEN 봉 점검")
+    iu = sub.add_parser("inspect-unproven", help="읽기 전용 — 스키마를 올리지 않고 UNPROVEN·MIGRATED 봉 재점검, "
+                                                 "관찰 기록 final 보정 미리 보기")
     iu.add_argument("--limit", type=int, default=30)
     h = sub.add_parser("holidays")
     h.add_argument("--from-year", type=int, default=2017)
@@ -155,8 +156,11 @@ def run_scan(args, store: ResearchStore, calendar: TradingCalendar, scan_at: dat
 
     같은 시각 실행이 이미 완료돼 건너뛸 때, 보고서가 없으면(이전 저장 실패·삭제) 저장된 실행으로 보고서만
     다시 만듭니다 — 다시 계산하지 않음 (GPT R4)."""
-    scan_db = args.scan_db or str(Path(args.db).with_name("s1_scans.sqlite3"))
-    with ScanStore(scan_db) as sstore:
+    with ScanStore(_scan_db(args)) as sstore:
+        if sstore.backup_path:
+            print(f"[관찰 저장소 스키마 변경] 바꾸기 전 백업: {sstore.backup_path}")
+        if sstore.upgrade_summary:
+            print(f"[관찰 기록 보정 s2] {json.dumps(sstore.upgrade_summary, ensure_ascii=False)}")
         scanner = S1Scanner(store, sstore, calendar, after_close=timedelta(minutes=args.after_close_min), log=print)
         try:
             res = scanner.run(scan_at, now=now, verify=verify)
@@ -190,6 +194,10 @@ def run_scan(args, store: ResearchStore, calendar: TradingCalendar, scan_at: dat
         return code
 
 
+def _scan_db(args) -> str:
+    return args.scan_db or str(Path(args.db).with_name("s1_scans.sqlite3"))
+
+
 def print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
 
@@ -207,12 +215,14 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
 
     if args.cmd == "inspect-unproven":            # 읽기 전용 — ResearchStore를 열지 않음(자동 이전·백업 없음)
         from infra.research.store_inspect import inspect_unproven
-        print_json(inspect_unproven(args.db, limit=args.limit))
+        print_json(inspect_unproven(args.db, limit=args.limit, scan_db=_scan_db(args)))
         return 0
 
     with ResearchStore(args.db) as store:
         if store.backup_path:
             print(f"[저장소 스키마 변경] 바꾸기 전 백업: {store.backup_path}")
+        if store.upgrade_summary:
+            print(f"[시각 재점검 {SCHEMA_VERSION}] {json.dumps(store.upgrade_summary, ensure_ascii=False)}")
         if client is None:
             client = _LazyClient(lambda: make_client(args))
         required_from = (date.fromisoformat(args.required_from) if args.cmd == "backfill"

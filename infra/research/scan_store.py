@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""S1 관찰 기록 저장소 (A4-A, SQLite — 기본 data/research/s1_scans.sqlite3, git 제외). 스키마 s1.
+"""S1 관찰 기록 저장소 (A4-A, SQLite — 기본 data/research/s1_scans.sqlite3, git 제외). 스키마 s2.
 
 수집 저장소(research.sqlite3)와 파일을 나눕니다 — 수집 DB를 다시 만들거나 이전해도 관찰 기록은 그대로 남습니다.
 
@@ -13,8 +13,15 @@ from __future__ import annotations
                    사전(zdict) 압축 JSON — 사전은 codec 표에 함께 저장. 입력 해시는 열로.
                    실행 공통 증거(지수 revision·스냅숏·세션·버전·스캔 시각)는 scan_run.context에 한 번만.
 - s1_observation : 신호 ID = 전략·설정 해시·종목·신호일(**입력 해시는 넣지 않음**)마다 대표 판정 하나.
-                   final(데이터·지수·스냅숏 모두 정상이고 판정이 PASS/FAIL로 정해진 실행의 판정)은 **절대 바꾸지 않음** — 이후 정정 데이터나
-                   새 스냅숏이 들어와도 그대로. final이 아닌 기록(보류·UNKNOWN)만 더 늦은 스캔 시각의 실행이 대체(이력 보존).
+                   final(`final_rule`: 데이터·지수·스냅숏 모두 정상이고 판정이 PASS/FAIL로 정해진 실행의 판정)은
+                   **절대 바꾸지 않음** — 이후 정정 데이터나 새 스냅숏이 들어와도 그대로. final이 아닌 기록(보류·UNKNOWN)만
+                   더 늦은 스캔 시각의 실행이 대체(이력 보존).
+- obs_audit      : 대표 기록을 실행이 아닌 이유로 고친 이력(s2). 바꾸기 전·후 값과 사유.
+
+기존 DB 이전 (열 때 자동, 바꾸기 전에 같은 폴더에 백업 `<파일>.bak-s1-<시각>`)
+- s1 → s2 (GPT B2): 이전 버전(f837185)은 입력만 정상이면 UNKNOWN 판정도 final=1로 고정했습니다. 대표 기록 중
+  현재 규칙(`final_rule`)을 만족하지 않는 final=1을 final=0으로 풀고 obs_audit에 남깁니다 → 이후 정해진 판정으로
+  대체될 수 있음. PASS·FAIL로 확정된 대표 기록은 그대로. 실행·종목별 판정(scan_run·s1_eval)은 당시 그대로 보존.
 
 원자성: 종목별 판정·대표 기록·COMPLETE 표시를 한 트랜잭션에 씁니다. 도중에 끊기면 아무것도 남지 않고 실행은
 RUNNING으로 남아 다음 실행이 ABORTED로 정리합니다. COMPLETE 표시는 `status='RUNNING'`인 행에만 하므로,
@@ -29,8 +36,18 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-SCAN_SCHEMA = "s1"
+from infra.research.store import sqlite_backup
+
+SCAN_SCHEMA = "s2"
 RUNNING, COMPLETE, FAILED, ABORTED = "RUNNING", "COMPLETE", "FAILED", "ABORTED"
+FINAL_RULE = "inputs_ok+decided"       # 실행 context에 기록 — 이 규칙 전(f837185) 실행과 구분
+
+
+def final_rule(data_status: str, index_status: str, snapshot_status: str, eligible_signal: str) -> int:
+    """확정(final): 종목·지수·스냅숏 입력이 모두 정상이고 판정이 PASS/FAIL로 정해진 경우만 (GPT R3·B2).
+    UNKNOWN(거래 없는 봉·이력 부족 등)은 이후 실행의 정해진 판정으로 대체될 수 있어야 함."""
+    return int(data_status == "OK" and index_status == "OK" and snapshot_status == "OK"
+               and eligible_signal in ("PASS", "FAIL"))
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -58,6 +75,9 @@ CREATE TABLE IF NOT EXISTS s1_observation(
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS ix_obs_date ON s1_observation(signal_date, eligible_signal);
 CREATE TABLE IF NOT EXISTS codec(name TEXT PRIMARY KEY, zdict BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS obs_audit(
+  audit_id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id TEXT NOT NULL, at TEXT NOT NULL, action TEXT NOT NULL,
+  before_json TEXT NOT NULL, after_json TEXT NOT NULL, reason TEXT NOT NULL);
 """
 
 # 판정 본문 압축용 사전(zdict) — 결과 JSON의 키·조건 이름을 미리 알려 행마다 압축률을 높입니다(약 1/4).
@@ -103,21 +123,90 @@ def signal_id(strategy: str, config_hash: str, symbol: str, signal_date: str) ->
     return f"S1|{strategy}|{config_hash}|{symbol}|{signal_date}"
 
 
+_RESET_SELECT = (
+    "SELECT o.signal_id, o.run_id, o.scan_at, o.eligible_signal, o.data_status, e.index_status, e.snapshot_status"
+    " FROM s1_observation o LEFT JOIN s1_eval e ON e.run_id = o.run_id AND e.symbol = o.symbol WHERE o.final = 1"
+    " ORDER BY o.signal_id")
+
+
+def _needs_reset(r) -> bool:
+    """대표 기록의 final=1이 현재 규칙을 만족하지 않음(실행 판정 행이 없으면 입력 상태를 알 수 없으므로 풂)."""
+    return r["index_status"] is None or not final_rule(r["data_status"], r["index_status"], r["snapshot_status"],
+                                                       r["eligible_signal"])
+
+
+def inspect_final_reset(path: str | Path) -> dict:
+    """읽기 전용: 다음 열기(s1 → s2) 때 final을 풀 대표 기록 수 — DB를 바꾸지 않음."""
+    conn = sqlite3.connect(f"file:{Path(path).as_posix()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute("SELECT value FROM meta WHERE key='scan_schema'").fetchone()
+        rows = conn.execute(_RESET_SELECT).fetchall()
+        reset = [r for r in rows if _needs_reset(r)]
+        by_signal: dict[str, int] = {}
+        for r in reset:
+            by_signal[r["eligible_signal"]] = by_signal.get(r["eligible_signal"], 0) + 1
+        return {"scan_schema": cur[0] if cur else None, "final_observations": len(rows),
+                "final_to_reset": len(reset), "by_signal": by_signal,
+                "note": "s1이면 다음 열기 때 이 기록들의 final을 풂(감사 이력 남김). s2면 이미 끝남 — 0이어야 정상."}
+    finally:
+        conn.close()
+
+
 class ScanStore:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, backup_before_upgrade: bool = True) -> None:
+        """기존 DB의 스키마를 올려야 하면, 바꾸기 전에 같은 폴더에 백업(<파일>.bak-<옛 버전>-<시각>)을 만듭니다."""
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         self.path = str(p)
+        self.backup_path: str | None = None
+        self.upgrade_summary: dict | None = None
         self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
         cur = self.conn.execute("SELECT value FROM meta WHERE key='scan_schema'").fetchone()
         if cur is None:
             self.conn.execute("INSERT INTO meta(key, value) VALUES('scan_schema', ?)", (SCAN_SCHEMA,))
+        elif cur[0] == "s1":
+            if backup_before_upgrade:
+                self.backup_path = sqlite_backup(self.conn, self.path, "s1")
+            self._upgrade_s1_to_s2()
         elif cur[0] != SCAN_SCHEMA:
             raise RuntimeError(f"관찰 저장소 스키마 {cur[0]} ≠ {SCAN_SCHEMA}: {self.path}")
         self.conn.execute("INSERT OR IGNORE INTO codec(name, zdict) VALUES(?, ?)", (CODEC, ZDICT_V1))
         self._zdict = {r[0]: bytes(r[1]) for r in self.conn.execute("SELECT name, zdict FROM codec")}
+
+    def _upgrade_s1_to_s2(self) -> None:
+        """GPT B2: 이전 버전이 고정한 'UNKNOWN + final=1' 대표 기록을 final=0으로 (감사 이력과 함께, 한 트랜잭션).
+
+        현재 규칙(`final_rule`)을 대표 기록의 실행 판정 행(s1_eval)에 다시 적용해 만족하지 않는 것만 풉니다.
+        PASS·FAIL로 확정된 기록은 그대로. scan_run·s1_eval(당시 실행 기록)은 바꾸지 않습니다."""
+        now = _ts(datetime.now())
+        reason = "S2_FINAL_RULE: 입력 정상 + 판정 PASS/FAIL만 확정 — 이전 버전(f837185)이 고정한 보류 판정을 풂 (GPT B2)"
+        with self.tx():
+            rows = self.conn.execute(_RESET_SELECT).fetchall()
+            reset = [r for r in rows if _needs_reset(r)]
+            for r in reset:
+                before = {k: r[k] for k in ("run_id", "scan_at", "eligible_signal", "data_status", "index_status",
+                                             "snapshot_status")} | {"final": 1}
+                self.conn.execute("INSERT INTO obs_audit(signal_id, at, action, before_json, after_json, reason)"
+                                  " VALUES(?,?,?,?,?,?)",
+                                  (r["signal_id"], now, "FINAL_RESET", json.dumps(before, ensure_ascii=False),
+                                   json.dumps({"final": 0}), reason))
+                self.conn.execute("UPDATE s1_observation SET final=0, updated_at=? WHERE signal_id=?",
+                                  (now, r["signal_id"]))
+            summary = {"from": "s1", "at": now, "final_observations": len(rows), "final_reset": len(reset)}
+            self.conn.execute("UPDATE meta SET value=? WHERE key='scan_schema'", (SCAN_SCHEMA,))
+            self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_s2', ?)",
+                              (json.dumps(summary, ensure_ascii=False),))
+        self.upgrade_summary = summary
+
+    def audit(self, signal_id: str | None = None) -> list[dict]:
+        q, a = "SELECT * FROM obs_audit", ()
+        if signal_id:
+            q, a = q + " WHERE signal_id=?", (signal_id,)
+        return [{**dict(r), "before": json.loads(r["before_json"]), "after": json.loads(r["after_json"])}
+                for r in self.conn.execute(q + " ORDER BY audit_id", a)]
 
     def _pack(self, obj) -> bytes:
         co = zlib.compressobj(9, zdict=self._zdict[CODEC])

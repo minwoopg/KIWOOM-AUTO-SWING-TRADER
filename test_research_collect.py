@@ -536,6 +536,10 @@ check("5-3) 장중 값(거래량 절반)은 한 번도 저장되지 않음 — �
       last.raw.volume == int(fk._rows("000660", date(2026, 10, 1))[0]["trde_qty"]))
 check("5-4) 겹친 구간이 같으면 확인 기준일(verified_base_dt) 갱신, 조정 기준 revision 유지",
       st.get_series("STOCK:000660").verified_base_dt == "20261001" and st.get_series("STOCK:000660").revision == 1)
+ap = [json.loads(r_["detail_json"]) for r_ in st.conn.execute(
+    "SELECT detail_json FROM series_event WHERE series_id='STOCK:000660' AND event='APPEND'")]
+check("5-4b) [GPT B1] 새 APPEND 기록에는 판(revision)을 적음 — 저장 근거를 판별로 확인",
+      len(ap) == 1 and ap[0].get("revision") == 1 and ap[0]["added"] == 1)
 r = col.update_series("STOCK:005930", "STOCK", "005930", now=ck)
 col.update_series("INDEX:KOSPI:001", "INDEX", "001", now=ck)
 fwd_1001 = st.load_bars("STOCK:005930")[-1]
@@ -910,8 +914,8 @@ mdb = TMP / "r1.sqlite3"
 r1_db(mdb)
 st5 = ResearchStore(mdb)
 revs5 = [(x["revision"], x["activated_at"], x["superseded_at"], x["reason"]) for x in st5.revisions(MS)]
-check("13-1) r1 DB를 열면 r4까지 자동 이전 — 봉·작업 보존, 스키마 r4",
-      st5.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r4"
+check("13-1) r1 DB를 열면 r5까지 자동 이전 — 봉·작업 보존, 스키마 r5",
+      st5.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r5"
       and len(st5.load_bars(MS)) == 6 and len(st5.load_history(MS)) == 7 and st5.job_counts("j1") == {"DONE": 1})
 check("13-2) [2차 #1] 과거 판 활성 시각은 저장 기록(INIT·REBASE) 시각으로 복원 — 첫 페이지 수신 시각 아님, 구간 겹침 없음",
       revs5 == [(1, "2026-09-30T19:05:00", "2026-10-01T19:10:00", "MIGRATED_R1_HISTORY:EVENT"),
@@ -945,7 +949,7 @@ class R2Only(ResearchStore):
     def _upgrade_r2_to_r3(self) -> None:          # 이전 버전처럼 r2에서 멈춤
         pass
 
-    def _upgrade_r3_to_r4(self) -> None:
+    def _recheck_migrated_times(self, from_version: str) -> None:
         pass
 
 
@@ -1030,9 +1034,9 @@ check("13-14) [GPT R2] 읽기 전용 점검: UNPROVEN 봉을 저장 기록과 �
       and not list(TMP.glob("r1_samesec.sqlite3.bak-r3-*")))
 st9 = ResearchStore(m5)
 bb = {sb.raw.date: sb for sb in st9.load_bars(MS)}
-check("13-13) 이미 r3로 바뀐 DB: 열면 r4로 다시 계산 — 근거 있는 같은 초 봉만 MIGRATED, 근거 없는 봉(다른 revision 기록 포함)은 "
+check("13-13) 이미 r3로 바뀐 DB: 열면 r5로 다시 계산 — 근거 있는 같은 초 봉만 MIGRATED, 근거 없는 봉(다른 revision 기록 포함)은 "
       "UNPROVEN 유지(일괄 해제 안 함), r3 뒤 새로 저장한 OBSERVED 봉은 그대로",
-      st9.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r4"
+      st9.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r5"
       and bb[date(2026, 10, 5)].time_basis == "MIGRATED" and bb[date(2026, 10, 6)].time_basis == "OBSERVED"
       and bb[date(2026, 10, 6)].available_at == datetime(2026, 10, 6, 19, 0)
       and bb[date(2026, 10, 7)].time_basis == "UNPROVEN" and bb[date(2026, 10, 8)].time_basis == "UNPROVEN"
@@ -1049,6 +1053,79 @@ check("13-16) 이미 최신이면 다시 백업하지 않음", st9.backup_path i
       and sorted(p.name.split(".bak-")[1][:2] for p in TMP.glob("r1_samesec.sqlite3.bak-*")) == ["r1", "r2", "r3"])
 # ↑ 스키마를 올린 세 번(r1 열기·r2 열기·r3 열기)마다 한 번씩만
 st9.close()
+
+# 판 귀속 (GPT B1): 저장 근거는 그 봉과 같은 판의 기록만 — revision 없는 예전 APPEND는 기록 순서·활성 구간으로 귀속
+from infra.research.store import attribute_writes, revision_timeline  # noqa: E402
+
+ev_b1 = [("2026-09-30T19:05:00", "INIT", {"revision": 1}),
+         ("2026-10-01T19:00:00", "APPEND", {"added": 1}),                 # rev1 구간 안 → rev1
+         ("2026-10-02T19:10:00", "APPEND", {"added": 1}),                 # 다음 판 활성과 같은 초(경계) → 모호
+         ("2026-10-02T19:10:00", "REBASE", {"revision": 2}),
+         ("2026-10-03T19:00:00", "APPEND", {"added": 1}),                 # rev2
+         ("2026-10-04T19:00:00", "APPEND", {"revision": 2, "added": 1}),  # 새 기록: revision 명시
+         ("2026-10-05T19:00:00", "REBASE", {"bars": 3}),                  # revision 없는 활성 기록 → 이후 모호
+         ("2026-10-06T19:00:00", "APPEND", {"added": 1})]
+tl_b1 = revision_timeline([{"revision": 1, "reason": "MIGRATED_R1_HISTORY", "activated_at": "2026-09-30T19:00:00"},
+                           {"revision": 2, "reason": "FORWARD_MISMATCH", "activated_at": "2026-10-02T19:10:00"}], ev_b1)
+aw = [(w.revision, w.source) for w in attribute_writes(ev_b1, tl_b1)]
+aw0 = [(w.revision, w.source) for w in attribute_writes([("2026-09-30T19:00:00", "APPEND", {}),
+                                                          ("2026-09-30T19:05:00", "INIT", {"revision": 1})], tl_b1)]
+check("13-17) [GPT B1] 저장 기록의 판 귀속: revision이 적힌 기록은 그대로, 예전 APPEND는 바로 앞 INIT·REBASE의 판(활성 구간 안), "
+      "다음 판 활성과 같은 초·앞 활성 기록 없음·revision 없는 활성 기록 뒤는 모호(근거 아님)",
+      aw == [(1, "EXPLICIT"), (1, "ORDER"), (None, "UNATTRIBUTED:AT_OR_AFTER_NEXT_REVISION"), (2, "EXPLICIT"),
+             (2, "ORDER"), (2, "EXPLICIT"), (None, "UNATTRIBUTED:ACTIVATION_WITHOUT_REVISION"),
+             (None, "UNATTRIBUTED:ACTIVATION_WITHOUT_REVISION")]
+      and aw0 == [(None, "UNATTRIBUTED:NO_PRIOR_REVISION"), (1, "EXPLICIT")])
+
+# GPT 재현: 끝난 판(revision 2, 10/2 19:10 종료)의 봉이 자기 판 저장 근거 없이 다음 판(revision 3)의 APPEND(10/3 19:00:01)로
+# 입증되던 문제. r2 시절 DB → 점검(읽기 전용) → 열기(r5)
+m6 = TMP / "r1_b1.sqlite3"
+r1_db(m6)
+R2Only(m6).close()
+con = sqlite3.connect(m6)
+con.execute(f"INSERT INTO bar_history(series_id, revision, date, open_raw, high_raw, low_raw, close_raw, volume,"
+            f" trade_value_raw, quality, run_type, received_at, available_at, first_ready_at, superseded_at, reason)"
+            f" VALUES('{MS}',2,'2026-10-02',200,205,195,200,1000,1,'','FORWARD','2026-10-02T18:00:00',"
+            "'2026-10-02T18:00:00','2026-10-02T18:00:00','2026-10-02T19:10:00','REBASE')")
+con.commit()
+con.close()
+st10 = ResearchStore(m6)
+h10 = {(h["revision"], h["date"]): h for h in st10.load_history(MS)}
+b10 = {sb.raw.date: sb for sb in st10.load_bars(MS)}
+check("13-18) [GPT B1 재현] 다음 판의 revision 없는 APPEND로 끝난 판의 봉을 입증하지 않음 — revision 2의 10/2 봉은 UNPROVEN "
+      "(이전: MIGRATED·available_at 10/3 19:00:01). 그 APPEND가 속한 revision 3의 봉(10/3)은 그대로 입증",
+      h10[(2, "2026-10-02")]["time_basis"] == "UNPROVEN" and h10[(2, "2026-10-02")]["available_at"] != "2026-10-03T19:00:01"
+      and b10[date(2026, 10, 3)].time_basis == "MIGRATED"
+      and b10[date(2026, 10, 3)].available_at == datetime(2026, 10, 3, 19, 0, 1)
+      and st10.research_series(MS, as_of=datetime(2026, 10, 2, 19, 5)).time_proof == "UNPROVEN")
+# 이미 r4로(이전 규칙으로) 보정된 DB: 그 봉이 MIGRATED·10/3 19:00:01로 남아 있던 상태
+st10.conn.execute("UPDATE bar_history SET time_basis='MIGRATED', available_at='2026-10-03T19:00:01'"
+                  " WHERE series_id=? AND revision=2 AND date='2026-10-02'", (MS,))
+st10.conn.execute("UPDATE meta SET value='r4' WHERE key='schema_version'")
+st10.close()
+h_before = hashlib.sha256(m6.read_bytes()).hexdigest()
+ins6 = inspect_unproven(m6)
+rc6 = ins6["recheck_migrated"]
+check("13-19) [GPT B1] 읽기 전용 점검이 r4에서 잘못 입증된 봉을 미리 보여 줌(보정과 같은 판정 함수) — MIGRATED→UNPROVEN 1봉, "
+      "나머지 MIGRATED는 그대로, 귀속 불가 기록 0. DB 해시 그대로·백업 없음",
+      ins6["schema"] == "r4" and rc6["MIGRATED->UNPROVEN"] == 1 and rc6["available_at_changed"] == 0
+      and rc6["unchanged"] == rc6["bars"] - 1 and rc6["rows"][0]["verdict"] == "NO_EVIDENCE"
+      and rc6["rows"][0]["available_at"] == "2026-10-03T19:00:01" and ins6["unattributed_writes"] == {}
+      and hashlib.sha256(m6.read_bytes()).hexdigest() == h_before and not list(TMP.glob("r1_b1.sqlite3.bak-r4-*")))
+st10 = ResearchStore(m6)
+h10 = {(h["revision"], h["date"]): h for h in st10.load_history(MS)}
+check("13-20) [GPT B1] r4 DB를 열면 백업 후 r5 재점검 — 잘못 입증된 봉만 UNPROVEN, 바뀐 봉 수를 집계(meta·출력)",
+      st10.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r5"
+      and h10[(2, "2026-10-02")]["time_basis"] == "UNPROVEN"
+      and st10.upgrade_summary["from"] == "r4" and st10.upgrade_summary["MIGRATED->UNPROVEN"] == 1
+      and "available_at_changed" not in str(st10.upgrade_summary)
+      and json.loads(st10.conn.execute("SELECT value FROM meta WHERE key='recheck_r5'").fetchone()[0])[
+          "MIGRATED->UNPROVEN"] == 1
+      and len(list(TMP.glob("r1_b1.sqlite3.bak-r4-*"))) == 1)
+st10.close()
+st10 = ResearchStore(m6)
+check("13-21) 다시 열면 재점검·백업 없음", st10.upgrade_summary is None and st10.backup_path is None)
+st10.close()
 
 # ── 6. 과거 휴장일 후보 ─────────────────────────────────────
 days = [date(2026, 1, 1) + timedelta(days=i) for i in range(273)]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""연구 데이터 저장소 (A2, SQLite 한 파일 — 기본 data/research/research.sqlite3, git 제외). 스키마 r2.
+"""연구 데이터 저장소 (A2, SQLite 한 파일 — 기본 data/research/research.sqlite3, git 제외). 스키마 r5.
 
 담는 것
 - universe_snapshot / universe_row : 날짜별 종목 목록. `snapshot_date`와 **`observed_at`(실제 조회 시각)**,
@@ -44,8 +44,13 @@ from __future__ import annotations
   (INIT·REBASE)** 으로 복원하고, 봉 available_at = max(활성 시각, 그 봉 수신 시각 이후 첫 저장 기록 시각)으로
   다시 계산합니다(첫 페이지 수신 시각을 사용 가능 시각으로 쓰지 않음). revision 구간이 겹치거나 기록이 없어
   입증할 수 없으면 time_basis=UNPROVEN — 시점 조회에서 보류. 정합성 이력도 VERIFY_FAILED 기록에서 다시 만듭니다.
-- r3 → r4: 같은 초 규칙으로 다시 계산(저장 기록 시각은 초 내림·수신 시각은 초 올림이라 최대 1초 앞서 보일 수 있음).
-  r3에서 한 페이지짜리 짧은 시계열의 새 봉이 UNPROVEN으로 잘못 남던 것을 바로잡음(MIGRATED·UNPROVEN 봉만).
+- r3·r4 → r5: 이전된 판의 MIGRATED·UNPROVEN 봉을 아래 근거 규칙으로 다시 계산(r3 뒤 새로 저장된 OBSERVED 봉은 그대로).
+  · 같은 초 규칙(r4): 저장 기록 시각은 초 내림·수신 시각은 초 올림이라 같은 초 저장이 최대 1초 앞서 보일 수 있음.
+  · 판 귀속(r5, GPT B1): 저장 근거는 **그 봉과 같은 revision의 기록만**. revision이 적힌 기록은 그대로,
+    revision이 없는 예전 기록(r1~r4의 APPEND)은 바로 앞 INIT·REBASE 기록(기록 순서)의 판으로 보고, 그 판의
+    활성 구간 [활성 시각, 다음 판 활성 시각) 안에 있을 때만 인정. 앞 기록이 없거나 구간 밖·경계와 같은 초면
+    어느 판인지 모호하므로 근거로 쓰지 않음. 새 APPEND 기록에는 revision을 적습니다.
+  · 판정은 `plan_migrated_bar` 하나로 — 읽기 전용 점검(`store_inspect`)과 실제 보정이 같은 함수를 씁니다.
 """
 
 import gzip
@@ -60,9 +65,10 @@ from typing import Iterable
 from domain.research.series import ResearchBar
 from infra.research.kiwoom_rows import NO_TRADES, RawBar, SourceSpec, to_research_bar
 
-SCHEMA_VERSION = "r4"
+SCHEMA_VERSION = "r5"
 SECOND = timedelta(seconds=1)
 WRITE_EVENTS = ("INIT", "REBASE", "EXTEND", "APPEND")      # 봉을 실제로 저장한 기록
+ACTIVATING_EVENTS = ("INIT", "REBASE")                       # 새 판(revision)을 활성화한 기록
 OBSERVED_TIME, MIGRATED_TIME, UNPROVEN_TIME = "OBSERVED", "MIGRATED", "UNPROVEN"
 NO_REVISION = "NO_REVISION"
 BACKFILL, FORWARD = "BACKFILL", "FORWARD"
@@ -165,28 +171,148 @@ def _d(s: str | None) -> date | None:
     return None if s is None else date.fromisoformat(s)
 
 
-def write_events_by_revision(events: list[tuple[str, str, dict]]) -> dict:
-    """저장 기록(INIT·REBASE·EXTEND·APPEND)을 revision별 시각 목록으로. revision이 없는 기록(APPEND)은 None 키.
+def _rev_of(detail) -> int | None:
+    rv = detail.get("revision") if isinstance(detail, dict) else None
+    return rv if isinstance(rv, int) and not isinstance(rv, bool) else None
 
-    events: (기록 시각, 종류, detail) — series_event 그대로."""
-    out: dict = {}
+
+@dataclass(frozen=True)
+class RevisionTimeline:
+    """한 시계열의 판(revision) 순서와 활성 시각. 이전된 판(MIGRATED_R1…)은 INIT·REBASE 기록 시각으로 복원."""
+    order: tuple[int, ...]
+    act: dict          # revision → 활성 시각(ISO 초)
+    proven: dict       # revision → 활성 시각을 기록으로 입증했는지
+    migrated: dict     # revision → r1에서 옮겨 온 판인지
+
+    def superseded(self, revision: int) -> str | None:
+        i = self.order.index(revision)
+        return self.act[self.order[i + 1]] if i + 1 < len(self.order) else None
+
+
+def revision_timeline(revs: list[dict], events: list[tuple[str, str, dict]]) -> RevisionTimeline:
+    """revs: series_revision 행(revision 순), events: (기록 시각, 종류, detail) — series_event를 event_id 순으로."""
+    made: dict[int, str] = {}
     for at, ev, detail in events:
+        rv = _rev_of(detail)
+        if ev in ACTIVATING_EVENTS and rv is not None and rv not in made:
+            made[rv] = at
+    act, proven, mig = {}, {}, {}
+    for r in revs:
+        rv = r["revision"]
+        mig[rv] = r["reason"].startswith("MIGRATED_R1")
+        if mig[rv]:
+            proven[rv] = rv in made
+            act[rv] = made.get(rv, r["activated_at"])
+        else:
+            proven[rv], act[rv] = True, r["activated_at"]
+    order = tuple(r["revision"] for r in revs)
+    for a, b in zip(order, order[1:]):              # 구간이 겹치면(활성 시각이 증가하지 않으면) 입증 실패
+        if act[a] is None or act[b] is None or not act[b] > act[a]:
+            proven[a] = proven[b] = False
+    return RevisionTimeline(order, act, proven, mig)
+
+
+@dataclass(frozen=True)
+class WriteRecord:
+    """봉을 저장한 기록 하나와 그 기록이 속한 판.
+
+    source: EXPLICIT(기록에 revision이 적혀 있음) / ORDER(예전 기록 — 바로 앞 INIT·REBASE의 판, 활성 구간 안) /
+            UNATTRIBUTED:<사유>(어느 판인지 모호 — 근거로 쓰지 않음)."""
+    at: str
+    event: str
+    revision: int | None
+    source: str
+
+
+def attribute_writes(events: list[tuple[str, str, dict]], tl: RevisionTimeline) -> list[WriteRecord]:
+    """저장 기록(INIT·REBASE·EXTEND·APPEND)마다 속한 판을 정합니다 (GPT B1). events는 event_id(기록 순서)대로.
+
+    revision 없는 예전 기록은 '바로 앞 INIT·REBASE 기록의 판'으로 보되, 그 판의 활성 구간
+    [활성 시각, 다음 판 활성 시각) 안에 있을 때만 인정 — 다음 판 활성과 같은 초(경계)거나 구간 밖이면 모호."""
+    out: list[WriteRecord] = []
+    anchor: int | None = None
+    anchor_note = "NO_PRIOR_REVISION"
+    for at, ev, detail in events:
+        rv = _rev_of(detail)
+        if ev in ACTIVATING_EVENTS:
+            anchor, anchor_note = (rv, "") if rv is not None else (None, "ACTIVATION_WITHOUT_REVISION")
         if ev not in WRITE_EVENTS:
             continue
-        rv = detail.get("revision") if isinstance(detail, dict) else None
-        rv = rv if isinstance(rv, int) and not isinstance(rv, bool) else None
-        out.setdefault(rv, []).append(at)
-    return {k: sorted(v) for k, v in out.items()}
+        if rv is not None:
+            out.append(WriteRecord(at, ev, rv, "EXPLICIT"))
+            continue
+        if anchor is None:
+            out.append(WriteRecord(at, ev, None, f"UNATTRIBUTED:{anchor_note}"))
+            continue
+        start = tl.act.get(anchor)
+        end = tl.superseded(anchor) if anchor in tl.order else None
+        if anchor not in tl.order or start is None:
+            why = "UNKNOWN_REVISION"
+        elif at < start:
+            why = "BEFORE_ACTIVATION"
+        elif end is not None and at >= end:
+            why = "AT_OR_AFTER_NEXT_REVISION"
+        else:
+            out.append(WriteRecord(at, ev, anchor, "ORDER"))
+            continue
+        out.append(WriteRecord(at, ev, None, f"UNATTRIBUTED:{why}"))
+    return out
 
 
-def find_write_evidence(writes_by_rev: dict, revision: int, received_at: str) -> str | None:
-    """그 봉(revision, 수신 시각)을 저장한 기록의 시각 — 없으면 None(입증 불가).
+def find_write_evidence(writes: list[WriteRecord], revision: int, received_at: str) -> WriteRecord | None:
+    """그 봉(revision, 수신 시각)을 저장한 기록 — 없으면 None(입증 불가).
 
-    같은 revision의 저장 기록(또는 revision 표시가 없는 APPEND 기록) 중 '수신 시각 − 1초' 이후의 첫 기록.
+    **같은 revision으로 귀속된** 저장 기록 중 '수신 시각 − 1초' 이후의 첫 기록. 다른 판·귀속 불가 기록은 쓰지 않음.
     1초: 저장 기록 시각은 초 내림, 수신 시각은 초 올림으로 남아 같은 초 저장이 1초 앞서 보일 수 있음."""
     floor_recv = (datetime.fromisoformat(received_at) - SECOND).isoformat(timespec="seconds")
-    cands = sorted(writes_by_rev.get(revision, []) + writes_by_rev.get(None, []))
-    return next((t for t in cands if t >= floor_recv), None)
+    cands = sorted((w for w in writes if w.revision == revision and w.at >= floor_recv), key=lambda w: w.at)
+    return cands[0] if cands else None
+
+
+@dataclass(frozen=True)
+class BarTimePlan:
+    """이전된 판의 봉 묶음(revision·수신 시각)에 대한 판정 — 점검과 보정이 같은 결과를 씁니다."""
+    verdict: str                  # PROVABLE / PROVABLE_SAME_SECOND / REVISION_UNPROVEN / NO_EVIDENCE / NOT_MIGRATED
+    time_basis: str | None        # MIGRATED / UNPROVEN (NOT_MIGRATED면 None — 건드리지 않음)
+    available_at: str | None      # MIGRATED일 때만. UNPROVEN은 기존 값 유지
+    evidence: WriteRecord | None
+
+
+def plan_migrated_bar(tl: RevisionTimeline, writes: list[WriteRecord], revision: int,
+                      received_at: str) -> BarTimePlan:
+    if not tl.migrated.get(revision, False):
+        return BarTimePlan("NOT_MIGRATED", None, None, None)
+    if not tl.proven.get(revision, False):
+        return BarTimePlan("REVISION_UNPROVEN", UNPROVEN_TIME, None, None)
+    w = find_write_evidence(writes, revision, received_at)
+    if w is None:
+        return BarTimePlan("NO_EVIDENCE", UNPROVEN_TIME, None, None)
+    verdict = "PROVABLE_SAME_SECOND" if w.at < received_at else "PROVABLE"
+    return BarTimePlan(verdict, MIGRATED_TIME, max(tl.act[revision], received_at, w.at), w)
+
+
+def load_series_evidence(conn: sqlite3.Connection, sid: str) -> tuple[RevisionTimeline, list[WriteRecord], dict]:
+    """(판 순서, 귀속된 저장 기록, revision → 사유). 보정·점검이 같은 방식으로 읽습니다."""
+    revs = [{"revision": r[0], "reason": r[1], "activated_at": r[2]} for r in conn.execute(
+        "SELECT revision, reason, activated_at FROM series_revision WHERE series_id=? ORDER BY revision", (sid,))]
+    events = [(r[0], r[1], json.loads(r[2])) for r in conn.execute(
+        "SELECT at, event, detail_json FROM series_event WHERE series_id=? ORDER BY event_id", (sid,))]
+    tl = revision_timeline(revs, events)
+    return tl, attribute_writes(events, tl), {r["revision"]: r["reason"] for r in revs}
+
+
+def sqlite_backup(conn: sqlite3.Connection, path: str, version: str) -> str:
+    """SQLite 백업 API로 일관된 사본 `<파일>.bak-<옛 버전>-<시각>`(쓰는 중이어도 안전). 같은 이름이 있으면 번호를 붙임."""
+    base = f"{path}.bak-{version}-{datetime.now():%Y%m%d_%H%M%S}"
+    dest, n = base, 1
+    while Path(dest).exists():
+        dest, n = f"{base}_{n}", n + 1
+    target = sqlite3.connect(dest)
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+    return dest
 
 
 @dataclass(frozen=True)
@@ -285,6 +411,7 @@ class ResearchStore:
         p.parent.mkdir(parents=True, exist_ok=True)
         self.path = str(p)
         self.backup_path: str | None = None
+        self.upgrade_summary: dict | None = None     # 이번에 열면서 시각을 다시 점검했으면 그 집계
         self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA_TABLES)
@@ -303,24 +430,14 @@ class ResearchStore:
         if version == "r2":
             self._upgrade_r2_to_r3()
             version = "r3"
-        if version == "r3":
-            self._upgrade_r3_to_r4()
-            version = "r4"
+        if version in ("r3", "r4"):
+            self._recheck_migrated_times(version)
+            version = SCHEMA_VERSION
         if version != SCHEMA_VERSION:
             raise RuntimeError(f"연구 저장소 스키마 {version} ≠ {SCHEMA_VERSION}: {self.path}")
 
     def _backup(self, version: str) -> str:
-        """SQLite 백업 API로 일관된 사본(쓰는 중이어도 안전). 이미 같은 이름이 있으면 덮지 않고 번호를 붙임."""
-        base = f"{self.path}.bak-{version}-{datetime.now():%Y%m%d_%H%M%S}"
-        dest, n = base, 1
-        while Path(dest).exists():
-            dest, n = f"{base}_{n}", n + 1
-        target = sqlite3.connect(dest)
-        try:
-            self.conn.backup(target)
-        finally:
-            target.close()
-        return dest
+        return sqlite_backup(self.conn, self.path, version)
 
     def _migrate_r1_to_r2(self) -> None:
         c = self.conn
@@ -387,79 +504,74 @@ class ResearchStore:
             c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_r3', ?)",
                       (datetime.now().isoformat(timespec="seconds"),))
 
-    def _upgrade_r3_to_r4(self) -> None:
-        """r3 이전의 시각 복원을 같은 초 규칙으로 다시 계산 (사용자 실측 2026-10-02: UNPROVEN 199봉).
+    def _recheck_migrated_times(self, from_version: str) -> None:
+        """r3·r4 → r5: 이전된 판의 MIGRATED·UNPROVEN 봉을 현재 근거 규칙(같은 초 + 판 귀속)으로 다시 계산.
 
-        r3 복원은 봉 수신 시각(초 올림)과 저장 기록 시각(초 내림)을 그대로 비교해서, 한 페이지로 끝나는 짧은 시계열
-        (최근 상장 — 수신과 저장이 같은 초)의 새 봉을 저장 기록이 없다고 보고 UNPROVEN으로 남겼습니다.
-        이미 r3로 바뀐 DB의 MIGRATED·UNPROVEN 봉만 다시 계산합니다(r3 뒤 새로 저장된 OBSERVED 봉은 그대로).
-        """
+        - r3: 수신 시각(초 올림)과 저장 기록(초 내림)을 그대로 비교해 같은 초 저장 봉을 UNPROVEN으로 남겼음(실측 199봉).
+        - r4: revision 없는 APPEND 기록을 판 확인 없이 모든 판의 근거로 써서, 끝난 판의 봉을 다음 판 기록으로
+              입증할 수 있었음(GPT B1). 이미 r4로 보정된 DB도 여기서 다시 점검 — 잘못 입증된 봉은 UNPROVEN으로.
+        r3 뒤 새로 저장된 OBSERVED 봉은 건드리지 않습니다. 바뀐 봉 수는 meta(recheck_r5)와 upgrade_summary에 남깁니다."""
+        tally: dict[str, int] = {}
         with self.tx():
             migrated = [r[0] for r in self.conn.execute(
                 "SELECT DISTINCT series_id FROM series_revision WHERE reason LIKE 'MIGRATED_R1%' ORDER BY series_id")]
             for sid in migrated:
-                self._repair_migrated_series(sid, only_basis=(MIGRATED_TIME, UNPROVEN_TIME))
+                for k, n in self._repair_migrated_series(sid, only_basis=(MIGRATED_TIME, UNPROVEN_TIME)).items():
+                    tally[k] = tally.get(k, 0) + n
+            summary = {"from": from_version, "at": datetime.now().isoformat(timespec="seconds"),
+                       "series": len(migrated), **dict(sorted(tally.items()))}
             self.conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (SCHEMA_VERSION,))
-            self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_r4', ?)",
-                              (datetime.now().isoformat(timespec="seconds"),))
+            self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('recheck_r5', ?)",
+                              (json.dumps(summary, ensure_ascii=False),))
+        self.upgrade_summary = summary
 
-    def _repair_migrated_series(self, sid: str, only_basis: tuple[str, ...] | None = None) -> None:
-        """only_basis를 주면 그 time_basis인 봉만 다시 계산(r3→r4: 이후 새로 저장된 OBSERVED 봉은 건드리지 않음).
+    def _repair_migrated_series(self, sid: str, only_basis: tuple[str, ...] | None = None) -> dict[str, int]:
+        """이전된 판(MIGRATED_R1…)의 활성·대체 시각과 봉 사용 가능 시각을 저장 기록으로 복원. 반환: 바뀐 봉 집계.
 
-        저장 근거(`find_write_evidence`): 같은 revision의 저장 기록 중 '수신 시각 − 1초' 이후 첫 기록. 저장 기록 시각은
-        초 내림, 봉 수신 시각은 초 올림으로 남아 같은 초 저장이 1초 앞서 보일 수 있기 때문. 근거가 있는 봉만 MIGRATED로,
+        only_basis를 주면 그 time_basis인 봉만 다시 계산(r3·r4 → r5: 이후 새로 저장된 OBSERVED 봉은 건드리지 않음).
+        봉마다 `plan_migrated_bar`(점검 도구와 같은 함수): 같은 판으로 귀속된 저장 기록이 있으면 MIGRATED,
         사용 가능 시각 = max(판 활성, 수신, 저장 기록)(수신 시각을 포함하므로 실제 저장보다 이르지 않음).
-        근거가 없는 봉은 UNPROVEN으로 남김 — 일괄 해제하지 않음."""
+        근거가 없거나 판 자체가 입증 안 되면 UNPROVEN — 일괄 해제하지 않음."""
         c = self.conn
         basis_cond, basis_args = "", ()
         if only_basis:
             basis_cond = f" AND time_basis IN ({','.join('?' * len(only_basis))})"
             basis_args = tuple(only_basis)
-        revs = [dict(r) for r in c.execute("SELECT * FROM series_revision WHERE series_id=? ORDER BY revision", (sid,))]
-        events = [(r["at"], r["event"], json.loads(r["detail_json"])) for r in c.execute(
-            "SELECT at, event, detail_json FROM series_event WHERE series_id=? ORDER BY event_id", (sid,))]
-        made: dict[int, str] = {}
-        for at, ev, detail in events:
-            rv = detail.get("revision") if isinstance(detail, dict) else None
-            if ev in ("INIT", "REBASE") and isinstance(rv, int) and not isinstance(rv, bool) and rv not in made:
-                made[rv] = at
-        writes = write_events_by_revision(events)
-        act, proven, mig = {}, {}, {}
-        for r in revs:
-            rv = r["revision"]
-            mig[rv] = r["reason"].startswith("MIGRATED_R1")
-            if mig[rv]:
-                proven[rv] = rv in made
-                act[rv] = made.get(rv, r["activated_at"])
-            else:
-                proven[rv], act[rv] = True, r["activated_at"]
-        order = [r["revision"] for r in revs]
-        for a, b in zip(order, order[1:]):              # 구간이 겹치면(활성 시각이 증가하지 않으면) 입증 실패
-            if not act[b] > act[a]:
-                proven[a] = proven[b] = False
-        for i, rv in enumerate(order):
-            if not mig[rv]:
-                if i + 1 < len(order):
+        tl, writes, reasons = load_series_evidence(c, sid)
+        tally: dict[str, int] = {}
+        for i, rv in enumerate(tl.order):
+            sup = tl.superseded(rv)
+            if not tl.migrated[rv]:
+                if sup is not None:
                     c.execute("UPDATE series_revision SET superseded_at=? WHERE series_id=? AND revision=?",
-                              (act[order[i + 1]], sid, rv))
+                              (sup, sid, rv))
                 continue
-            base_reason = revs[i]["reason"].split(":")[0]
-            sup = act[order[i + 1]] if i + 1 < len(order) else None
+            base_reason = reasons[rv].split(":")[0]
             c.execute("UPDATE series_revision SET activated_at=?, superseded_at=?, reason=? WHERE series_id=? AND revision=?",
-                      (act[rv], sup, f"{base_reason}:{'EVENT' if proven[rv] else 'UNPROVEN'}", sid, rv))
+                      (tl.act[rv], sup, f"{base_reason}:{'EVENT' if tl.proven[rv] else 'UNPROVEN'}", sid, rv))
             for table in ("bar", "bar_history"):
-                recvs = [r[0] for r in c.execute(
-                    f"SELECT DISTINCT received_at FROM {table} WHERE series_id=? AND revision=?{basis_cond}",
-                    (sid, rv) + basis_args)]
-                for recv in recvs:
-                    w = find_write_evidence(writes, rv, recv)
-                    if proven[rv] and w is not None:
+                groups = c.execute(
+                    f"SELECT received_at, time_basis, available_at, COUNT(*) FROM {table} WHERE series_id=? AND revision=?"
+                    f"{basis_cond} GROUP BY received_at, time_basis, available_at", (sid, rv) + basis_args).fetchall()
+                plans: dict[str, BarTimePlan] = {}
+                for recv, old_basis, old_av, n in groups:
+                    p = plans.setdefault(recv, plan_migrated_bar(tl, writes, rv, recv))
+                    if old_basis != p.time_basis:
+                        key = f"{old_basis}->{p.time_basis}"
+                    elif p.time_basis == MIGRATED_TIME and old_av != p.available_at:
+                        key = "MIGRATED_available_at_changed"
+                    else:
+                        key = "unchanged"
+                    tally[key] = tally.get(key, 0) + n
+                for recv, p in plans.items():
+                    if p.time_basis == MIGRATED_TIME:
                         c.execute(f"UPDATE {table} SET available_at=?, time_basis=? WHERE series_id=? AND revision=?"
                                   f" AND received_at=?{basis_cond}",
-                                  (max(act[rv], recv, w), MIGRATED_TIME, sid, rv, recv) + basis_args)
+                                  (p.available_at, MIGRATED_TIME, sid, rv, recv) + basis_args)
                     else:
                         c.execute(f"UPDATE {table} SET time_basis=? WHERE series_id=? AND revision=? AND received_at=?"
                                   f"{basis_cond}", (UNPROVEN_TIME, sid, rv, recv) + basis_args)
+        return tally
 
     def _rebuild_integrity_log(self, sid: str) -> None:
         c = self.conn
@@ -898,8 +1010,10 @@ class ResearchStore:
                 "UPDATE series SET verified_base_dt=?, verified_at=?, first_date=?, last_date=?, no_trades_count=?,"
                 " invalid_count=?, updated_at=? WHERE series_id=?",
                 (verified_base_dt, _ts_up(verified_at), first, last, n_nt, n_inv, _ts(now), series_id))
+            # revision을 적음 — 저장 근거를 판별로 확인할 수 있게 (GPT B1; r1~r4 기록에는 없었음)
             self._event(series_id, now, "APPEND" if bars else "VERIFIED",
-                        {"added": len(bars), "verified_base_dt": verified_base_dt, "scope": "FIRST_PAGE"})
+                        {"revision": meta.revision, "added": len(bars), "verified_base_dt": verified_base_dt,
+                         "scope": "FIRST_PAGE"})
         return len(bars)
 
     def mark_integrity(self, series_id: str, detail: str, now: datetime, status: str = REBASE_REQUIRED) -> None:

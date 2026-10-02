@@ -32,7 +32,7 @@ from domain.research.series import SeriesView
 from domain.research.types import Tri
 from domain.research.universe import COMMON, UniversePolicy, classify_row
 from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE
-from infra.research.scan_store import ABORTED, ScanStore
+from infra.research.scan_store import ABORTED, FINAL_RULE, ScanStore, final_rule
 from infra.research.store import NO_REVISION, ResearchStore
 from utils.trading_calendar import CalendarCoverageError, TradingCalendar
 
@@ -207,8 +207,7 @@ class S1Scanner:
                           "snapshot_status": snap_status, "no_trades_hold": nt_hold,
                           # 확정(final): 입력이 모두 정상이고 판정이 PASS/FAIL로 정해진 경우만 (GPT R3)
                           # — UNKNOWN(거래 없는 봉·이력 부족 등)은 이후 실행의 정해진 판정으로 대체될 수 있음
-                          "final": int(ds == OK and idx_status == OK and snap_status == OK
-                                       and tri["eligible_signal"] in (Tri.PASS.value, Tri.FAIL.value)),
+                          "final": final_rule(ds, idx_status, snap_status, tri["eligible_signal"]),
                           "actionable": actionable, "input_hash": input_hash, "result": result,
                           "evidence": evidence})
         context = {"signal_date": t.isoformat(), "scan_at": scan_at.isoformat(timespec="seconds"),
@@ -224,7 +223,8 @@ class S1Scanner:
                                 "stored_policy": snap["policy_version"], "status": snap_status},
                    "applied_policy": self.policy.policy_version, "strategy": self.strategy,
                    "config_hash": self.config_hash, "config": asdict(self.cfg),
-                   "feature_version": F.FEATURE_VERSION, "market_version": M.MARKET_VERSION}
+                   "feature_version": F.FEATURE_VERSION, "market_version": M.MARKET_VERSION,
+                   "final_rule": FINAL_RULE}
         return {"signal_date": t, "snapshot": snap, "snapshot_status": snap_status, "evals": evals,
                 "context": context}
 
@@ -267,15 +267,24 @@ class S1Scanner:
                 "context": comp["context"], "evals": comp["evals"], "aborted_previous": aborted}
 
     def verify(self, run_id: str, scan_at: datetime) -> dict:
-        """저장된 실행을 같은 scan_at으로 다시 계산해 종목별 판정·입력 해시·결과가 같은지 비교(저장 안 함)."""
+        """저장된 실행을 같은 scan_at으로 다시 계산해 종목별 판정·입력 해시·결과가 같은지 비교(저장 안 함).
+
+        final은 입력 상태·판정에서 정해지는 값이라, 저장된 행에 **현재 규칙**을 적용한 값과 비교합니다.
+        이전 규칙(f837185)으로 저장된 실행의 final 차이는 불일치가 아니라 final_rule_changed로 따로 셉니다."""
         stored = {e["symbol"]: e for e in self.sstore.evals(run_id)}
         comp = {e["symbol"]: e for e in self.compute(scan_at)["evals"]}
-        keys = ("eligible_signal", "data_status", "index_status", "snapshot_status", "input_hash", "final")
+        keys = ("eligible_signal", "data_status", "index_status", "snapshot_status", "input_hash")
+
+        def rule(e):
+            return final_rule(e["data_status"], e["index_status"], e["snapshot_status"], e["eligible_signal"])
+
         diff = sorted(s for s in set(stored) | set(comp)
                       if s not in stored or s not in comp
-                      or any(stored[s][k] != comp[s][k] for k in keys)
+                      or any(stored[s][k] != comp[s][k] for k in keys) or rule(stored[s]) != comp[s]["final"]
                       or stored[s]["result"] != json.loads(json.dumps(comp[s]["result"], sort_keys=True)))
-        return {"identical": not diff, "symbols": len(comp), "diff": diff[:20], "diff_count": len(diff)}
+        changed = sum(1 for e in stored.values() if e["final"] != rule(e))
+        return {"identical": not diff, "symbols": len(comp), "diff": diff[:20], "diff_count": len(diff),
+                "final_rule_changed": changed}
 
 
 def summarize_evals(evals: list[dict], context: dict) -> dict:
