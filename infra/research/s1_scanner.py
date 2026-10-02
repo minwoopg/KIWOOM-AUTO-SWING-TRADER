@@ -205,7 +205,10 @@ class S1Scanner:
             evals.append({"symbol": rec.code, "name": rec.name, "market": rec.market, "series_id": sid,
                           "signal_date": t.isoformat(), **tri, "data_status": ds, "index_status": idx_status,
                           "snapshot_status": snap_status, "no_trades_hold": nt_hold,
-                          "final": int(ds == OK and idx_status == OK and snap_status == OK),
+                          # 확정(final): 입력이 모두 정상이고 판정이 PASS/FAIL로 정해진 경우만 (GPT R3)
+                          # — UNKNOWN(거래 없는 봉·이력 부족 등)은 이후 실행의 정해진 판정으로 대체될 수 있음
+                          "final": int(ds == OK and idx_status == OK and snap_status == OK
+                                       and tri["eligible_signal"] in (Tri.PASS.value, Tri.FAIL.value)),
                           "actionable": actionable, "input_hash": input_hash, "result": result,
                           "evidence": evidence})
         context = {"signal_date": t.isoformat(), "scan_at": scan_at.isoformat(timespec="seconds"),

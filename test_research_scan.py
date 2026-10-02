@@ -175,7 +175,8 @@ check("2-4) [완료 기준] 시계열 없음·오래된 봉·REBASE_REQUIRED·UN
               for s in ("000400", "000500", "000700", "000800")))
 check("2-5) 거래 없는 봉이 160세션 안에 있으면 HISTORY UNKNOWN·no_trades_hold 표시",
       E["000600"]["eligible_signal"] == "UNKNOWN" and E["000600"]["no_trades_hold"] == 1
-      and [c for c in E["000600"]["result"]["checks"] if c["name"] == "HISTORY"][0]["detail"].startswith("NO_TRADES"))
+      and [c for c in E["000600"]["result"]["checks"] if c["name"] == "HISTORY"][0]["detail"].startswith("NO_TRADES")
+      and E["000600"]["final"] == 0)
 lv = E["000100"]["result"]["levels"]
 check("2-6) 후보에 참고 손절가·진입 상한·조건별 결과 저장, 다음 개장 전 스캔(actionable=1), 확정(final=1)",
       lv["stop_ref"] > 0 and lv["entry_cap"] > lv["stop_ref"] and len(E["000100"]["result"]["checks"]) >= 10
@@ -216,6 +217,10 @@ st.append_forward(series_id="STOCK:000500", bars=[FetchedBar(pass_bars(UPTO_T)[-
                   verified_base_dt="20261001", verified_at=datetime(2026, 10, 1, 9, 30))
 corr = [RawBar(b.date, b.open_raw + 7, b.high_raw + 7, b.low_raw + 7, b.close_raw + 7, b.volume, b.trade_value_raw, "")
         for b in pass_bars(UPTO_T)]
+st.replace_series(spec=STOCK_DAILY, series_id="STOCK:000600", code="000600",            # 거래 없는 봉 정정
+                  candidate=[FetchedBar(b, datetime(2026, 10, 1, 8, 0)) for b in pass_bars(UPTO_T)],
+                  basis=AdjustmentBasis("1", "20261001"), activated_at=datetime(2026, 10, 1, 8, 0), job_id=None,
+                  required_from=None, coverage="OK", coverage_detail="", reason="TEST_NO_TRADES_FIX")
 rr = st.replace_series(spec=STOCK_DAILY, series_id="STOCK:000100", code="000100",
                        candidate=[FetchedBar(b, datetime(2026, 10, 1, 8, 0)) for b in corr],
                        basis=AdjustmentBasis("1", "20261001"), activated_at=datetime(2026, 10, 1, 8, 0), job_id=None,
@@ -235,9 +240,12 @@ check("4-2) 10/1 12:00 스캔(신호일 여전히 9/30): 정정 값·새 스냅�
 check("4-3) 보류였던 000500은 늦게 도착한 9/30 봉으로 평가돼 대표 기록 대체(이력 보존), 개장 뒤 스캔이라 actionable=0",
       O["000500"]["run_id"] == late["run_id"] and O["000500"]["data_status"] == "OK" and O["000500"]["replaced_count"] == 1
       and O["000500"]["history"][0]["data_status"].startswith("STALE") and O["000500"]["actionable"] == 0)
-check("4-4) 대표 기록 집계: 확정 5건 유지(000100·000200·000300·100100·000600) · 보류 4건 대체(000500 해소 + "
+check("4-4) [GPT R3] 첫 스캔 NO_TRADES → UNKNOWN(final=0) → 정정 뒤 스캔 PASS가 대표 기록을 대체(이력 보존)",
+      O["000600"]["eligible_signal"] == "PASS" and O["000600"]["run_id"] == late["run_id"]
+      and O["000600"]["history"][0]["eligible_signal"] == "UNKNOWN" and O["000600"]["final"] == 1)
+check("4-4b) 대표 기록 집계: 확정 4건 유지(000100·000200·000300·100100) · 대체 5건(000500·000600 해소 + "
       "000400·000700·000800은 더 늦은 보류로 대체)",
-      late["counts"]["observations"]["kept_final"] == 5 and late["counts"]["observations"]["replaced"] == 4)
+      late["counts"]["observations"]["kept_final"] == 4 and late["counts"]["observations"]["replaced"] == 5)
 first_evals = {e["symbol"]: e for e in ss.evals(res["run_id"])}
 check("4-5) 첫 실행의 판정 기록 자체도 그대로(append-only)",
       first_evals["000100"]["eligible_signal"] == "PASS" and first_evals["000100"]["evidence"]["stock"]["revision"] == 1)
@@ -393,6 +401,67 @@ check("8-4) update: 갱신이 실패해도(종료 코드 1) 갱신 뒤 스캔은
 code4 = rc.main(["--db", db, "--report-dir", str(rdir), "update", "--no-scan"], calendar=CAL, client=DownClient(),
                 now=Clock(datetime(2026, 9, 30, 20, 10)))
 check("8-5) update --no-scan은 스캔하지 않음", code4 == 1 and len(ScanStore(TMP / "s1_scans.sqlite3").runs()) == 2)
+
+# R4: 보고서 저장 실패 → 같은 시각 재실행이 보고서만 다시 만듦(재계산 없음)
+rdb = str(TMP / "rep.sqlite3")
+build("rep").close()
+rdir2 = TMP / "reports2"
+rsdb = str(TMP / "rep_scans_cli.sqlite3")
+orig_write = rc.write_report
+
+
+def broken_write(run, out_dir):
+    raise OSError("디스크 가득 참(모의)")
+
+
+rc.write_report = broken_write
+try:
+    c1 = rc.main(["--db", rdb, "--scan-db", rsdb, "--report-dir", str(rdir2), "scan", "--at", "2026-09-30T19:30:00"],
+                 calendar=CAL,
+                 now=Clock(datetime(2026, 9, 30, 19, 31)))
+finally:
+    rc.write_report = orig_write
+srep = ScanStore(rsdb)
+n_eval_before = srep.conn.execute("SELECT COUNT(*) FROM s1_eval").fetchone()[0]
+calls = []
+orig_compute = S1Scanner.compute
+S1Scanner.compute = lambda self, at: calls.append(at) or orig_compute(self, at)
+try:
+    c2 = rc.main(["--db", rdb, "--scan-db", rsdb, "--report-dir", str(rdir2), "scan", "--at", "2026-09-30T19:30:00"],
+                 calendar=CAL,
+                 now=Clock(datetime(2026, 9, 30, 19, 40)))
+finally:
+    S1Scanner.compute = orig_compute
+runs_r = srep.runs()
+md2 = list(rdir2.glob("*.md"))
+check("8-6) [GPT R4] 보고서 저장 실패 → 종료 코드 1·관찰 기록은 저장 → 같은 시각 재실행은 재계산 없이 저장된 실행으로 보고서만 "
+      "다시 만들고 0, 실행·판정 추가 없음",
+      c1 == 1 and c2 == 0 and not calls and len(md2) == 1 and len(runs_r) == 1
+      and runs_r[0]["report_path"] == str(md2[0])
+      and srep.conn.execute("SELECT COUNT(*) FROM s1_eval").fetchone()[0] == n_eval_before)
+first_run = srep.load_run(runs_r[0]["run_id"])
+direct = TMP / "reports_direct"
+from infra.research.scan_report import write_report as wr  # noqa: E402
+st_r = ResearchStore(rdb)
+fresh = S1Scanner(st_r, ScanStore(TMP / "rep_fresh_scans.sqlite3"), CAL).run(SCAN, now=clk)
+pd = Path(wr(fresh, direct))
+check("8-7) 저장된 실행으로 다시 만든 보고서 = 같은 입력으로 새로 계산해 만든 보고서(실행 ID만 다름)",
+      md2[0].read_text(encoding="utf-8").replace(first_run["run_id"], "RUN")
+      == pd.read_text(encoding="utf-8").replace(fresh["run_id"], "RUN"))
+st_r.close()
+srep.close()
+
+# R5: 분류 정책만 다른 실행 → 실행 ID 충돌 없이 둘 다 완료
+from domain.research.universe import UniversePolicy  # noqa: E402
+st = build("pol")
+ss5 = ScanStore(TMP / "pol_scans.sqlite3")
+ra = S1Scanner(st, ss5, CAL).run(SCAN, now=clk)
+rb = S1Scanner(st, ss5, CAL, policy=UniversePolicy(foreign_class_names=())).run(SCAN, now=clk)
+check("8-8) [GPT R5] 같은 시각·설정에서 분류 정책만 다르면 서로 다른 실행 ID로 둘 다 완료(유일성 충돌 없음)",
+      ra["status"] == rb["status"] == COMPLETE and ra["run_id"] != rb["run_id"] and ra["run_key"] != rb["run_key"]
+      and [r["status"] for r in ss5.runs()] == [COMPLETE, COMPLETE])
+ss5.close()
+st.close()
 
 # ── 9. GPT 종합 검토 작은 보완 ─────────────────────────────────
 import io  # noqa: E402

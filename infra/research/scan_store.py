@@ -13,14 +13,15 @@ from __future__ import annotations
                    사전(zdict) 압축 JSON — 사전은 codec 표에 함께 저장. 입력 해시는 열로.
                    실행 공통 증거(지수 revision·스냅숏·세션·버전·스캔 시각)는 scan_run.context에 한 번만.
 - s1_observation : 신호 ID = 전략·설정 해시·종목·신호일(**입력 해시는 넣지 않음**)마다 대표 판정 하나.
-                   final(데이터·지수·스냅숏 모두 정상인 실행의 판정)은 **절대 바꾸지 않음** — 이후 정정 데이터나
-                   새 스냅숏이 들어와도 그대로. final이 아닌 보류 기록만 더 늦은 스캔 시각의 실행이 대체(이력 보존).
+                   final(데이터·지수·스냅숏 모두 정상이고 판정이 PASS/FAIL로 정해진 실행의 판정)은 **절대 바꾸지 않음** — 이후 정정 데이터나
+                   새 스냅숏이 들어와도 그대로. final이 아닌 기록(보류·UNKNOWN)만 더 늦은 스캔 시각의 실행이 대체(이력 보존).
 
 원자성: 종목별 판정·대표 기록·COMPLETE 표시를 한 트랜잭션에 씁니다. 도중에 끊기면 아무것도 남지 않고 실행은
 RUNNING으로 남아 다음 실행이 ABORTED로 정리합니다. COMPLETE 표시는 `status='RUNNING'`인 행에만 하므로,
 다른 실행이 이미 ABORTED로 정리한 실행은 완료로 표시되지 않고 되돌려집니다.
 """
 
+import hashlib
 import json
 import sqlite3
 import zlib
@@ -162,7 +163,9 @@ class ScanStore:
                 self.conn.execute("UPDATE scan_run SET status=?, finished_at=?, error=? WHERE run_id=?",
                                   (ABORTED, _ts(started_at), f"다음 실행 시작 시 RUNNING으로 남아 있어 정리", rid))
             attempt = self.conn.execute("SELECT COUNT(*) FROM scan_run WHERE run_key=?", (run_key,)).fetchone()[0] + 1
-            run_id = f"s1_{signal_date.replace('-', '')}_{scan_at:%Y%m%d%H%M%S}_{config_hash[:8]}_a{attempt}"
+            # 실행 ID는 run_key 전체의 해시를 포함 — 분류 정책 등 run_key만 다른 실행이 같은 ID가 되지 않게 (GPT R5)
+            key_hash = hashlib.sha256(run_key.encode("utf-8")).hexdigest()[:10]
+            run_id = f"s1_{signal_date.replace('-', '')}_{scan_at:%Y%m%d%H%M%S}_{key_hash}_a{attempt}"
             self.conn.execute(
                 "INSERT INTO scan_run(run_id, run_key, attempt, scan_at, signal_date, strategy, config_hash,"
                 " universe_policy, feature_version, market_version, after_close_min, started_at, status)"
@@ -243,6 +246,13 @@ class ScanStore:
         d["context"] = json.loads(d.pop("context_json") or "{}")
         d["counts"] = json.loads(d.pop("counts_json") or "{}")
         return d
+
+    def load_run(self, run_id: str) -> dict | None:
+        """저장된 실행 그대로(context·counts·종목 판정) — 다시 계산하지 않고 보고서를 만들 때 씀 (GPT R4)."""
+        r = self.conn.execute("SELECT * FROM scan_run WHERE run_id=?", (run_id,)).fetchone()
+        if r is None:
+            return None
+        return {**self._run_dict(r), "evals": self.evals(run_id)}
 
     def runs(self, signal_date: str | None = None) -> list[dict]:
         q, a = "SELECT * FROM scan_run", ()

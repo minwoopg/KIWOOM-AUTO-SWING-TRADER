@@ -38,7 +38,7 @@ from __future__ import annotations
 정합성 이력 (series_integrity, r3): 재수집 실패(REBASE_REQUIRED)·복구(OK)를 시각과 함께 남깁니다.
 시점 조회는 그 시각의 상태를 돌려주므로, 나중에 복구돼도 실패 당시 평가는 보류(UNKNOWN)로 재현됩니다.
 
-기존 DB 이전 (열 때 자동, 한 트랜잭션씩)
+기존 DB 이전 (열 때 자동, 한 트랜잭션씩 — 바꾸기 전에 같은 폴더에 백업 `<파일>.bak-<옛 버전>-<시각>`)
 - r1 → r2: 봉별 fetched_at(첫 페이지 수신 시각) → received_at, 임시 available_at, revision 행 생성.
 - r2 → r3 (이미 r2로 이전된 DB 포함): r1에서 옮겨 온 판의 활성 시각을 **r1이 저장 때마다 남긴 변경 기록
   (INIT·REBASE)** 으로 복원하고, 봉 available_at = max(활성 시각, 그 봉 수신 시각 이후 첫 저장 기록 시각)으로
@@ -165,6 +165,30 @@ def _d(s: str | None) -> date | None:
     return None if s is None else date.fromisoformat(s)
 
 
+def write_events_by_revision(events: list[tuple[str, str, dict]]) -> dict:
+    """저장 기록(INIT·REBASE·EXTEND·APPEND)을 revision별 시각 목록으로. revision이 없는 기록(APPEND)은 None 키.
+
+    events: (기록 시각, 종류, detail) — series_event 그대로."""
+    out: dict = {}
+    for at, ev, detail in events:
+        if ev not in WRITE_EVENTS:
+            continue
+        rv = detail.get("revision") if isinstance(detail, dict) else None
+        rv = rv if isinstance(rv, int) and not isinstance(rv, bool) else None
+        out.setdefault(rv, []).append(at)
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def find_write_evidence(writes_by_rev: dict, revision: int, received_at: str) -> str | None:
+    """그 봉(revision, 수신 시각)을 저장한 기록의 시각 — 없으면 None(입증 불가).
+
+    같은 revision의 저장 기록(또는 revision 표시가 없는 APPEND 기록) 중 '수신 시각 − 1초' 이후의 첫 기록.
+    1초: 저장 기록 시각은 초 내림, 수신 시각은 초 올림으로 남아 같은 초 저장이 1초 앞서 보일 수 있음."""
+    floor_recv = (datetime.fromisoformat(received_at) - SECOND).isoformat(timespec="seconds")
+    cands = sorted(writes_by_rev.get(revision, []) + writes_by_rev.get(None, []))
+    return next((t for t in cands if t >= floor_recv), None)
+
+
 @dataclass(frozen=True)
 class AdjustmentBasis:
     upd_stkpc_tp: str | None        # 종목 "1"(수정주가). 지수는 None
@@ -255,10 +279,12 @@ class ResearchSeries:
 
 
 class ResearchStore:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, backup_before_upgrade: bool = True) -> None:
+        """기존 DB의 스키마를 올려야 하면, 바꾸기 전에 같은 폴더에 백업(<파일>.bak-<옛 버전>-<시각>)을 만듭니다."""
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         self.path = str(p)
+        self.backup_path: str | None = None
         self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA_TABLES)
@@ -269,6 +295,8 @@ class ResearchStore:
             version = "r2"
         else:
             version = cur[0]
+            if version != SCHEMA_VERSION and backup_before_upgrade:
+                self.backup_path = self._backup(version)
         if version == "r1":
             self._migrate_r1_to_r2()
             version = "r2"
@@ -280,6 +308,19 @@ class ResearchStore:
             version = "r4"
         if version != SCHEMA_VERSION:
             raise RuntimeError(f"연구 저장소 스키마 {version} ≠ {SCHEMA_VERSION}: {self.path}")
+
+    def _backup(self, version: str) -> str:
+        """SQLite 백업 API로 일관된 사본(쓰는 중이어도 안전). 이미 같은 이름이 있으면 덮지 않고 번호를 붙임."""
+        base = f"{self.path}.bak-{version}-{datetime.now():%Y%m%d_%H%M%S}"
+        dest, n = base, 1
+        while Path(dest).exists():
+            dest, n = f"{base}_{n}", n + 1
+        target = sqlite3.connect(dest)
+        try:
+            self.conn.backup(target)
+        finally:
+            target.close()
+        return dest
 
     def _migrate_r1_to_r2(self) -> None:
         c = self.conn
@@ -365,10 +406,10 @@ class ResearchStore:
     def _repair_migrated_series(self, sid: str, only_basis: tuple[str, ...] | None = None) -> None:
         """only_basis를 주면 그 time_basis인 봉만 다시 계산(r3→r4: 이후 새로 저장된 OBSERVED 봉은 건드리지 않음).
 
-        같은 초 규칙: 저장 기록 시각은 초 내림, 봉 수신 시각은 초 올림으로 남았으므로 실제로 수신 뒤에 저장했어도
-        기록 시각이 수신 시각보다 최대 1초 앞서 보일 수 있습니다. 그래서 '수신 시각 − 1초 이후의 첫 저장 기록'을
-        그 봉을 저장한 기록으로 보고, 사용 가능 시각은 max(판 활성, 수신 시각, 저장 기록 시각)으로 둡니다
-        (수신 시각을 포함하므로 같은 초 경우에도 실제 저장보다 이르게 되지 않음)."""
+        저장 근거(`find_write_evidence`): 같은 revision의 저장 기록 중 '수신 시각 − 1초' 이후 첫 기록. 저장 기록 시각은
+        초 내림, 봉 수신 시각은 초 올림으로 남아 같은 초 저장이 1초 앞서 보일 수 있기 때문. 근거가 있는 봉만 MIGRATED로,
+        사용 가능 시각 = max(판 활성, 수신, 저장 기록)(수신 시각을 포함하므로 실제 저장보다 이르지 않음).
+        근거가 없는 봉은 UNPROVEN으로 남김 — 일괄 해제하지 않음."""
         c = self.conn
         basis_cond, basis_args = "", ()
         if only_basis:
@@ -382,7 +423,7 @@ class ResearchStore:
             rv = detail.get("revision") if isinstance(detail, dict) else None
             if ev in ("INIT", "REBASE") and isinstance(rv, int) and not isinstance(rv, bool) and rv not in made:
                 made[rv] = at
-        writes = sorted(at for at, ev, _ in events if ev in WRITE_EVENTS)
+        writes = write_events_by_revision(events)
         act, proven, mig = {}, {}, {}
         for r in revs:
             rv = r["revision"]
@@ -411,8 +452,7 @@ class ResearchStore:
                     f"SELECT DISTINCT received_at FROM {table} WHERE series_id=? AND revision=?{basis_cond}",
                     (sid, rv) + basis_args)]
                 for recv in recvs:
-                    floor_recv = (datetime.fromisoformat(recv) - SECOND).isoformat(timespec="seconds")
-                    w = next((t for t in writes if t >= floor_recv), None)
+                    w = find_write_evidence(writes, rv, recv)
                     if proven[rv] and w is not None:
                         c.execute(f"UPDATE {table} SET available_at=?, time_basis=? WHERE series_id=? AND revision=?"
                                   f" AND received_at=?{basis_cond}",

@@ -1011,15 +1011,43 @@ st9.conn.execute(f"INSERT INTO bar(series_id, date, open_raw, high_raw, low_raw,
                  f" quality, run_type, received_at, available_at, first_ready_at, time_basis, revision)"
                  f" VALUES('{MS}','2026-10-06',101,106,96,101,1000,1,'','FORWARD','2026-10-06T19:00:00',"
                  "'2026-10-06T19:00:00','2026-10-06T19:00:00','OBSERVED',3)")                  # r3 뒤 새로 저장한 봉
+for d, recv in (("2026-10-07", "2026-10-07T08:00:05"), ("2026-10-08", "2026-10-08T08:00:05")):   # 근거 없는 봉
+    st9.conn.execute(f"INSERT INTO bar(series_id, date, open_raw, high_raw, low_raw, close_raw, volume, trade_value_raw,"
+                     f" quality, run_type, received_at, available_at, first_ready_at, time_basis, revision)"
+                     f" VALUES('{MS}',?,101,106,96,101,1000,1,'','BACKFILL',?,?,?,'UNPROVEN',3)", (d, recv, recv, recv))
+st9.conn.execute("INSERT INTO series_event(series_id, at, event, detail_json) VALUES(?,?,?,?)",
+                 (MS, "2026-10-08T08:00:04", "EXTEND", json.dumps({"revision": 99})))   # 다른 revision의 저장 기록
 st9.conn.execute("UPDATE meta SET value='r3' WHERE key='schema_version'")
 st9.close()
+from infra.research.store_inspect import inspect_unproven  # noqa: E402
+ins = inspect_unproven(m5)
+vv = {r["first"]: r["verdict"] for r in ins["rows"]}
+check("13-14) [GPT R2] 읽기 전용 점검: UNPROVEN 봉을 저장 기록과 대조 — 같은 초 저장 근거 있음(PROVABLE_SAME_SECOND) / "
+      "기록 없음·다른 revision 기록뿐(NO_EVIDENCE). 점검은 스키마를 올리지 않고 백업도 만들지 않음",
+      ins["schema"] == "r3" and ins["unproven_bars"] == 3
+      and vv == {"2026-10-05": "PROVABLE_SAME_SECOND", "2026-10-07": "NO_EVIDENCE", "2026-10-08": "NO_EVIDENCE"}
+      and ins["verdict_bars"] == {"PROVABLE_SAME_SECOND": 1, "NO_EVIDENCE": 2}
+      and not list(TMP.glob("r1_samesec.sqlite3.bak-r3-*")))
 st9 = ResearchStore(m5)
 bb = {sb.raw.date: sb for sb in st9.load_bars(MS)}
-check("13-13) 이미 r3로 바뀐 DB: 열면 r4로 다시 계산 — UNPROVEN이던 같은 초 봉은 MIGRATED, r3 뒤 새로 저장한 OBSERVED 봉은 그대로",
+check("13-13) 이미 r3로 바뀐 DB: 열면 r4로 다시 계산 — 근거 있는 같은 초 봉만 MIGRATED, 근거 없는 봉(다른 revision 기록 포함)은 "
+      "UNPROVEN 유지(일괄 해제 안 함), r3 뒤 새로 저장한 OBSERVED 봉은 그대로",
       st9.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r4"
       and bb[date(2026, 10, 5)].time_basis == "MIGRATED" and bb[date(2026, 10, 6)].time_basis == "OBSERVED"
       and bb[date(2026, 10, 6)].available_at == datetime(2026, 10, 6, 19, 0)
-      and st9.research_series(MS).unproven_bars == 0)
+      and bb[date(2026, 10, 7)].time_basis == "UNPROVEN" and bb[date(2026, 10, 8)].time_basis == "UNPROVEN"
+      and st9.research_series(MS).unproven_bars == 2)
+baks = list(TMP.glob("r1_samesec.sqlite3.bak-r3-*"))
+with sqlite3.connect(baks[0]) as bk:
+    bak_ok = (bk.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r3"
+              and bk.execute("SELECT COUNT(*) FROM bar WHERE time_basis='UNPROVEN'").fetchone()[0] == 3)
+check("13-15) [GPT R2] 스키마를 올리기 전에 같은 폴더에 백업(<파일>.bak-r3-<시각>) — 바꾸기 전 상태 그대로",
+      len(baks) == 1 and bak_ok and st9.backup_path == str(baks[0]))
+st9.close()
+st9 = ResearchStore(m5)
+check("13-16) 이미 최신이면 다시 백업하지 않음", st9.backup_path is None
+      and sorted(p.name.split(".bak-")[1][:2] for p in TMP.glob("r1_samesec.sqlite3.bak-*")) == ["r1", "r2", "r3"])
+# ↑ 스키마를 올린 세 번(r1 열기·r2 열기·r3 열기)마다 한 번씩만
 st9.close()
 
 # ── 6. 과거 휴장일 후보 ─────────────────────────────────────
@@ -1073,6 +1101,21 @@ new_job = rc.main(["--db", cdb, "backfill", "--new", "--limit", "1"], client=cli
 with ResearchStore(cdb) as cst:
     n_jobs3 = cst.conn.execute("SELECT COUNT(*) FROM job").fetchone()[0]
 check("7-3) 전체를 다시 받을 때만 --new로 새 작업", new_job == 0 and n_jobs3 == n_jobs + 1)
+made = []
+orig_make = rc.make_client
+rc.make_client = lambda a: made.append(a.env_file) or cli_client       # 팩토리만 가짜 — 실제 _LazyClient 경로
+try:
+    ldb = str(TMP / "lazy.sqlite3")
+    fk.calls.clear()
+    lc = [rc.main(["--db", ldb, "universe"], now=ck, calendar=CAL),
+          rc.main(["--db", ldb, "backfill", "--limit", "1", "--no-index"], now=ck, calendar=CAL)]
+except Exception as exc:                     # 래퍼가 조회를 넘기지 못하면 여기로 (실패로 기록)
+    lc = [f"{type(exc).__name__}: {exc}"]
+finally:
+    rc.make_client = orig_make
+check("7-4) [GPT R1] 클라이언트를 넘기지 않는 일반 CLI 경로(_LazyClient)로 universe·backfill 실제 조회 성공",
+      lc == [0, 0] and len(made) >= 1 and any(c["api"] == "ka10099" for c in fk.calls)
+      and any(c["api"] == "ka10081" for c in fk.calls))
 
 # ── 8. 경계: 연구 수집은 주문·운영 경로와 무관 ─────────────────
 FORBID = ("infra.broker", "app", "domain.service", "domain.position", "domain.risk", "domain.strategy",

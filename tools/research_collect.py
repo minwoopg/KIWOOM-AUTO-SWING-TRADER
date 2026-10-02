@@ -10,6 +10,7 @@
     python tools/research_collect.py scan                     # S1 스캔만 (지금 시각 기준, 조회 없음)
     python tools/research_collect.py scan --at 2026-10-02T19:30:00 --verify   # 그 시각 스캔 재현·비교
     python tools/research_collect.py status
+    python tools/research_collect.py inspect-unproven         # 읽기 전용: UNPROVEN 봉을 저장 기록과 대조(이전·백업 없음)
     python tools/research_collect.py holidays --from-year 2017 --to-year 2025
 
 - 저장: data/research/research.sqlite3 (git 제외). 테스트·수집 모두 commands/·원장과 무관.
@@ -90,6 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--at", help="스캔 시각(Asia/Seoul, 예 2026-10-02T19:30:00). 기본: 지금")
     sc.add_argument("--verify", action="store_true", help="같은 시각 실행이 이미 있으면 다시 계산해 저장값과 비교")
     sub.add_parser("status")
+    iu = sub.add_parser("inspect-unproven", help="읽기 전용 — 스키마를 올리지 않고 UNPROVEN 봉 점검")
+    iu.add_argument("--limit", type=int, default=30)
     h = sub.add_parser("holidays")
     h.add_argument("--from-year", type=int, default=2017)
     h.add_argument("--to-year", type=int, default=2025)
@@ -124,22 +127,34 @@ class _LazyClient:
         if self._client is None:
             self._client = self._factory()
 
+    def __getattr__(self, name):
+        # 일반 속성 조회가 실패했을 때만 불림 — fetch_page·calls 등을 실제 클라이언트로 넘김
+        if name.startswith("_"):
+            raise AttributeError(name)
+        if name in ("calls", "retries") and self._client is None:
+            return 0
+        self.ensure()
+        return getattr(self._client, name)
+
 
 def _ensure_client(client) -> None:
     if isinstance(client, _LazyClient):
         client.ensure()
 
-    def __getattr__(self, name):
-        if name in ("calls", "retries") and self._client is None:
-            return 0
-        if self._client is None:
-            self._client = self._factory()
-        return getattr(self._client, name)
+
+def _report_ok(path: str | None) -> bool:
+    if not path:
+        return False
+    md = Path(path)
+    return md.exists() and md.with_suffix(".json").exists()
 
 
 def run_scan(args, store: ResearchStore, calendar: TradingCalendar, scan_at: datetime, now, *,
              verify: bool = False) -> int:
-    """S1 관찰 스캔 (읽기만, 주문 없음). 반환: 0 완료·건너뜀 / 2 스캔 실패 / 1 보고서만 실패."""
+    """S1 관찰 스캔 (읽기만, 주문 없음). 반환: 0 완료·건너뜀 / 2 스캔 실패 / 1 보고서 실패(관찰 기록은 저장됨).
+
+    같은 시각 실행이 이미 완료돼 건너뛸 때, 보고서가 없으면(이전 저장 실패·삭제) 저장된 실행으로 보고서만
+    다시 만듭니다 — 다시 계산하지 않음 (GPT R4)."""
     scan_db = args.scan_db or str(Path(args.db).with_name("s1_scans.sqlite3"))
     with ScanStore(scan_db) as sstore:
         scanner = S1Scanner(store, sstore, calendar, after_close=timedelta(minutes=args.after_close_min), log=print)
@@ -148,23 +163,30 @@ def run_scan(args, store: ResearchStore, calendar: TradingCalendar, scan_at: dat
         except (ScanError, CollectError) as exc:
             print(f"[스캔 실패] {exc}")
             return 2
-        if res["status"] != "COMPLETE":
+        if res["status"] == "COMPLETE":
+            run = res
+        else:
             print_json({k: v for k, v in res.items() if k != "evals"})
             v = res.get("verify")
-            return 0 if (v is None or v["identical"]) else 2
+            if v is not None and not v["identical"]:
+                return 2
+            if _report_ok(res.get("report_path")):
+                return 0
+            run = sstore.load_run(res["run_id"])
+            print(f"[보고서 없음] 저장된 실행 {res['run_id']}로 보고서만 다시 만듭니다(재계산 없음)")
         try:
-            path = write_report(res, args.report_dir)
-            sstore.set_report_path(res["run_id"], path)
+            path = write_report(run, args.report_dir)
+            sstore.set_report_path(run["run_id"], path)
         except OSError as exc:
-            print(f"[보고서 저장 실패 — 관찰 기록은 저장됨] {exc}")
-            path, code = None, 1
-        else:
-            code = 0
-        c = res["counts"]
-        print_json({"run_id": res["run_id"], "signal_date": res["context"]["signal_date"], "universe": c["universe"],
-                    "signals": c["signals"], "by_signal": c["by_signal"], "data_hold_total": c["data_hold_total"],
-                    "index_status": c["index_status"], "market_regime": c["market_regime"],
-                    "no_trades_hold": c["no_trades_hold"], "observations": c["observations"], "report": path})
+            print(f"[보고서 저장 실패 — 관찰 기록은 저장됨, 같은 명령을 다시 실행하면 보고서만 다시 만듦] {exc}")
+            path = None
+        code = 0 if _report_ok(path) else 1
+        c = run["counts"]
+        print_json({"run_id": run["run_id"], "signal_date": run["context"]["signal_date"],
+                    "universe": c["universe"], "signals": c["signals"], "by_signal": c["by_signal"],
+                    "data_hold_total": c["data_hold_total"], "index_status": c["index_status"],
+                    "market_regime": c["market_regime"], "no_trades_hold": c["no_trades_hold"],
+                    "observations": c.get("observations"), "report": path})
         return code
 
 
@@ -183,7 +205,14 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                     **summarize(classify_rows(rows))})
         return 0
 
+    if args.cmd == "inspect-unproven":            # 읽기 전용 — ResearchStore를 열지 않음(자동 이전·백업 없음)
+        from infra.research.store_inspect import inspect_unproven
+        print_json(inspect_unproven(args.db, limit=args.limit))
+        return 0
+
     with ResearchStore(args.db) as store:
+        if store.backup_path:
+            print(f"[저장소 스키마 변경] 바꾸기 전 백업: {store.backup_path}")
         if client is None:
             client = _LazyClient(lambda: make_client(args))
         required_from = (date.fromisoformat(args.required_from) if args.cmd == "backfill"
