@@ -245,7 +245,10 @@ python tools/probe_market_data.py --env-file ..\KIWOOM-AUTO-TRADER\.env --skip-d
   같은 시각 재현은 `scan --at ... --verify`. 관찰 기록은 `data/research/s1_scans.sqlite3`(git 제외).
   스캔 시각에 알 수 있던 값만 쓰고, 데이터·지수·스냅숏이 불완전하면 후보로 넘기지 않고 보류합니다.
   실행·대표 기록은 계산 계약(설정·정책·계산 버전·lookback·완성 지연·달력)별로 따로 저장합니다.
-- 과거 일괄 스캔(A4-B)·다음날 확인과 이후 움직임(A5)은 다음 단계입니다.
+- A5-1 개장 가격 기록(주문 없음): 거래일 09:05(개장 + 5분)에 `open-check` — 대상 계약(`config/research.yaml`)의 전날
+  확정 후보만 현재가·기준가를 조회해 상한 이내·초과·손절가 이하·가격 기준 변경·거래 불가·조회 실패·지연·누락을 구분해
+  기록(`data/research/a5_checks.sqlite3`, 보고서 `reports/research/a5/`). 관찰 가격이며 체결이 아닙니다.
+- 다음 단계: 조회 전용 상시 실행 관리자(A24-A), 이후 움직임 평가(A5-2), 과거 일괄 스캔(A4-B).
 
 ## 원본과의 관계 (`provenance.json`)
 

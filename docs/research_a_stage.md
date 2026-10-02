@@ -270,4 +270,44 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
 
 ### 다음
 - A4-B: 과거 일괄 스캔 — 과거 달력 확인 뒤, 백필은 생존 편향 있는 탐색용 결과로 분리, 현재 위험 상태를 과거에 적용하지 않음.
-- A5: 다음 거래일 09:05 가격 확인, 5·10·20거래일 뒤 움직임 평가(actionable 기록만 진입 가정).
+- A5: 다음 거래일 09:05 가격 확인(A5-1, 아래), 5·10·20거래일 뒤 움직임 평가(A5-2, actionable 기록만 진입 가정).
+
+## A5-1 다음 거래일 개장 가격 기록 (`infra/research/open_check.py`) — 2026-10-02
+
+GPT 재검토 `71b78e3` 지시. 주문 없음·조회만(모의 도메인, 시세 TR ka10001 하나 추가). 관찰 가격 기록이며 체결이 아님.
+
+### 실행
+- `python tools/research_collect.py open-check` — 오늘(거래일)의 목표 시각(개장 + 5분, 보통 09:05)에 후보 가격을 기록.
+  목표 30분 전 안이면 기다렸다가 실행, 더 멀거나 `--no-wait`면 기록 없이 끝냄. 휴장일은 다음 거래일 안내.
+  지난 날짜는 `--day 2026-10-06` — 정규장이 끝났으면 조회 없이 누락(MISSED)으로 기록.
+- 대상 계약: `config/research.yaml`의 `s1.active_contract` — `current`(지금 코드·기본 설정 계약, update·scan과 같은 완성
+  지연) 또는 12자리 해시. 모르는 키·잘못된 값은 오류(fail-closed). 확인 시각 `a5.open_check.offset_min`(기본 5),
+  ON_TIME 허용 `on_time_tolerance_sec`(기본 120).
+- 저장 `data/research/a5_checks.sqlite3`(수집·관찰 DB와 별도), 보고서 `reports/research/a5/a5_open_<대상일>.md·json` (git 제외).
+- 원천 확인: `python tools/probe_price_sources.py`(장중) — ka10001 필드와 시각 필드 후보(ka10003 체결·ka10004 호가 후보 TR)를 기록.
+
+### 후보 확정 (`candidate_set`·`candidate`, 대상 거래일 D마다 한 번)
+- 신호일 t = D의 직전 거래일. 대상 계약의 t 대표 기록 중 **PASS·final=1·actionable=1·스캔 시각 < D 개장**만.
+  다른 계약·계약 기록 전(NULL)·개장 뒤 확정된 기록은 후보가 아님 → 종목당 하나.
+- 첫 확인 실행(목표 시각 이후)이 signal_id·run_id·contract_hash·입력 해시·진입 상한·참고 손절가·신호일 종가(그 스캔 시각의
+  값)·revision을 저장해 확정 — 이후 실행은 다시 고르지 않고 이 목록을 씀(관찰 기록이 나중에 바뀌어도).
+- D마다 목록 하나: 대상 계약을 바꿔도 이미 확정된 D는 그 계약 그대로(CONTRACT_CHANGED 표시), 새 계약은 다음 D부터.
+- 개장 전 대상 계약 스캔이 없으면 NO_SCAN, 스캔은 있었는데 후보가 없으면 NO_CANDIDATES로 확정(조회 0회).
+
+### 가격 확인 (`price_check`, 후보·확인 종류(`OPEN+5m`)마다 한 행)
+- 목표 시각 = 달력의 D 개장 시각 + offset(특수 개장일 1/2 10:00 개장이면 10:05). 목표 전에는 실행 거부(아무것도 기록 안 함).
+- 요청·수신 시각·시도 횟수·지연(초) 기록. 목표 + 허용 안이면 ON_TIME, 넘으면 LATE — 실제 조회 시각 그대로(09:05 가격으로
+  간주하지 않음). D 정규장 종료 뒤(또는 다음 날)면 조회하지 않고 MISSED — 일봉으로 채우지 않음.
+- 조회: ka10001 cur_prc(현재가)·base_pric(기준가) 필수, 시가·고가·저가·상한가·하한가·거래량은 있으면 기록, 응답 본문 보존
+  (토큰처럼 보이는 키는 가림). 원천 가격 시각 필드는 아직 확인되지 않아 비움(프로브 결과로 보완 예정).
+- 결과(fetch_status): OK / FETCH_FAILED(재시도 후 실패) / PARSE_FAILED(필수 필드 없음) / NOT_RUN(누락) — 그 확인의 결과로 남김.
+- 판정(outcome, 우선순위): NOT_TRADABLE(현재가 0·거래량 0(정지 가능)·상한가) > BASIS_CHANGED(D 기준가 ≠ 신호일 종가 —
+  액면분할·권리락 등으로 가격 기준이 달라져 진입 상한 비교 보류) > ABOVE_CAP(관찰가 > 진입 상한) > BELOW_STOP(관찰가 ≤ 참고
+  손절가) > WITHIN_CAP. 신호일 종가·기준가·진입 상한 대비 괴리를 함께 기록.
+- 가정 체결가격은 WITHIN_CAP일 때만 관찰가 + 규칙 이름 `OBSERVED_PRICE_AT_CHECK(가정 — 실제 체결 아님)`. 체결(FILLED) 표시 없음.
+- 재시작: 이미 기록된 후보는 다시 조회·저장하지 않음(행마다 한 트랜잭션 — 중단돼도 남은 후보만 이어서, 늦으면 LATE).
+  실행 기록(`check_run`)은 RUNNING → COMPLETE / FAILED, 남아 있던 RUNNING은 다음 실행이 ABORTED로 정리.
+
+### 다음
+- A24-A: 조회 전용 상시 실행 관리자 — 마감 갱신·스캔·아침 가격 기록 자동 실행, 재시작 후 이어감, 놓친 확인은 누락으로.
+- A5-2: 5·10·20거래일 움직임(미완료 표본·데이터 미확보 구분). 18:10 완성 기준 실측.
