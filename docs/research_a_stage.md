@@ -158,7 +158,7 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
   `research_series(as_of=X)`는 `query_mode=AS_OF`와 **X 시각의 integrity**를 따로 돌려줌 — 9/30 정상 → 10/1 실패 →
   10/2 복구 뒤에도 10/1 20:00 조회는 REBASE_REQUIRED(A4는 UNKNOWN으로 보류). 조회에 쓴 revision의 기록은
   `revision_info`(조정 기준·활성·대체 시각), 지금 상태는 `current_meta` — 과거 판단에 현재 메타를 쓰지 않음.
-- **기존 DB 이전 (열 때 자동, 한 번만)**: r1 → r2 → r3 → r4. r1에서 옮겨 온 판은 **r1이 저장 때마다 남긴 변경 기록**으로
+- **기존 DB 이전 (열 때 자동, 한 번만)**: r1 → r2 → r3 → r5 (r4 DB도 r5로). r1에서 옮겨 온 판은 **r1이 저장 때마다 남긴 변경 기록**으로
   시각을 복원(2차 재검토 #1): 판 활성 시각 = 그 판을 만든 INIT/REBASE 기록 시각(전체 수집 후 저장한 시각 — 첫 페이지
   수신 시각이 아님), 대체 시각 = 다음 판 활성 시각, 봉 available_at = max(판 활성 시각, 수신 뒤 첫 저장 기록 시각).
   활성 시각이 증가하지 않아 구간이 겹치거나 기록이 없어 입증할 수 없는 판·봉은 `time_basis=UNPROVEN` —
@@ -169,10 +169,23 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
   남김. r4는 '수신 시각 − 1초 이후의 첫 저장 기록'을 그 봉의 저장으로 보고 사용 가능 시각 = max(판 활성, 수신, 저장 기록)
   (수신 시각을 포함하므로 실제 저장보다 이르지 않음). 이미 r3인 DB는 열 때 MIGRATED·UNPROVEN 봉만 다시 계산
   (r3 뒤 새로 저장된 OBSERVED 봉은 그대로).
-  * 저장 근거는 **같은 revision의 저장 기록**(revision 표시 없는 APPEND 포함)만 인정. 근거 없는 봉은 UNPROVEN 유지(일괄 해제 안 함).
+  * 저장 근거는 **같은 revision의 저장 기록**만 인정. 근거 없는 봉은 UNPROVEN 유지(일괄 해제 안 함).
   * 스키마를 올리기 전에 같은 폴더에 자동 백업(`research.sqlite3.bak-<옛 버전>-<시각>`, SQLite 백업 API). 확인 뒤 지워도 됨.
   * 보정 전에 `inspect-unproven`(읽기 전용, 이전·백업 없음)으로 UNPROVEN 봉을 종목·날짜·저장 기록과 대조할 수 있음
     (PROVABLE_SAME_SECOND·PROVABLE은 보정 대상, REVISION_UNPROVEN·NO_EVIDENCE는 계속 보류).
+- **r3·r4 → r5 (2026-10-02, GPT 재검토 `c308ccb` B1) — 저장 기록의 판 귀속**: r4는 revision이 적히지 않은 APPEND 기록
+  (r1~r4의 매일 갱신)을 판 확인 없이 **모든 판의 근거**로 합쳐, 끝난 판의 봉을 다음 판의 APPEND로 입증할 수 있었음
+  (r3는 다른 판의 REBASE 기록까지 근거로 씀). r5 규칙:
+  * revision이 적힌 기록(INIT·REBASE·EXTEND, 새 APPEND)은 그 판. **새 APPEND 기록에는 revision을 적음**.
+  * revision 없는 예전 기록은 **기록 순서(event_id)상 바로 앞 INIT·REBASE의 판**으로 보되, 그 판의 활성 구간
+    [활성 시각, 다음 판 활성 시각) 안일 때만 인정. 앞 활성 기록이 없거나, revision 없는 활성 기록 뒤이거나, 구간 밖·다음 판
+    활성과 같은 초(경계)면 **어느 판인지 모호 → 근거로 쓰지 않음**.
+  * 봉 판정은 `plan_migrated_bar` 하나 — `inspect-unproven`과 실제 보정이 같은 함수를 씀.
+  * 이미 r4로 보정된 DB도 열 때 MIGRATED·UNPROVEN 봉을 다시 계산 — 잘못 입증된 봉은 UNPROVEN으로. 바뀐 봉 수는
+    출력(`[시각 재점검 r5] {...}`)과 meta `recheck_r5`에 남김. UNPROVEN 봉의 available_at은 기존 값 유지(시점 조회에 쓰지 않음).
+  * `inspect-unproven`은 이제 이미 MIGRATED인 봉도 같은 규칙으로 다시 계산해 바뀔 것을 미리 보여 줌(`recheck_migrated`:
+    MIGRATED→UNPROVEN·사용 가능 시각 변경), 판을 정할 수 없는 예전 기록 수(`unattributed_writes`), 관찰 기록 DB의
+    final 보정 대상(`scan_db`)도 함께.
 
 ### 응답·연속조회 계약 (A2-R3)
 - return_code가 **있고 0**이어야 성공(누락을 성공으로 보지 않음). cont-yn 헤더는 Y/N, Y이면 next-key 필수.
@@ -216,13 +229,21 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
   다시 분류**(저장 정책·적용 정책 둘 다 기록). 스냅숏이 없으면 스캔 실패(FAILED).
 - 세션 목록은 거래소 달력에서만(최근 300세션). 과거 연도 달력이 없으면 긴 창은 INSUFFICIENT_SESSIONS(보수적).
 
-### 저장 (스키마 s1)
+### 저장 (스키마 s2)
 | 표 | 내용 |
 |---|---|
 | `scan_run` | 실행. run_key = 신호일·스캔 시각·전략·설정 해시·분류 정책 — COMPLETE는 하나뿐(유일 인덱스). RUNNING → COMPLETE / FAILED / ABORTED. 실행 공통 증거(지수 revision·판정, 스냅숏, 세션, 버전)는 context |
 | `s1_eval` | 실행마다 종목별 판정 전부(PASS·FAIL·UNKNOWN, 조건별 값·사유, 참고 손절가·진입 상한, 관찰값). append-only. 결과·증거(revision·조정 기준일·지수 revision·스냅숏 ID·위험 표시)는 사전 압축 JSON, 입력 해시는 열 |
 | `s1_observation` | 신호 ID = `S1|전략|설정 해시|종목|신호일`(**입력 해시 없음**)마다 대표 판정. final(데이터·지수·스냅숏 모두 정상이고 **판정이 PASS/FAIL로 정해진** 경우)은 절대 안 바뀜 — 이후 정정·새 스냅숏에도 유지. final이 아닌 기록(데이터 보류·UNKNOWN — 거래 없는 봉·이력 부족 등)은 더 늦은 스캔 시각의 실행이 대체(이력 보존). 과거 시각 재현 실행은 더 늦은 기록을 되돌리지 않음 |
 
+| `obs_audit` | 대표 기록을 실행이 아닌 이유(규칙 변경)로 고친 이력 — 바꾸기 전·후 값과 사유 (s2) |
+
+- final 규칙(`scan_store.final_rule`, 실행 context `final_rule="inputs_ok+decided"`): 종목·지수·스냅숏 입력이 모두 정상이고
+  판정이 PASS/FAIL. 스캐너·관찰 저장소 이전·재현 검증이 같은 함수를 씀.
+- **s1 → s2 (GPT B2, 열 때 자동·한 번만, 바꾸기 전 백업 `s1_scans.sqlite3.bak-s1-<시각>`)**: 이전 버전(`f837185`)은 입력만
+  정상이면 UNKNOWN 판정도 final=1로 고정 → 이후 정상 판정으로 대체되지 않았음. 대표 기록 중 현재 규칙을 만족하지 않는
+  final=1을 final=0으로 풀고 `obs_audit`에 남김(PASS·FAIL 확정 기록은 그대로). 실행·종목별 판정(`scan_run`·`s1_eval`)은 당시
+  그대로 보존. `--verify`는 저장된 행에 현재 규칙을 적용한 final과 비교하고, 이전 규칙 차이는 `final_rule_changed`로 따로 셈.
 - actionable = 스캔 시각 < 다음 거래일 개장 — 개장 뒤에 늦게 해소된 기록은 0(A5에서 진입 가정에 쓰지 않음).
 - 같은 run_key 재실행 → 건너뜀(중복 저장 없음). `--verify`는 다시 계산해 종목별 판정·입력 해시·결과 비교만.
   건너뛸 때 보고서(md·json)가 없으면 저장된 실행(context·집계·판정)으로 **보고서만 다시 만듦**(재계산 없음).

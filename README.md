@@ -239,7 +239,8 @@ python tools/probe_market_data.py --env-file ..\KIWOOM-AUTO-TRADER\.env --skip-d
   일봉 거래대금 필드와 단위, 지수 일봉 TR을 실측합니다(TR 이름은 조사 후보). 장 마감 후 권장.
 - A2 수집(조회 전용, 모의 도메인만, 허용 TR 3개): `python tools/research_collect.py universe | backfill | update | status | holidays`
   — 종목 목록 스냅숏, 재개 가능한 일봉·지수 백필(2017-01-02부터), 매일 18:10 이후 갱신. 저장은 `data/research/`(git 제외).
-  규칙은 `docs/research_a_stage.md`의 A2 절. 저장소 스키마가 바뀌면 새 버전이 기존 DB를 열 때 자동 이전합니다(r1→r2).
+  규칙은 `docs/research_a_stage.md`의 A2 절. 저장소 스키마가 바뀌면 새 버전이 기존 DB를 열 때 백업 후 자동 이전합니다
+  (연구 DB r5, 관찰 DB s2). 바꾸기 전에 `inspect-unproven`(읽기 전용)으로 무엇이 바뀔지 미리 볼 수 있습니다.
 - A4-A S1 관찰 스캔(주문 없음): `update`가 끝나면 자동으로 스캔·보고서(`reports/research/s1/`), 스캔만은 `scan`,
   같은 시각 재현은 `scan --at ... --verify`. 관찰 기록은 `data/research/s1_scans.sqlite3`(git 제외).
   스캔 시각에 알 수 있던 값만 쓰고, 데이터·지수·스냅숏이 불완전하면 후보로 넘기지 않고 보류합니다.

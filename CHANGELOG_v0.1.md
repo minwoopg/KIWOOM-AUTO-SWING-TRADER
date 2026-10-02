@@ -1005,4 +1005,59 @@ GPT가 사용자 `status`와 `f837185`를 함께 검토: 회귀 30/30·스캔 39
 ### 전달 파일
 - 패치 0001 (r4), 0002 (fix: R1~R5), 0003 (docs)
 
+## 2026-10-02 — A4-A 잔여 B1·B2: 저장 근거의 판 귀속(r5), 이전 버전 UNKNOWN 확정 기록 보정(s2) (GPT 재검토 `c308ccb`)
+
+### 배경
+GPT가 `c308ccb`(R1~R5 반영)를 검토: R1·R4·R5 해결 확인, 회귀 30/30·수집 114/114·스캔 43/43·동등성 18/18, 읽기 전용 점검 전후
+DB 해시 동일, 자동 백업 확인. 기존 데이터와 관련된 잔여 2건.
+- B1(R2 잔여): `find_write_evidence`가 해당 revision 기록에 **revision 없는 모든 저장 기록(APPEND)** 을 합쳐, 끝난 판(revision 1,
+  10/2 19:10 종료)의 봉을 다음 판의 APPEND(10/3 19:00)로 입증 → MIGRATED·available_at 10/3 19:00. "같은 revision 근거만"
+  계약 위반. 이미 r4로 보정된 DB의 재점검 경로도 필요.
+- B2(R3 잔여): 새 기록은 UNKNOWN이면 final=0이지만, 이전 버전(`f837185`)이 남긴 `UNKNOWN + final=1` 대표 기록은 그대로 →
+  데이터 정정 뒤 PASS가 대체하지 못함(실제 `f837185`로 만든 DB로 재현).
+- 같은 날 사용자 운영 DB: r4 전환 완료, `inspect-unproven` UNPROVEN 0(199봉 모두 같은 초 근거로 보정).
+
+### 변경 내용
+| ID | 파일 | 내용 |
+|---|---|---|
+| B1 | `infra/research/store.py` (r5) | `revision_timeline`(판 순서·활성 시각) + `attribute_writes`: revision이 적힌 기록은 그 판, 없는 예전 기록은 기록 순서상 바로 앞 INIT·REBASE의 판이고 그 판의 활성 구간 [활성, 다음 판 활성) 안일 때만. 앞 활성 기록 없음·revision 없는 활성 기록 뒤·구간 밖·경계 같은 초는 귀속 불가(근거 아님). `find_write_evidence`는 같은 판으로 귀속된 기록만 |
+| B1 | 〃 | 봉 판정 `plan_migrated_bar` 하나로 보정·점검 공용. r3·r4 DB를 열면 백업 후 MIGRATED·UNPROVEN 봉 재계산(r5) — 잘못 입증된 봉 UNPROVEN, 바뀐 봉 수를 출력·meta `recheck_r5`에 |
+| B1 | 〃 `append_forward` | 새 APPEND·VERIFIED 기록에 revision 기록 |
+| B1 | `infra/research/store_inspect.py` | 읽기 전용 점검에 `recheck_migrated`(이미 MIGRATED인 봉 중 바뀔 것), `unattributed_writes`(판을 정할 수 없는 예전 기록), `scan_db`(관찰 DB final 보정 대상) 추가 |
+| B2 | `infra/research/scan_store.py` (s2) | `final_rule` 공용 함수. s1 DB를 열면 백업 후 대표 기록 중 현재 규칙을 만족하지 않는 final=1을 final=0으로 + `obs_audit`(바꾸기 전 run·판정·입력 상태, 사유). PASS·FAIL 확정 기록·`scan_run`·`s1_eval`은 그대로. 읽기 전용 미리 보기 `inspect_final_reset` |
+| B2 | `infra/research/s1_scanner.py` | final = `final_rule(...)`, 실행 context에 `final_rule` 기록. `verify`는 저장된 행에 현재 규칙을 적용해 비교, 이전 규칙 차이는 `final_rule_changed`로 따로 |
+| CLI | `tools/research_collect.py` | 연구 DB 재점검·관찰 DB 이전 시 백업 경로·집계 출력, `inspect-unproven`이 관찰 DB 미리 보기도 |
+| 문서 | `docs/research_a_stage.md`, `README.md` | r5 판 귀속 규칙, s2 이전·obs_audit·final 규칙 |
+
+### 테스트 및 검증
+- `test_research_collect` 114→119(실측 원문 포함 120): 5-4b 새 APPEND에 revision, 13-17 판 귀속 규칙(명시·순서·경계 같은 초·앞
+  기록 없음·revision 없는 활성 기록 뒤), 13-18 GPT 재현(다음 판 APPEND로 끝난 판 봉 입증 안 함, 그 APPEND가 속한 판 봉은 그대로),
+  13-19 r4 DB 읽기 전용 점검이 MIGRATED→UNPROVEN 1봉을 미리 보여 줌(DB 해시 그대로·백업 없음), 13-20 r4 DB 열기 → 백업·r5·집계,
+  13-21 다시 열면 재점검·백업 없음.
+- `test_research_scan` 43→49: 11-1 s1 DB 읽기 전용 미리 보기(풀 기록 1건·DB 그대로), 11-1b CLI `inspect-unproven`의 관찰 DB 미리 보기,
+  11-2 열면 백업·s2·UNKNOWN만 final=0·감사 이력·PASS/FAIL 4건 유지·당시 s1_eval 보존, 11-3 정정 뒤 최신 스캔 PASS가 대체(대체 1회),
+  11-4 이전 규칙 실행 재현 검증 identical·final_rule_changed 1, 11-5 다시 열면 보정·백업 없음.
+- **실제 이전 버전 코드로 재현**:
+  * r1(`166585b`) 백필·APPEND → r2(`e913df1`) 같은 초 EXTEND·REBASE·APPEND → r3(`f837185`) → r4(`c308ccb`) 순서로 만든 DB.
+    한 종목은 revision 1의 9/30 APPEND 기록이 없는 상태(GPT 조건): r3는 다음 판 REBASE(10/1 19:10), r4는 다음 판 APPEND
+    (10/2 19:00)로 입증. 새 코드 `inspect-unproven`(해시 그대로) → MIGRATED→UNPROVEN 1봉, 열면 백업 후 r5에서 그 봉만 UNPROVEN,
+    같은 초 EXTEND 봉(실측 199봉 유형)을 포함한 나머지 13봉은 그대로. r3 DB를 바로 r5로 열어도 같은 봉 판정(UNPROVEN 봉의
+    미사용 available_at만 이전 값 유지).
+  * `f837185` 스캐너로 관찰 DB(UNKNOWN·final=1) 생성 → `c308ccb`로 열어도 그대로(재현) → 새 코드로 열면 백업·s2·감사 1건,
+    정정 뒤 스캔 PASS가 대체(대체 1회), 이전 실행 재현 검증 identical·final_rule_changed 1.
+- 변이 확인 10종 모두 잡힘: 판 귀속 무시·활성 구간 검사 제거·새 APPEND revision 제거·r4 재점검 제거·점검의 MIGRATED 재점검 제거,
+  s1→s2 보정 제거·PASS/FAIL까지 해제·감사 이력 제거·verify 저장 final 그대로 비교·관찰 DB 백업 제거.
+- `run_regression_tests.py --skip test_broker_order_status.py`: 30개 전부 통과. 단타 원본 동등성 18/18. `git status` 깨끗.
+
+### 변경하지 않은 것
+- S1 조건·기준값, 수집·검증 규칙, 주문 경로. r3 뒤 새로 저장된 OBSERVED 봉. 이전 실행의 판정 기록(`scan_run`·`s1_eval`·집계).
+
+### 다음 작업
+- 사용자: 패치 적용 → `inspect-unproven`(읽기 전용: `recheck_migrated`·`unattributed_writes`·`scan_db` 확인) → `status`(백업 후 r5) →
+  18:10 이후 `update`(자동 스캔, 관찰 DB가 있으면 백업 후 s2) → 보고서.
+- 백업 파일(`.bak-r4-*`, `.bak-s1-*`)은 결과 확인 뒤 지워도 됨.
+
+### 전달 파일
+- 패치 0001 (fix: B1·B2), 0002 (docs)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
