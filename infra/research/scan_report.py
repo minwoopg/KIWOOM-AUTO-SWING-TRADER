@@ -24,6 +24,14 @@ def _table(head: list[str], rows: list[list]) -> list[str]:
     return out
 
 
+def _contract_line(ctx: dict) -> str:
+    c = ctx.get("contract")
+    if not c:
+        return "- 계산 계약: 기록 전 실행(s3 이전) — 대표 기록은 계약이 있는 실행과 따로 묶임"
+    return (f"- 계산 계약 `c:{ctx['contract_hash']}` — lookback {c['lookback_sessions']}세션 · 달력 `{c['calendar']}` · "
+            f"final 규칙 {c['final_rule']} · 스캔 규칙 {c['scan_rules']} (조건이 다르면 별도 실행·별도 대표 기록)")
+
+
 def build_markdown(run: dict) -> str:
     c, ctx = run["counts"], run["context"]
     lines = [f"# S1 관찰 보고서 — 신호일 {ctx['signal_date']}", "",
@@ -31,6 +39,7 @@ def build_markdown(run: dict) -> str:
              f"- 전략 `{ctx['strategy']}` · 설정 해시 `{ctx['config_hash']}` · 지표 {ctx['feature_version']} · "
              f"시장 {ctx['market_version']} · 분류 정책 {ctx['applied_policy']}",
              f"- 완성 기준: 정규장 종료 + {ctx['after_close_min']}분 — **잠정 기준**(장 마감 후 실측 확인 전)",
+             _contract_line(ctx),
              f"- 종목 목록: 스냅숏 {ctx['snapshot']['snapshot_id']} (관측 {ctx['snapshot']['observed_at']}, "
              f"저장 정책 {ctx['snapshot']['stored_policy']}) — 상태 {ctx['snapshot']['status']}",
              f"- 세션: {ctx['sessions']['first']} ~ {ctx['sessions']['last']} ({ctx['sessions']['count']}개, 거래소 달력)",

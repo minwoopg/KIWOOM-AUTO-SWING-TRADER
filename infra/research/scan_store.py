@@ -1,27 +1,32 @@
 from __future__ import annotations
 
-"""S1 관찰 기록 저장소 (A4-A, SQLite — 기본 data/research/s1_scans.sqlite3, git 제외). 스키마 s2.
+"""S1 관찰 기록 저장소 (A4-A, SQLite — 기본 data/research/s1_scans.sqlite3, git 제외). 스키마 s3.
 
 수집 저장소(research.sqlite3)와 파일을 나눕니다 — 수집 DB를 다시 만들거나 이전해도 관찰 기록은 그대로 남습니다.
 
 테이블
-- scan_run       : 스캔 한 번. run_key = (신호일 | 스캔 시각 | 전략 | 설정 해시 | 분류 정책). 같은 run_key의
-                   COMPLETE는 하나뿐(부분 유일 인덱스) → 같은 입력·스캔 시각으로 다시 돌려도 중복 저장 없음.
+- scan_run       : 스캔 한 번. run_key = (신호일 | 스캔 시각 | 전략 | 설정 해시 | 분류 정책 | **계산 계약 해시**). 같은
+                   run_key의 COMPLETE는 하나뿐(부분 유일 인덱스) → 같은 계약·스캔 시각으로 다시 돌려도 중복 저장 없음,
+                   계약(lookback·계산 버전·완성 지연·달력 등)이 다르면 별도 실행. contract_hash 열(s3).
                    상태 RUNNING → COMPLETE / FAILED / ABORTED. 시작할 때 남아 있던 RUNNING은 ABORTED로 정리.
 - s1_eval        : 그 실행의 종목별 판정 전부(후보·탈락·보류). 실행마다 쌓이고 고치지 않음(append-only).
                    결과 본문(S1Result, 시장 판정은 실행 context로 분리)·종목별 증거(revision·조정 기준·위험 표시)는
                    사전(zdict) 압축 JSON — 사전은 codec 표에 함께 저장. 입력 해시는 열로.
                    실행 공통 증거(지수 revision·스냅숏·세션·버전·스캔 시각)는 scan_run.context에 한 번만.
-- s1_observation : 신호 ID = 전략·설정 해시·종목·신호일(**입력 해시는 넣지 않음**)마다 대표 판정 하나.
+- s1_observation : 신호 ID = 전략·**계산 계약 해시**·종목·신호일(`S1|전략|c:<계약>|종목|신호일`, **입력 해시는 넣지 않음**)마다
+                   대표 판정 하나 — 서로 다른 계약의 판정이 한 대표 기록에 섞이지 않음. contract_hash 열(s3).
+                   s3 이전 기록(계약 미기록, contract_hash NULL, 신호 ID `S1|전략|설정 해시|…`)은 별도 묶음으로 그대로 보존.
                    final(`final_rule`: 데이터·지수·스냅숏 모두 정상이고 판정이 PASS/FAIL로 정해진 실행의 판정)은
                    **절대 바꾸지 않음** — 이후 정정 데이터나 새 스냅숏이 들어와도 그대로. final이 아닌 기록(보류·UNKNOWN)만
                    더 늦은 스캔 시각의 실행이 대체(이력 보존).
 - obs_audit      : 대표 기록을 실행이 아닌 이유로 고친 이력(s2). 바꾸기 전·후 값과 사유.
 
-기존 DB 이전 (열 때 자동, 바꾸기 전에 같은 폴더에 백업 `<파일>.bak-s1-<시각>`)
+기존 DB 이전 (열 때 자동, 바꾸기 전에 같은 폴더에 백업 `<파일>.bak-<옛 버전>-<시각>`)
 - s1 → s2 (GPT B2): 이전 버전(f837185)은 입력만 정상이면 UNKNOWN 판정도 final=1로 고정했습니다. 대표 기록 중
   현재 규칙(`final_rule`)을 만족하지 않는 final=1을 final=0으로 풀고 obs_audit에 남깁니다 → 이후 정해진 판정으로
   대체될 수 있음. PASS·FAIL로 확정된 대표 기록은 그대로. 실행·종목별 판정(scan_run·s1_eval)은 당시 그대로 보존.
+- s2 → s3 (GPT 재검토 016907a P2): scan_run·s1_observation에 contract_hash 열 추가. 기존 행은 NULL(계약 기록 전 —
+  어떤 lookback·달력으로 계산했는지 저장돼 있지 않아 추정하지 않음). 기존 기록은 바꾸지 않음.
 
 원자성: 종목별 판정·대표 기록·COMPLETE 표시를 한 트랜잭션에 씁니다. 도중에 끊기면 아무것도 남지 않고 실행은
 RUNNING으로 남아 다음 실행이 ABORTED로 정리합니다. COMPLETE 표시는 `status='RUNNING'`인 행에만 하므로,
@@ -38,7 +43,7 @@ from pathlib import Path
 
 from infra.research.store import sqlite_backup
 
-SCAN_SCHEMA = "s2"
+SCAN_SCHEMA = "s3"
 RUNNING, COMPLETE, FAILED, ABORTED = "RUNNING", "COMPLETE", "FAILED", "ABORTED"
 FINAL_RULE = "inputs_ok+decided"       # 실행 context에 기록 — 이 규칙 전(f837185) 실행과 구분
 
@@ -57,7 +62,7 @@ CREATE TABLE IF NOT EXISTS scan_run(
   feature_version TEXT NOT NULL, market_version TEXT NOT NULL, after_close_min INTEGER NOT NULL,
   started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, snapshot_id INTEGER, snapshot_observed_at TEXT,
   snapshot_status TEXT, context_json TEXT NOT NULL DEFAULT '{}', counts_json TEXT NOT NULL DEFAULT '{}',
-  report_path TEXT, error TEXT NOT NULL DEFAULT '');
+  report_path TEXT, error TEXT NOT NULL DEFAULT '', contract_hash TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_run_complete ON scan_run(run_key) WHERE status='COMPLETE';
 CREATE INDEX IF NOT EXISTS ix_run_signal_date ON scan_run(signal_date, scan_at);
 CREATE TABLE IF NOT EXISTS s1_eval(
@@ -72,7 +77,7 @@ CREATE TABLE IF NOT EXISTS s1_observation(
   config_hash TEXT NOT NULL, run_id TEXT NOT NULL, scan_at TEXT NOT NULL, eligible_signal TEXT NOT NULL,
   data_status TEXT NOT NULL, input_hash TEXT NOT NULL, final INTEGER NOT NULL, actionable INTEGER,
   first_run_id TEXT NOT NULL, replaced_count INTEGER NOT NULL, history_json TEXT NOT NULL,
-  created_at TEXT NOT NULL, updated_at TEXT NOT NULL) WITHOUT ROWID;
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, contract_hash TEXT) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS ix_obs_date ON s1_observation(signal_date, eligible_signal);
 CREATE TABLE IF NOT EXISTS codec(name TEXT PRIMARY KEY, zdict BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS obs_audit(
@@ -119,8 +124,9 @@ def _ts(dt: datetime | None) -> str | None:
     return None if dt is None else dt.replace(microsecond=0).isoformat(timespec="seconds")
 
 
-def signal_id(strategy: str, config_hash: str, symbol: str, signal_date: str) -> str:
-    return f"S1|{strategy}|{config_hash}|{symbol}|{signal_date}"
+def signal_id(strategy: str, contract_hash: str, symbol: str, signal_date: str) -> str:
+    """대표 기록 키 — 계산 계약별로 구분(입력 해시는 넣지 않음). s3 이전 기록은 c: 대신 설정 해시였음."""
+    return f"S1|{strategy}|c:{contract_hash}|{symbol}|{signal_date}"
 
 
 _RESET_SELECT = (
@@ -148,7 +154,7 @@ def inspect_final_reset(path: str | Path) -> dict:
             by_signal[r["eligible_signal"]] = by_signal.get(r["eligible_signal"], 0) + 1
         return {"scan_schema": cur[0] if cur else None, "final_observations": len(rows),
                 "final_to_reset": len(reset), "by_signal": by_signal,
-                "note": "s1이면 다음 열기 때 이 기록들의 final을 풂(감사 이력 남김). s2면 이미 끝남 — 0이어야 정상."}
+                "note": "s1이면 다음 열기 때 이 기록들의 final을 풂(감사 이력 남김). s2 이후면 이미 끝남 — 0이어야 정상."}
     finally:
         conn.close()
 
@@ -167,16 +173,23 @@ class ScanStore:
         cur = self.conn.execute("SELECT value FROM meta WHERE key='scan_schema'").fetchone()
         if cur is None:
             self.conn.execute("INSERT INTO meta(key, value) VALUES('scan_schema', ?)", (SCAN_SCHEMA,))
-        elif cur[0] == "s1":
-            if backup_before_upgrade:
-                self.backup_path = sqlite_backup(self.conn, self.path, "s1")
-            self._upgrade_s1_to_s2()
-        elif cur[0] != SCAN_SCHEMA:
-            raise RuntimeError(f"관찰 저장소 스키마 {cur[0]} ≠ {SCAN_SCHEMA}: {self.path}")
+        else:
+            version = cur[0]
+            if version not in ("s1", "s2", SCAN_SCHEMA):
+                raise RuntimeError(f"관찰 저장소 스키마 {version} ≠ {SCAN_SCHEMA}: {self.path}")
+            if version != SCAN_SCHEMA:
+                if backup_before_upgrade:
+                    self.backup_path = sqlite_backup(self.conn, self.path, version)
+                self.upgrade_summary = {"from": version, "to": SCAN_SCHEMA}
+            if version == "s1":
+                self.upgrade_summary.update(self._upgrade_s1_to_s2())
+                version = "s2"
+            if version == "s2":
+                self.upgrade_summary.update(self._upgrade_s2_to_s3())
         self.conn.execute("INSERT OR IGNORE INTO codec(name, zdict) VALUES(?, ?)", (CODEC, ZDICT_V1))
         self._zdict = {r[0]: bytes(r[1]) for r in self.conn.execute("SELECT name, zdict FROM codec")}
 
-    def _upgrade_s1_to_s2(self) -> None:
+    def _upgrade_s1_to_s2(self) -> dict:
         """GPT B2: 이전 버전이 고정한 'UNKNOWN + final=1' 대표 기록을 final=0으로 (감사 이력과 함께, 한 트랜잭션).
 
         현재 규칙(`final_rule`)을 대표 기록의 실행 판정 행(s1_eval)에 다시 적용해 만족하지 않는 것만 풉니다.
@@ -195,11 +208,27 @@ class ScanStore:
                                    json.dumps({"final": 0}), reason))
                 self.conn.execute("UPDATE s1_observation SET final=0, updated_at=? WHERE signal_id=?",
                                   (now, r["signal_id"]))
-            summary = {"from": "s1", "at": now, "final_observations": len(rows), "final_reset": len(reset)}
-            self.conn.execute("UPDATE meta SET value=? WHERE key='scan_schema'", (SCAN_SCHEMA,))
+            summary = {"at": now, "final_observations": len(rows), "final_reset": len(reset)}
+            self.conn.execute("UPDATE meta SET value='s2' WHERE key='scan_schema'")
             self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_s2', ?)",
                               (json.dumps(summary, ensure_ascii=False),))
-        self.upgrade_summary = summary
+        return summary
+
+    def _upgrade_s2_to_s3(self) -> dict:
+        """계산 계약 열(contract_hash) 추가. 기존 실행·대표 기록은 NULL로 두고 바꾸지 않음(계약을 추정하지 않음)."""
+        with self.tx():
+            for table in ("scan_run", "s1_observation"):
+                cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+                if "contract_hash" not in cols:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN contract_hash TEXT")
+            out = {"legacy_runs": self.conn.execute(
+                       "SELECT COUNT(*) FROM scan_run WHERE contract_hash IS NULL").fetchone()[0],
+                   "legacy_observations": self.conn.execute(
+                       "SELECT COUNT(*) FROM s1_observation WHERE contract_hash IS NULL").fetchone()[0]}
+            self.conn.execute("UPDATE meta SET value=? WHERE key='scan_schema'", (SCAN_SCHEMA,))
+            self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_s3', ?)",
+                              (json.dumps({"at": _ts(datetime.now()), **out}, ensure_ascii=False),))
+        return out
 
     def audit(self, signal_id: str | None = None) -> list[dict]:
         q, a = "SELECT * FROM obs_audit", ()
@@ -242,7 +271,7 @@ class ScanStore:
 
     def begin_run(self, *, run_key: str, scan_at: datetime, signal_date: str, strategy: str, config_hash: str,
                   universe_policy: str, feature_version: str, market_version: str, after_close_min: int,
-                  started_at: datetime) -> tuple[str, list[str]]:
+                  started_at: datetime, contract_hash: str) -> tuple[str, list[str]]:
         """(run_id, 정리한 이전 RUNNING 실행 목록). 이미 COMPLETE면 ValueError — 호출 전에 complete_run으로 확인."""
         with self.tx():
             if self.conn.execute("SELECT 1 FROM scan_run WHERE run_key=? AND status=?", (run_key, COMPLETE)).fetchone():
@@ -257,10 +286,10 @@ class ScanStore:
             run_id = f"s1_{signal_date.replace('-', '')}_{scan_at:%Y%m%d%H%M%S}_{key_hash}_a{attempt}"
             self.conn.execute(
                 "INSERT INTO scan_run(run_id, run_key, attempt, scan_at, signal_date, strategy, config_hash,"
-                " universe_policy, feature_version, market_version, after_close_min, started_at, status)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " universe_policy, feature_version, market_version, after_close_min, started_at, status, contract_hash)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (run_id, run_key, attempt, _ts(scan_at), signal_date, strategy, config_hash, universe_policy,
-                 feature_version, market_version, after_close_min, _ts(started_at), RUNNING))
+                 feature_version, market_version, after_close_min, _ts(started_at), RUNNING, contract_hash))
         return run_id, stale
 
     def fail_run(self, run_id: str, error: str, now: datetime, status: str = FAILED) -> None:
@@ -270,7 +299,7 @@ class ScanStore:
 
     def finish_run(self, *, run_id: str, evals: list[dict], context: dict, counts: dict, snapshot: dict | None,
                    snapshot_status: str, scan_at: datetime, now: datetime, strategy: str, config_hash: str,
-                   before_commit=None) -> dict:
+                   contract_hash: str, before_commit=None) -> dict:
         """판정·대표 기록·COMPLETE를 한 트랜잭션에. 반환: 대표 기록 변화 집계."""
         obs_tally = {"new": 0, "kept_final": 0, "replaced": 0, "kept_newer": 0}
         with self.tx():
@@ -292,7 +321,7 @@ class ScanStore:
                   None if e["result"] is None else self._pack(e["result"]), self._pack(e["evidence"])) for e in evals])
             for e in evals:
                 key = self._upsert_observation(e, run_id=run_id, scan_at=scan_at, now=now, strategy=strategy,
-                                               config_hash=config_hash)
+                                               config_hash=config_hash, contract_hash=contract_hash)
                 obs_tally[key] += 1
             counts = {**counts, "observations": obs_tally}
             self.conn.execute("UPDATE scan_run SET counts_json=? WHERE run_id=?",
@@ -301,15 +330,18 @@ class ScanStore:
                 before_commit()
         return obs_tally
 
-    def _upsert_observation(self, e: dict, *, run_id, scan_at, now, strategy, config_hash) -> str:
-        sid = signal_id(strategy, config_hash, e["symbol"], e["signal_date"])
+    def _upsert_observation(self, e: dict, *, run_id, scan_at, now, strategy, config_hash, contract_hash) -> str:
+        sid = signal_id(strategy, contract_hash, e["symbol"], e["signal_date"])
         old = self.conn.execute("SELECT * FROM s1_observation WHERE signal_id=?", (sid,)).fetchone()
         vals = (run_id, _ts(scan_at), e["eligible_signal"], e["data_status"], e["input_hash"], int(e["final"]),
                 e["actionable"])
         if old is None:
-            self.conn.execute("INSERT INTO s1_observation VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            self.conn.execute("INSERT INTO s1_observation(signal_id, symbol, signal_date, strategy, config_hash, run_id,"
+                              " scan_at, eligible_signal, data_status, input_hash, final, actionable, first_run_id,"
+                              " replaced_count, history_json, created_at, updated_at, contract_hash)"
+                              " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                               (sid, e["symbol"], e["signal_date"], strategy, config_hash, *vals, run_id, 0, "[]",
-                               _ts(now), _ts(now)))
+                               _ts(now), _ts(now), contract_hash))
             return "new"
         if old["final"]:
             return "kept_final"                    # 확정된 관찰은 덮어쓰지 않음
@@ -359,9 +391,15 @@ class ScanStore:
             out.append(d)
         return out
 
-    def observations(self, signal_date: str | None = None) -> list[dict]:
-        q, a = "SELECT * FROM s1_observation", ()
+    def observations(self, signal_date: str | None = None, *, contract_hash: str | None = None) -> list[dict]:
+        """대표 기록. contract_hash를 주면 그 계산 계약의 기록만(계약이 둘 이상이면 섞지 않으려면 지정)."""
+        conds, a = [], []
         if signal_date:
-            q, a = q + " WHERE signal_date=?", (signal_date,)
+            conds.append("signal_date=?")
+            a.append(signal_date)
+        if contract_hash:
+            conds.append("contract_hash=?")
+            a.append(contract_hash)
+        q = "SELECT * FROM s1_observation" + (" WHERE " + " AND ".join(conds) if conds else "")
         return [{**dict(r), "history": json.loads(r["history_json"])}
-                for r in self.conn.execute(q + " ORDER BY signal_date, symbol", a)]
+                for r in self.conn.execute(q + " ORDER BY signal_date, symbol, signal_id", a)]

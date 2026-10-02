@@ -15,8 +15,12 @@ from __future__ import annotations
   * 세션 목록은 거래소 달력(config/krx_calendar.yaml)에서만 — 다루지 않는 해는 INSUFFICIENT_SESSIONS(보수적).
 - 후보(PASS)와 탈락(FAIL)·보류(UNKNOWN)를 모두 조건별 사유·참고 손절가·진입 상한과 함께 저장합니다.
   입력 해시·revision·조정 기준·스냅숏 ID·계산 버전은 증거 필드(신호 ID에는 넣지 않음).
-- 같은 run_key(신호일·스캔 시각·전략·설정·분류 정책)는 한 번만 완료로 저장 — 다시 돌리면 건너뜀(verify면 다시
-  계산해 저장값과 같은지 비교만).
+- 같은 run_key(신호일·스캔 시각·전략·설정·분류 정책·**계산 계약**)는 한 번만 완료로 저장 — 다시 돌리면 건너뜀(verify면
+  다시 계산해 저장값과 같은지 비교만).
+- 계산 계약(GPT 재검토 016907a): 같은 DB·같은 스캔 시각이라도 결과를 바꿀 수 있는 계산 조건 전부 —
+  전략·설정 해시·분류 정책·지표/시장 계산 버전·lookback(세션 수)·완성 봉 지연·거래일 달력 내용·final 규칙·
+  스캔 입력 규칙 버전·지수 ID. 해시를 실행 키·context·대표 기록 키에 넣어, 조건이 다르면 별도 실행·별도 대표 기록.
+  입력 데이터 해시는 계약이 아니라 종목별 증거(input_hash)로 그대로 둡니다.
 """
 
 import hashlib
@@ -39,6 +43,18 @@ from utils.trading_calendar import CalendarCoverageError, TradingCalendar
 SCAN_LOOKBACK_SESSIONS = 300          # S1 최대 창 160 + 관찰값 여유(252일 지표가 생겨도 충분)
 INDEX_IDS = ("INDEX:KOSPI:001", "INDEX:KOSDAQ:101")
 OK = "OK"
+# 스캔 입력 선택 규칙(데이터·지수·스냅숏 보류 조건, 세션 창, 입력 해시 구성)의 버전 — 이 파일의 그 규칙을 바꾸면 올림
+SCAN_RULES_VERSION = "sr1"
+
+
+def calendar_version(cal: TradingCalendar) -> str:
+    """거래일 달력의 계산에 쓰이는 내용(다루는 해·휴장일·정규/특수 세션 시각)의 해시 — 휴장일 이름·주석·줄바꿈은 무관."""
+    def st(x):
+        return [x.open.strftime("%H:%M"), x.close.strftime("%H:%M"), x.closing_auction_start.strftime("%H:%M")]
+    data = {"covered_years": sorted(cal.covered_years), "holidays": sorted(d.isoformat() for d in cal.holidays),
+            "regular": st(cal.regular),
+            "special_sessions": {d.isoformat(): st(v) for d, v in sorted(cal.special_sessions.items())}}
+    return "cal:" + hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:12]
 
 
 class ScanError(RuntimeError):
@@ -110,10 +126,20 @@ class S1Scanner:
         self.log = log or (lambda m: None)
         self.strategy = f"{STRATEGY_ID}_{STRATEGY_VERSION}"
         self.config_hash = self.cfg.config_hash()
+        self.contract = self._contract()
+        self.contract_hash = hashlib.sha256(json.dumps(self.contract, sort_keys=True).encode()).hexdigest()[:12]
+
+    def _contract(self) -> dict:
+        """계산 계약 — 같은 DB·스캔 시각에서 결과를 바꿀 수 있는 계산 조건 전부(입력 데이터 제외)."""
+        return {"strategy": self.strategy, "config_hash": self.config_hash,
+                "universe_policy": self.policy.policy_version, "feature_version": F.FEATURE_VERSION,
+                "market_version": M.MARKET_VERSION, "lookback_sessions": self.lookback,
+                "after_close_sec": int(self.after_close.total_seconds()), "calendar": calendar_version(self.cal),
+                "final_rule": FINAL_RULE, "scan_rules": SCAN_RULES_VERSION, "index_ids": list(INDEX_IDS)}
 
     def run_key(self, scan_at: datetime, signal_date: date) -> str:
         return (f"{signal_date.isoformat()}|{scan_at.replace(microsecond=0).isoformat(timespec='seconds')}|"
-                f"{self.strategy}|{self.config_hash}|{self.policy.policy_version}")
+                f"{self.strategy}|{self.config_hash}|{self.policy.policy_version}|c:{self.contract_hash}")
 
     # ── 계산(읽기만) ─────────────────────────────────────────
     def _evidence(self, rs) -> dict:
@@ -224,7 +250,7 @@ class S1Scanner:
                    "applied_policy": self.policy.policy_version, "strategy": self.strategy,
                    "config_hash": self.config_hash, "config": asdict(self.cfg),
                    "feature_version": F.FEATURE_VERSION, "market_version": M.MARKET_VERSION,
-                   "final_rule": FINAL_RULE}
+                   "final_rule": FINAL_RULE, "contract_hash": self.contract_hash, "contract": self.contract}
         return {"signal_date": t, "snapshot": snap, "snapshot_status": snap_status, "evals": evals,
                 "context": context}
 
@@ -236,6 +262,7 @@ class S1Scanner:
         done = self.sstore.complete_run(key)
         if done is not None:
             out = {"status": "SKIPPED_ALREADY_COMPLETE", "run_id": done["run_id"], "run_key": key,
+                   "contract_hash": self.contract_hash,
                    "counts": done["counts"], "report_path": done["report_path"]}
             if verify:
                 out["verify"] = self.verify(done["run_id"], scan_at)
@@ -244,7 +271,8 @@ class S1Scanner:
             run_key=key, scan_at=scan_at, signal_date=t.isoformat(), strategy=self.strategy,
             config_hash=self.config_hash, universe_policy=self.policy.policy_version,
             feature_version=F.FEATURE_VERSION, market_version=M.MARKET_VERSION,
-            after_close_min=int(self.after_close.total_seconds() // 60), started_at=now())
+            after_close_min=int(self.after_close.total_seconds() // 60), started_at=now(),
+            contract_hash=self.contract_hash)
         for rid in aborted:
             self.log(f"[SCAN] 이전에 끝나지 않은 실행 {rid} → ABORTED")
         try:
@@ -253,7 +281,8 @@ class S1Scanner:
             obs = self.sstore.finish_run(run_id=run_id, evals=comp["evals"], context=comp["context"], counts=counts,
                                          snapshot=comp["snapshot"], snapshot_status=comp["snapshot_status"],
                                          scan_at=scan_at, now=now(), strategy=self.strategy,
-                                         config_hash=self.config_hash, before_commit=before_commit)
+                                         config_hash=self.config_hash, contract_hash=self.contract_hash,
+                                         before_commit=before_commit)
         except Exception as exc:
             self.sstore.fail_run(run_id, f"{type(exc).__name__}: {exc}", now())
             raise
@@ -263,15 +292,25 @@ class S1Scanner:
             finally:
                 raise
         counts["observations"] = obs
-        return {"status": "COMPLETE", "run_id": run_id, "run_key": key, "counts": counts,
+        return {"status": "COMPLETE", "run_id": run_id, "run_key": key, "contract_hash": self.contract_hash,
+                "counts": counts,
                 "context": comp["context"], "evals": comp["evals"], "aborted_previous": aborted}
 
     def verify(self, run_id: str, scan_at: datetime) -> dict:
         """저장된 실행을 같은 scan_at으로 다시 계산해 종목별 판정·입력 해시·결과가 같은지 비교(저장 안 함).
 
         final은 입력 상태·판정에서 정해지는 값이라, 저장된 행에 **현재 규칙**을 적용한 값과 비교합니다.
-        이전 규칙(f837185)으로 저장된 실행의 final 차이는 불일치가 아니라 final_rule_changed로 따로 셉니다."""
-        stored = {e["symbol"]: e for e in self.sstore.evals(run_id)}
+        이전 규칙(f837185)으로 저장된 실행의 final 차이는 불일치가 아니라 final_rule_changed로 따로 셉니다.
+        저장된 실행의 계산 계약이 지금 스캐너와 다르면 비교하지 않고 contract_match=False(같은 조건의 재현이 아님).
+        계약을 기록하기 전 실행(s3 이전)은 contract_match=None으로 두고 비교합니다."""
+        run = self.sstore.load_run(run_id)
+        stored_contract = (run or {}).get("context", {}).get("contract_hash")
+        if stored_contract is not None and stored_contract != self.contract_hash:
+            return {"identical": False, "contract_match": False, "stored_contract_hash": stored_contract,
+                    "contract_hash": self.contract_hash,
+                    "contract_diff": sorted(k for k in set(self.contract) | set(run["context"].get("contract", {}))
+                                            if self.contract.get(k) != run["context"].get("contract", {}).get(k))}
+        stored = {e["symbol"]: e for e in (run or {}).get("evals", [])}
         comp = {e["symbol"]: e for e in self.compute(scan_at)["evals"]}
         keys = ("eligible_signal", "data_status", "index_status", "snapshot_status", "input_hash")
 
@@ -283,8 +322,8 @@ class S1Scanner:
                       or any(stored[s][k] != comp[s][k] for k in keys) or rule(stored[s]) != comp[s]["final"]
                       or stored[s]["result"] != json.loads(json.dumps(comp[s]["result"], sort_keys=True)))
         changed = sum(1 for e in stored.values() if e["final"] != rule(e))
-        return {"identical": not diff, "symbols": len(comp), "diff": diff[:20], "diff_count": len(diff),
-                "final_rule_changed": changed}
+        return {"identical": not diff, "contract_match": None if stored_contract is None else True,
+                "symbols": len(comp), "diff": diff[:20], "diff_count": len(diff), "final_rule_changed": changed}
 
 
 def summarize_evals(evals: list[dict], context: dict) -> dict:

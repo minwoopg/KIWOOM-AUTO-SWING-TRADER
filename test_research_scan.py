@@ -335,21 +335,21 @@ check("7-2) 다음 실행은 같은 run_key로 정상 완료(시도 2), 결과 �
       and [r["status"] for r in ss.runs()] == [ABORTED, COMPLETE])
 rid, _ = ss.begin_run(run_key="k|x", scan_at=datetime(2026, 9, 30, 20, 0), signal_date="2026-09-30", strategy="s",
                       config_hash="c" * 16, universe_policy="u", feature_version="f", market_version="m",
-                      after_close_min=160, started_at=datetime(2026, 9, 30, 20, 0))       # 강제 종료로 RUNNING에 남음
+                      after_close_min=160, started_at=datetime(2026, 9, 30, 20, 0), contract_hash="t" * 12)       # 강제 종료로 RUNNING에 남음
 r8 = sc.run(datetime(2026, 9, 30, 20, 30), now=Clock(datetime(2026, 9, 30, 20, 31)))
 check("7-3) 강제 종료로 RUNNING에 남은 실행은 다음 실행이 ABORTED로 정리",
       r8["aborted_previous"] == [rid] and {r["run_id"]: r["status"] for r in ss.runs()}[rid] == ABORTED)
 rid2, _ = ss.begin_run(run_key="k|y", scan_at=datetime(2026, 9, 30, 21, 0), signal_date="2026-09-30", strategy="s",
                        config_hash="c" * 16, universe_policy="u", feature_version="f", market_version="m",
-                       after_close_min=160, started_at=datetime(2026, 9, 30, 21, 0))
+                       after_close_min=160, started_at=datetime(2026, 9, 30, 21, 0), contract_hash="t" * 12)
 ss.begin_run(run_key="k|z", scan_at=datetime(2026, 9, 30, 21, 5), signal_date="2026-09-30", strategy="s",
              config_hash="c" * 16, universe_policy="u", feature_version="f", market_version="m",
-             after_close_min=160, started_at=datetime(2026, 9, 30, 21, 5))            # 다른 실행이 rid2를 정리
+             after_close_min=160, started_at=datetime(2026, 9, 30, 21, 5), contract_hash="t" * 12)            # 다른 실행이 rid2를 정리
 n_eval = ss.conn.execute("SELECT COUNT(*) FROM s1_eval").fetchone()[0]
 try:
     ss.finish_run(run_id=rid2, evals=r7["evals"], context={}, counts={}, snapshot=None, snapshot_status="OK",
                   scan_at=datetime(2026, 9, 30, 21, 0), now=datetime(2026, 9, 30, 21, 6), strategy="s",
-                  config_hash="c" * 16)
+                  config_hash="c" * 16, contract_hash="t" * 12)
     check("7-4) ABORTED로 정리된 실행은 늦게 끝나도 완료로 표시되지 않고 아무것도 쓰지 않음", False)
 except ScanAbortedError:
     check("7-4) ABORTED로 정리된 실행은 늦게 끝나도 완료로 표시되지 않고 아무것도 쓰지 않음",
@@ -500,12 +500,17 @@ sc, ss = scanner(st, "legacy")
 first = sc.run(SCAN, now=Clock(datetime(2026, 9, 30, 19, 31)))
 ss.close()
 ldb = TMP / "legacy_scans.sqlite3"
-con = sqlite3.connect(ldb)                  # 이전 버전(f837185)이 남긴 상태: 입력만 정상이면 UNKNOWN도 final=1, 스키마 s1
-con.execute("UPDATE s1_observation SET final=1 WHERE symbol='000600'")
+con = sqlite3.connect(ldb)                  # 이전 버전(f837185)이 남긴 상태: 입력만 정상이면 UNKNOWN도 final=1, 스키마 s1,
+con.execute("UPDATE s1_observation SET final=1 WHERE symbol='000600'")      # 계산 계약 기록 없음
 con.execute("UPDATE s1_eval SET final=1 WHERE symbol='000600'")
 ctx_old = json.loads(con.execute("SELECT context_json FROM scan_run").fetchone()[0])
-ctx_old.pop("final_rule")
-con.execute("UPDATE scan_run SET context_json=?", (json.dumps(ctx_old, ensure_ascii=False),))
+for k in ("final_rule", "contract_hash", "contract"):
+    ctx_old.pop(k)
+con.execute("UPDATE scan_run SET context_json=?, contract_hash=NULL, run_key=substr(run_key, 1, instr(run_key, '|c:') - 1)",
+            (json.dumps(ctx_old, ensure_ascii=False),))
+for (sig,) in con.execute("SELECT signal_id FROM s1_observation").fetchall():
+    con.execute("UPDATE s1_observation SET signal_id=?, contract_hash=NULL WHERE signal_id=?",
+                (sig.replace(f"|c:{sc.contract_hash}|", f"|{sc.config_hash}|"), sig))
 con.execute("DROP TABLE obs_audit")
 con.execute("UPDATE meta SET value='s1' WHERE key='scan_schema'")
 con.commit()
@@ -531,11 +536,13 @@ ss = ScanStore(ldb)
 O = {o["symbol"]: o for o in ss.observations("2026-09-30")}
 aud = ss.audit()
 ev_old = {e["symbol"]: e for e in ss.evals(first["run_id"])}
-check("11-2) [GPT B2] 열면 백업 후 s2: UNKNOWN+final=1 대표 기록만 final=0(감사 이력: 바꾸기 전 run·판정·입력 상태), "
-      "PASS·FAIL 확정 기록 4건은 그대로, 당시 실행 판정 행(s1_eval)은 보존",
-      ss.conn.execute("SELECT value FROM meta WHERE key='scan_schema'").fetchone()[0] == "s2"
-      and ss.upgrade_summary["final_reset"] == 1 and ss.upgrade_summary["final_observations"] == 5
-      and O["000600"]["final"] == 0 and O["000600"]["eligible_signal"] == "UNKNOWN"
+check("11-2) [GPT B2] 열면 백업 후 s3: UNKNOWN+final=1 대표 기록만 final=0(감사 이력: 바꾸기 전 run·판정·입력 상태), "
+      "PASS·FAIL 확정 기록 4건은 그대로, 당시 실행 판정 행(s1_eval)은 보존, 계약 기록 전 실행·대표 기록은 NULL로 표시",
+      ss.conn.execute("SELECT value FROM meta WHERE key='scan_schema'").fetchone()[0] == "s3"
+      and ss.upgrade_summary["from"] == "s1" and ss.upgrade_summary["final_reset"] == 1
+      and ss.upgrade_summary["final_observations"] == 5 and ss.upgrade_summary["legacy_runs"] == 1
+      and ss.upgrade_summary["legacy_observations"] == 9
+      and O["000600"]["final"] == 0 and O["000600"]["eligible_signal"] == "UNKNOWN" and O["000600"]["contract_hash"] is None
       and all(O[s]["final"] == 1 for s in ("000100", "000200", "000300", "100100"))
       and len(aud) == 1 and aud[0]["action"] == "FINAL_RESET" and aud[0]["before"]["eligible_signal"] == "UNKNOWN"
       and aud[0]["before"]["run_id"] == first["run_id"] and aud[0]["after"] == {"final": 0}
@@ -547,20 +554,94 @@ st.replace_series(spec=STOCK_DAILY, series_id="STOCK:000600", code="000600",    
                   required_from=None, coverage="OK", coverage_detail="", reason="TEST_NO_TRADES_FIX")
 sc = S1Scanner(st, ss, CAL)
 later = sc.run(datetime(2026, 10, 1, 12, 0), now=Clock(datetime(2026, 10, 1, 12, 1)))
-O = {o["symbol"]: o for o in ss.observations("2026-09-30")}
-check("11-3) [GPT B2 재현] 이전 대표 기록 UNKNOWN → 데이터 정정 뒤 최신 스캔 PASS가 대체(대체 1회, 이력 보존), "
-      "확정 기록 4건 유지",
-      O["000600"]["eligible_signal"] == "PASS" and O["000600"]["final"] == 1 and O["000600"]["replaced_count"] == 1
-      and O["000600"]["history"][0]["eligible_signal"] == "UNKNOWN" and O["000600"]["run_id"] == later["run_id"]
-      and later["counts"]["observations"]["kept_final"] == 4 and later["context"]["final_rule"] == "inputs_ok+decided")
+legacy = {o["symbol"]: o for o in ss.observations("2026-09-30") if o["contract_hash"] is None}
+cur = {o["symbol"]: o for o in ss.observations("2026-09-30", contract_hash=sc.contract_hash)}
+check("11-3) 정정 뒤 최신 스캔(계약 기록) PASS는 그 계약의 대표 기록으로 — 계약 기록 전 대표 기록과 섞지 않고 그대로 보존"
+      "(UNKNOWN·final=0·대체 0)",
+      cur["000600"]["eligible_signal"] == "PASS" and cur["000600"]["final"] == 1
+      and cur["000600"]["run_id"] == later["run_id"] and len(cur) == 9
+      and legacy["000600"]["eligible_signal"] == "UNKNOWN" and legacy["000600"]["final"] == 0
+      and legacy["000600"]["replaced_count"] == 0 and len(legacy) == 9
+      and later["counts"]["observations"]["new"] == 9 and later["context"]["final_rule"] == "inputs_ok+decided")
 vf = sc.verify(first["run_id"], SCAN)
-check("11-4) 이전 규칙으로 저장된 실행의 재현 검증: 입력·판정·결과는 일치(identical), final 규칙 차이는 따로 1건",
-      vf["identical"] and vf["final_rule_changed"] == 1)
+check("11-4) 이전 규칙·계약 기록 전 실행의 재현 검증: 입력·판정·결과는 일치(identical), 계약은 알 수 없음(None), "
+      "final 규칙 차이는 따로 1건",
+      vf["identical"] and vf["contract_match"] is None and vf["final_rule_changed"] == 1)
 ss.close()
 ss = ScanStore(ldb)
 check("11-5) 다시 열면 보정·백업 없음(한 번만), 감사 이력 1건 그대로",
       ss.upgrade_summary is None and ss.backup_path is None and len(ss.audit()) == 1
       and inspect_final_reset(ldb)["final_to_reset"] == 0)
+ss.close()
+st.close()
+
+# ── 12. 계산 계약 (GPT 재검토 016907a) ─────────────────────────────
+st = build("contract")
+sc300, ss = scanner(st, "contract")
+sc100 = S1Scanner(st, ss, CAL, lookback=100)
+c300 = sc300.run(SCAN, now=Clock(datetime(2026, 9, 30, 19, 31)))
+direct100 = {e["symbol"]: e["eligible_signal"] for e in sc100.compute(SCAN)["evals"]}
+c100 = sc100.run(SCAN, now=Clock(datetime(2026, 9, 30, 19, 32)))
+E300 = {e["symbol"]: e["eligible_signal"] for e in c300["evals"]}
+check("12-1) [GPT 재현] 같은 시각·같은 DB에서 lookback 300 → PASS, lookback 100 직접 계산 → UNKNOWN(이력 부족)",
+      E300["000100"] == "PASS" and direct100["000100"] == "UNKNOWN")
+check("12-2) [GPT P2] lookback 100 저장 실행은 기존 실행을 재사용하지 않고 별도 실행으로 완료(계약 해시가 다름) — "
+      "실행 키·context·실행 행에 계약 기록",
+      c100["status"] == COMPLETE and c100["run_id"] != c300["run_id"] and sc100.contract_hash != sc300.contract_hash
+      and c100["run_key"].endswith(f"|c:{sc100.contract_hash}") and c100["context"]["contract"]["lookback_sessions"] == 100
+      and {r["run_id"]: r["contract_hash"] for r in ss.runs()} == {c300["run_id"]: sc300.contract_hash,
+                                                                   c100["run_id"]: sc100.contract_hash})
+o300 = {o["symbol"]: o for o in ss.observations("2026-09-30", contract_hash=sc300.contract_hash)}
+o100 = {o["symbol"]: o for o in ss.observations("2026-09-30", contract_hash=sc100.contract_hash)}
+check("12-3) [GPT P2] 대표 기록은 계약별로 따로 — lookback 300의 PASS 확정 기록이 lookback 100의 UNKNOWN과 섞이지 않음, "
+      "신호 ID에 계약(c:…), 입력 해시는 신호 ID에 없음",
+      o300["000100"]["eligible_signal"] == "PASS" and o300["000100"]["final"] == 1
+      and o100["000100"]["eligible_signal"] == "UNKNOWN" and len(o300) == len(o100) == 9
+      and o300["000100"]["signal_id"] == f"S1|{sc300.strategy}|c:{sc300.contract_hash}|000100|2026-09-30"
+      and len(ss.observations("2026-09-30")) == 18
+      and c100["counts"]["observations"] == {"new": 9, "kept_final": 0, "replaced": 0, "kept_newer": 0})
+again = sc100.run(SCAN, now=Clock(datetime(2026, 9, 30, 19, 40)), verify=True)
+cross = sc300.verify(c100["run_id"], SCAN)
+check("12-4) 같은 계약 재실행은 건너뜀(재계산 일치), 다른 계약 스캐너로 그 실행을 검증하면 비교하지 않고 계약 불일치 표시",
+      again["status"] == "SKIPPED_ALREADY_COMPLETE" and again["run_id"] == c100["run_id"] and again["verify"]["identical"]
+      and again["verify"]["contract_match"] is True and cross["contract_match"] is False
+      and not cross["identical"] and cross["contract_diff"] == ["lookback_sessions"] and "diff" not in cross)
+from domain.research.universe import UniversePolicy  # noqa: E402
+from infra.research import s1_scanner as S1M  # noqa: E402
+from utils.trading_calendar import TradingCalendar as TC  # noqa: E402
+
+cal2 = TC(covered_years=CAL.covered_years, holidays={**CAL.holidays, date(2026, 12, 30): "가상 휴장"},
+          regular=CAL.regular, special_sessions=CAL.special_sessions)
+cal3 = TC(covered_years=CAL.covered_years, holidays={d: "이름만 바꿈" for d in CAL.holidays}, regular=CAL.regular,
+          special_sessions=CAL.special_sessions)
+base_h = sc300.contract_hash
+hashes = {
+    "after_close": S1Scanner(st, ss, CAL, after_close=timedelta(minutes=200)).contract_hash,
+    "calendar": S1Scanner(st, ss, cal2).contract_hash,
+    "policy": S1Scanner(st, ss, CAL, policy=UniversePolicy(audit_ok_values=("정상", "시험"))).contract_hash,
+    "lookback": S1Scanner(st, ss, CAL, lookback=250).contract_hash,
+}
+_fv = S1M.F.FEATURE_VERSION
+S1M.F.FEATURE_VERSION = "f_test"
+hashes["feature"] = S1Scanner(st, ss, CAL).contract_hash
+S1M.F.FEATURE_VERSION = _fv
+_mv = S1M.M.MARKET_VERSION
+S1M.M.MARKET_VERSION = "m_test"
+hashes["market"] = S1Scanner(st, ss, CAL).contract_hash
+S1M.M.MARKET_VERSION = _mv
+check("12-5) 계약 해시는 완성 지연·달력 내용(휴장일)·분류 정책·lookback·지표·시장 계산 버전이 바뀌면 달라지고, "
+      "휴장일 이름만 바뀌면 그대로 — 같은 조건이면 항상 같음",
+      len(set(hashes.values()) | {base_h}) == len(hashes) + 1
+      and S1Scanner(st, ss, cal3).contract_hash == base_h and S1Scanner(st, ss, CAL).contract_hash == base_h
+      and set(sc300.contract) == {"strategy", "config_hash", "universe_policy", "feature_version", "market_version",
+                                  "lookback_sessions", "after_close_sec", "calendar", "final_rule", "scan_rules",
+                                  "index_ids"})
+from infra.research.scan_report import build_markdown  # noqa: E402
+
+md300 = build_markdown(ss.load_run(c300["run_id"]))
+check("12-6) 보고서에 계산 계약(해시·lookback·달력·규칙) 표시",
+      f"계산 계약 `c:{sc300.contract_hash}`" in md300 and "lookback 300세션" in md300
+      and f"달력 `{S1M.calendar_version(CAL)}`" in md300)
 ss.close()
 st.close()
 

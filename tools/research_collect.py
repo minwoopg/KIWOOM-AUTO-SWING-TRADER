@@ -160,7 +160,7 @@ def run_scan(args, store: ResearchStore, calendar: TradingCalendar, scan_at: dat
         if sstore.backup_path:
             print(f"[관찰 저장소 스키마 변경] 바꾸기 전 백업: {sstore.backup_path}")
         if sstore.upgrade_summary:
-            print(f"[관찰 기록 보정 s2] {json.dumps(sstore.upgrade_summary, ensure_ascii=False)}")
+            print(f"[관찰 저장소 이전] {json.dumps(sstore.upgrade_summary, ensure_ascii=False)}")
         scanner = S1Scanner(store, sstore, calendar, after_close=timedelta(minutes=args.after_close_min), log=print)
         try:
             res = scanner.run(scan_at, now=now, verify=verify)
@@ -187,6 +187,7 @@ def run_scan(args, store: ResearchStore, calendar: TradingCalendar, scan_at: dat
         code = 0 if _report_ok(path) else 1
         c = run["counts"]
         print_json({"run_id": run["run_id"], "signal_date": run["context"]["signal_date"],
+                    "contract_hash": run["context"].get("contract_hash"),
                     "universe": c["universe"], "signals": c["signals"], "by_signal": c["by_signal"],
                     "data_hold_total": c["data_hold_total"], "index_status": c["index_status"],
                     "market_regime": c["market_regime"], "no_trades_hold": c["no_trades_hold"],
