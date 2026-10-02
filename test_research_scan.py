@@ -361,6 +361,35 @@ try:
 except sqlite3.IntegrityError:
     dup = False
 check("7-5) 같은 run_key의 COMPLETE는 하나뿐(유일 인덱스)", not dup)
+ss2 = ScanStore(TMP / "commit_scans.sqlite3")
+st2 = build("commit")
+ticks = iter([datetime(2026, 9, 30, 19, 31, 0, 0), datetime(2026, 9, 30, 19, 31, 5, 0),
+              datetime(2026, 9, 30, 19, 31, 9, 250000)])
+last = [datetime(2026, 9, 30, 19, 31, 9, 250000)]
+
+
+def tick():
+    try:
+        last[0] = next(ticks)
+    except StopIteration:
+        pass
+    return last[0]
+
+
+rc7 = S1Scanner(st2, ss2, CAL).run(SCAN, now=tick)
+row7 = ss2.conn.execute("SELECT finished_at, committed_at FROM scan_run WHERE run_id=?", (rc7["run_id"],)).fetchone()
+try:
+    S1Scanner(st2, ss2, CAL).run(datetime(2026, 9, 30, 20, 0), now=Clock(datetime(2026, 9, 30, 20, 1)),
+                                  before_commit=boom)
+except KeyboardInterrupt:
+    pass
+nocommit = [r["committed_at"] for r in ss2.runs() if r["status"] != COMPLETE]
+check("7-6) [A5-R1] 커밋이 끝난 뒤 잰 시각을 초 올림해 committed_at(19:31:09.25 → 19:31:10) — 저장 트랜잭션 시작 시각"
+      "(finished_at)과 따로. 커밋 전에 중단된 실행은 committed_at 없음",
+      row7["committed_at"] == "2026-09-30T19:31:10" and row7["finished_at"] < row7["committed_at"]
+      and nocommit == [None])
+ss2.close()
+st2.close()
 ss.close()
 st.close()
 
@@ -506,7 +535,8 @@ con.execute("UPDATE s1_eval SET final=1 WHERE symbol='000600'")
 ctx_old = json.loads(con.execute("SELECT context_json FROM scan_run").fetchone()[0])
 for k in ("final_rule", "contract_hash", "contract"):
     ctx_old.pop(k)
-con.execute("UPDATE scan_run SET context_json=?, contract_hash=NULL, run_key=substr(run_key, 1, instr(run_key, '|c:') - 1)",
+con.execute("UPDATE scan_run SET context_json=?, contract_hash=NULL, committed_at=NULL,"
+            " run_key=substr(run_key, 1, instr(run_key, '|c:') - 1)",
             (json.dumps(ctx_old, ensure_ascii=False),))
 for (sig,) in con.execute("SELECT signal_id FROM s1_observation").fetchall():
     con.execute("UPDATE s1_observation SET signal_id=?, contract_hash=NULL WHERE signal_id=?",
@@ -536,9 +566,10 @@ ss = ScanStore(ldb)
 O = {o["symbol"]: o for o in ss.observations("2026-09-30")}
 aud = ss.audit()
 ev_old = {e["symbol"]: e for e in ss.evals(first["run_id"])}
-check("11-2) [GPT B2] 열면 백업 후 s3: UNKNOWN+final=1 대표 기록만 final=0(감사 이력: 바꾸기 전 run·판정·입력 상태), "
-      "PASS·FAIL 확정 기록 4건은 그대로, 당시 실행 판정 행(s1_eval)은 보존, 계약 기록 전 실행·대표 기록은 NULL로 표시",
-      ss.conn.execute("SELECT value FROM meta WHERE key='scan_schema'").fetchone()[0] == "s3"
+check("11-2) [GPT B2] 열면 백업 후 s4: UNKNOWN+final=1 대표 기록만 final=0(감사 이력: 바꾸기 전 run·판정·입력 상태), "
+      "PASS·FAIL 확정 기록 4건은 그대로, 당시 실행 판정 행(s1_eval)은 보존, 계약·커밋 시각 기록 전 실행·대표 기록은 NULL로 표시",
+      ss.conn.execute("SELECT value FROM meta WHERE key='scan_schema'").fetchone()[0] == "s4"
+      and ss.upgrade_summary["to"] == "s4" and ss.upgrade_summary["runs_without_commit_time"] == 1
       and ss.upgrade_summary["from"] == "s1" and ss.upgrade_summary["final_reset"] == 1
       and ss.upgrade_summary["final_observations"] == 5 and ss.upgrade_summary["legacy_runs"] == 1
       and ss.upgrade_summary["legacy_observations"] == 9

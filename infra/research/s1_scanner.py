@@ -289,7 +289,7 @@ class S1Scanner:
                                          snapshot=comp["snapshot"], snapshot_status=comp["snapshot_status"],
                                          scan_at=scan_at, now=now(), strategy=self.strategy,
                                          config_hash=self.config_hash, contract_hash=self.contract_hash,
-                                         before_commit=before_commit)
+                                         before_commit=before_commit, clock=now)
         except Exception as exc:
             self.sstore.fail_run(run_id, f"{type(exc).__name__}: {exc}", now())
             raise

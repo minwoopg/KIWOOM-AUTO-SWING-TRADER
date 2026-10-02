@@ -53,6 +53,15 @@ class _Retryable(RuntimeError):
     pass
 
 
+class DeadlinePassed(RuntimeError):
+    """요청 직전(호출 간격 대기·재시도 대기 뒤) 시각이 마감 이후 — 요청을 보내지 않음 (A5-R2).
+    ResearchApiError가 아님: '조회 실패'가 아니라 '마감이 지나 조회하지 않음'. attempts = 이미 보낸 요청 수."""
+
+    def __init__(self, msg: str, attempts: int) -> None:
+        super().__init__(msg)
+        self.attempts = attempts
+
+
 def assert_mock_domain(base_url: str) -> None:
     parsed = urlparse(base_url or "")
     if ((parsed.scheme or "").lower() != "https"
@@ -133,7 +142,8 @@ class ReadOnlyResearchClient:
                 self.sleep(wait)
         self._last_call = self.monotonic()
 
-    def _post_once(self, api_id: str, payload: dict, cont_yn: str, next_key: str) -> tuple[int, dict, Any, datetime]:
+    def _post_once(self, api_id: str, payload: dict, cont_yn: str, next_key: str,
+                   deadline: datetime | None = None, sent: int = 0) -> tuple[int, dict, Any, datetime]:
         import requests
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
@@ -141,8 +151,10 @@ class ReadOnlyResearchClient:
             "cont-yn": cont_yn, "next-key": next_key, "api-id": api_id,
         }
         self._pace()
-        self.calls += 1
         requested_at = self.now()
+        if deadline is not None and requested_at >= deadline:      # 대기·재시도 뒤 실제 요청 직전에 검사
+            raise DeadlinePassed(f"{api_id}: 요청 직전 {requested_at} ≥ 마감 {deadline} — 요청하지 않음", sent)
+        self.calls += 1
         try:
             r = self.session.post(f"{self.base_url}{_ALL_API[api_id]}", headers=headers, json=payload, timeout=15)
         except requests.RequestException as exc:
@@ -154,15 +166,17 @@ class ReadOnlyResearchClient:
             body = None
         return r.status_code, resp_headers, body, requested_at
 
-    def _request(self, api_id: str, payload: dict, cont_yn: str, next_key: str) -> tuple:
-        """(status, 응답 헤더, 본문, 요청 시각, 수신 시각, 시도 횟수). 429·전송 실패 재시도, 401은 한 번 재인증."""
+    def _request(self, api_id: str, payload: dict, cont_yn: str, next_key: str,
+                 deadline: datetime | None = None) -> tuple:
+        """(status, 응답 헤더, 본문, 요청 시각, 수신 시각, 시도 횟수). 429·전송 실패 재시도, 401은 한 번 재인증.
+        deadline이 있으면 매 요청 직전에 검사해 지났으면 DeadlinePassed(요청하지 않음)."""
         if not self._token:
             self.authenticate()
-        attempt, reauthed, tries = 0, False, 0
+        attempt, reauthed, calls0 = 0, False, self.calls
         while True:
             try:
-                tries += 1
-                status, h, body, requested_at = self._post_once(api_id, payload, cont_yn, next_key)
+                status, h, body, requested_at = self._post_once(api_id, payload, cont_yn, next_key, deadline,
+                                                                self.calls - calls0)
                 if status == 429:
                     raise _Retryable("HTTP 429")
                 if status == 401 and not reauthed:
@@ -179,7 +193,7 @@ class ReadOnlyResearchClient:
                 self.retries += 1
                 self.log(f"[RESEARCH] {api_id} {exc} — {wait}초 후 재시도 ({attempt}/{len(self.retry_backoff_sec)})")
                 self.sleep(wait)
-        return status, h, body, requested_at, self.now(), tries
+        return status, h, body, requested_at, self.now(), self.calls - calls0
 
     @staticmethod
     def _check_ok(api_id: str, payload: dict, status: int, body: Any) -> None:
@@ -189,12 +203,14 @@ class ReadOnlyResearchClient:
         if rc is None or isinstance(rc, bool) or str(rc).strip() != "0":
             raise ResearchApiError(f"{api_id} {payload}: return_code={rc!r} {body.get('return_msg', '')}")
 
-    def fetch_body(self, api_id: str, payload: dict) -> Body:
-        """목록이 아닌 한 건짜리 조회(A5-1 시세). return_code가 있고 0이어야 성공 — 아니면 ResearchApiError."""
+    def fetch_body(self, api_id: str, payload: dict, *, not_after: datetime | None = None) -> Body:
+        """목록이 아닌 한 건짜리 조회(A5-1 시세). return_code가 있고 0이어야 성공 — 아니면 ResearchApiError.
+        not_after(정규장 종료 등)가 있으면 인증·호출 간격·재시도 대기 뒤 **요청 직전마다** 검사해 지났으면
+        DeadlinePassed. 응답 수신 시각 검증은 호출한 쪽에서(Body.received_at)."""
         assert_mock_domain(self.base_url)
         if api_id not in PRICE_API:
             raise ResearchConfigError(f"가격 기록에 허용되지 않은 api-id: {api_id}")
-        status, _h, body, requested_at, received_at, tries = self._request(api_id, payload, "N", "")
+        status, _h, body, requested_at, received_at, tries = self._request(api_id, payload, "N", "", not_after)
         self._check_ok(api_id, payload, status, body)
         return Body(body, requested_at, received_at, tries)
 

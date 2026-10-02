@@ -22,7 +22,8 @@ sys.path.insert(0, ".")
 
 from domain.research.universe import classify_rows, summarize
 from infra.research import open_check as A5
-from infra.research.kiwoom_readonly import (PRICE_API, RESEARCH_API, Body, ReadOnlyResearchClient, ResearchApiError,
+from infra.research.kiwoom_readonly import (PRICE_API, RESEARCH_API, Body, DeadlinePassed, ReadOnlyResearchClient,
+                                            ResearchApiError,
                                             ResearchConfigError)
 from infra.research.kiwoom_rows import INDEX_DAILY, STOCK_DAILY, RawBar
 from infra.research.research_config import ResearchSettingsError, load_research_settings
@@ -134,8 +135,10 @@ class FakePrice:
     def __init__(self, clock: Clock, spec: dict):
         self.clock, self.spec, self.calls = clock, spec, []
 
-    def fetch_body(self, api_id, payload):
+    def fetch_body(self, api_id, payload, not_after=None):
         sym = payload["stk_cd"]
+        if not_after is not None and self.clock.t >= not_after:      # 실제 클라이언트처럼 요청 직전 마감 검사
+            raise DeadlinePassed(f"{api_id}: 마감 뒤", 0)
         self.calls.append((api_id, sym, self.clock.t))
         req = self.clock.t
         self.clock.t += timedelta(seconds=1)
@@ -288,9 +291,10 @@ check("3-1) [GPT] 판정 구분: 상한 이내 / 상한 초과 / 손절가 이�
       and R[PASS_CODES[3]]["gap_vs_cap"] is not None and "보류" in R[PASS_CODES[3]]["outcome_detail"]
       and [R[c]["fetch_status"] for c in PASS_CODES[5:]] == ["OK", "FETCH_FAILED", "PARSE_FAILED"])
 r0 = R[PASS_CODES[0]]
-check("3-2) [GPT] 요청·수신 시각·시도 횟수·지연(초) 기록. 허용(9초) 안은 ON_TIME, 넘으면 LATE — 실제 조회 시각 그대로",
+check("3-2) [GPT] 요청·수신 시각·시도 횟수·지연(초) 기록. 허용(9초) 안은 ON_TIME, 요청은 9초에 했지만 수신이 넘으면 "
+      "LATE_RESPONSE, 요청이 넘으면 LATE — 실제 조회 시각 그대로",
       r0["requested_at"] == "2026-10-01T09:05:00" and r0["received_at"] == "2026-10-01T09:05:00" and r0["attempts"] == 2
-      and [R[c]["timing"] for c in PASS_CODES] == ["ON_TIME"] * 4 + ["LATE"] * 4
+      and [R[c]["timing"] for c in PASS_CODES] == ["ON_TIME"] * 3 + ["LATE_RESPONSE"] + ["LATE"] * 4
       and [R[c]["lateness_sec"] for c in PASS_CODES] == [0, 3, 6, 9, 12, 15, 18, 19]
       and R[PASS_CODES[7]]["requested_at"] == "2026-10-01T09:05:19")
 x0, x1 = json.loads(r0["extra_json"]), json.loads(R[PASS_CODES[1]]["extra_json"])
@@ -375,7 +379,8 @@ clk6 = Clock(datetime(2026, 10, 1, 15, 29, 52))
 f6 = FakePrice(clk6, {c: quote(int(L[c][0]) - 1, CLOSES[c]) for c in PASS_CODES})
 res6 = A5.OpenChecker(os6, ss, st, CAL, contract_hash=sc.contract_hash).run(D, client=f6, now=clk6)
 check("3-10) 정규장 종료(15:30)를 넘기는 실행: 그 전 조회는 LATE로 기록, 종료 뒤 후보는 조회 없이 MISSED",
-      [r["timing"] for r in res6["checks"]] == ["LATE"] * 3 + ["MISSED"] * 5 and len(f6.calls) == 9)
+      [r["timing"] for r in res6["checks"]] == ["LATE"] * 3 + ["MISSED"] * 5 and len(f6.calls) == 8
+      and json.loads(res6["checks"][2]["extra_json"])["ka10004"]["status"] == "SKIPPED_AFTER_CLOSE")
 
 # 후보 없음 구분
 st_n = build("none", all_down=True)
@@ -441,7 +446,7 @@ check("4-1) 시세 조회(fetch_body)는 ka10001만, 목록 조회(fetch_page)�
 # a1 DB(이전 버전 — 보조 조회 열 없음) → a2
 a1db = TMP / "old_a1.sqlite3"
 old_schema = A5._SCHEMA.replace(" source_price INTEGER,\n  source_exchange TEXT, source_lag_sec INTEGER, best_ask INTEGER,"
-                                " best_bid INTEGER, quote_time TEXT, extra_json TEXT,", "")
+                                " best_bid INTEGER, quote_time TEXT, extra_json TEXT,\n  response_ms INTEGER,", "")
 con = sqlite3.connect(a1db)
 con.executescript(old_schema)
 con.execute("INSERT INTO meta VALUES('a5_schema','a1')")
@@ -455,12 +460,153 @@ with A5.OpenCheckStore(a1db) as oa:
     cols = {r[1] for r in oa.conn.execute("PRAGMA table_info(price_check)")}
     old_row = oa.checks("a5_x")[0]
     ok_a2 = (oa.conn.execute("SELECT value FROM meta WHERE key='a5_schema'").fetchone()[0] == "a2"
-             and oa.backup_path is not None and "best_ask" not in had and {"source_price", "best_ask", "extra_json"} <= cols
+             and oa.backup_path is not None and "best_ask" not in had
+             and {"source_price", "best_ask", "extra_json", "response_ms"} <= cols
              and old_row["outcome"] == "MISSED" and old_row["best_ask"] is None)
 with A5.OpenCheckStore(a1db) as oa:
     again_none = oa.backup_path is None
 check("4-1b) A5 기록 저장소 a1 → a2: 백업 후 보조 조회 열 추가, 기존 기록 그대로(보조 값 비움), 다시 열면 백업 없음",
       ok_a2 and again_none and len(list(TMP.glob("old_a1.sqlite3.bak-a1-*"))) == 1)
+
+# ── 4b. GPT 재검토 14eb8c0 A5-R1~R3 ─────────────────────────
+# R1: 개장 뒤에 과거 시각(scan_at 9/30 19:30)으로 계산·저장한 실행은 후보 원천이 아님
+st_l = build("late")
+ss_l = ScanStore(TMP / "late_scans.sqlite3")
+sc_l = S1Scanner(st_l, ss_l, CAL)
+late_run = sc_l.run(SCAN, now=Clock(datetime(2026, 10, 1, 9, 10)))
+d_l, c_l = A5.select_candidates(ss_l, st_l, CAL, D, sc_l.contract_hash)
+lr = {r["run_id"]: r for r in ss_l.runs()}[late_run["run_id"]]
+check("4b-1) [A5-R1 재현] scan_at 9/30 19:30이지만 실제 저장 완료 10/1 09:10인 실행 → 개장 전 후보 원천 아님(NO_SCAN, 제외 1회 "
+      "기록) — PASS 8건이어도 후보 0",
+      sum(e["eligible_signal"] == "PASS" for e in late_run["evals"]) == 8 and lr["committed_at"] == "2026-10-01T09:10:00"
+      and d_l["status"] == "NO_SCAN" and c_l == [] and len(d_l["source"]["excluded_runs"]) == 1
+      and "개장 뒤 저장된 실행 1회 제외" in d_l["reason"])
+st_m = build("mixed")
+ss_m = ScanStore(TMP / "mixed_scans.sqlite3")
+sc_m = S1Scanner(st_m, ss_m, CAL)
+pre = sc_m.run(SCAN, now=Clock(datetime(2026, 9, 30, 19, 31)))                  # 개장 전 저장: 000500은 STALE
+st_m.append_forward(series_id="STOCK:000500", bars=[FetchedBar(pass_bars(UPTO_T, base=30_000)[-1],
+                                                             datetime(2026, 9, 30, 21, 0))],
+                    verified_base_dt="20260930", verified_at=datetime(2026, 9, 30, 21, 0))
+post_l = sc_m.run(datetime(2026, 9, 30, 21, 30), now=Clock(datetime(2026, 10, 1, 9, 10)))   # 과거 시각, 개장 뒤 저장
+o500 = {o["symbol"]: o for o in ss_m.observations(T.isoformat(), contract_hash=sc_m.contract_hash)}["000500"]
+d_m, c_m = A5.select_candidates(ss_m, st_m, CAL, D, sc_m.contract_hash)
+check("4b-2) [A5-R1] 대표 기록의 run_id도 개장 전 저장 실행이어야 함 — 개장 뒤 저장 실행이 000500을 PASS·확정·actionable=1로 "
+      "바꿨어도 제외, 개장 전 저장 실행의 후보 8건은 그대로(근거: committed_at)",
+      o500["eligible_signal"] == "PASS" and o500["final"] == 1 and o500["actionable"] == 1
+      and o500["run_id"] == post_l["run_id"] and {c["symbol"] for c in c_m} == set(PASS_CODES)
+      and d_m["source"]["runs"] == [pre["run_id"]] and d_m["source"]["commit_basis"][pre["run_id"]]["basis"] == "COMMITTED_AT"
+      and [x["run_id"] for x in d_m["source"]["excluded_runs"]] == [post_l["run_id"]])
+ss_m.conn.execute("UPDATE scan_run SET committed_at=NULL WHERE run_id=?", (pre["run_id"],))       # 커밋 시각 기록 전 실행
+d_m2, c_m2 = A5.select_candidates(ss_m, st_m, CAL, D, sc_m.contract_hash)
+ss_m.conn.execute("UPDATE scan_run SET committed_at=NULL, finished_at='2026-10-01T08:30:00' WHERE run_id=?",
+                  (pre["run_id"],))
+d_m3, c_m3 = A5.select_candidates(ss_m, st_m, CAL, D, sc_m.contract_hash)
+check("4b-3) 커밋 시각이 없는 이전 실행은 finished_at + 1시간을 저장 완료 상한으로(보수적): 9/30 19:31 → 20:31 < 개장이면 포함, "
+      "10/1 08:30 → 09:30 ≥ 개장이면 제외. 근거를 후보 목록 원천에 기록",
+      len(c_m2) == 8 and d_m2["source"]["commit_basis"][pre["run_id"]]["basis"].startswith("LEGACY_FINISHED_AT+1h")
+      and d_m2["source"]["commit_basis"][pre["run_id"]]["commit_bound"] == "2026-09-30T20:31:00"
+      and d_m3["status"] == "NO_SCAN" and c_m3 == [])
+ss_m.close()
+st_m.close()
+ss_l.close()
+st_l.close()
+
+
+# R2: 조회 함수 진입 뒤 대기·재시도로 마감을 넘기는 경우 — 실제 클라이언트(가짜 세션)로
+class TimedSess:
+    """요청마다 (지연 초, 응답)을 차례로. 지연만큼 시계를 진행해 응답 수신 시각을 만듦."""
+
+    def __init__(self, clock, plan):
+        self.clock, self.plan, self.posts = clock, list(plan), []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        if url.endswith("/oauth2/token"):
+            return Resp(200, {"token": "T", "return_code": 0})
+        self.posts.append(((headers or {}).get("api-id"), json.get("stk_cd"), self.clock.t))
+        delay, resp = self.plan.pop(0) if self.plan else (0, Resp(200, {"return_code": 0, "cur_prc": "+1",
+                                                                          "base_pric": "1"}))   # 계획 밖 요청
+        self.clock.t += timedelta(seconds=delay)
+        return resp
+
+
+def real_client(clock, plan, backoff=(5,)):
+    sess = TimedSess(clock, plan)
+    cli = ReadOnlyResearchClient(sess, "https://mockapi.kiwoom.com", "k", "s", now=clock,
+                                 monotonic=lambda: clock.t.timestamp(),
+                                 sleep=lambda sec: setattr(clock, "t", clock.t + timedelta(seconds=sec)),
+                                 retry_backoff_sec=backoff)
+    return cli, sess
+
+
+one = PASS_CODES[0]
+ok_body = {"return_code": 0, **quote(int(L[one][0]) - 1, CLOSES[one])}
+trade_ok = {"return_code": 0, "cntr_infr": [{"tm": "152958", "cur_prc": ok_body["cur_prc"], "stex_tp": "KRX"}]}
+book_ok = {"return_code": 0, "bid_req_base_tm": "152958", "sel_fpr_bid": "+1", "buy_fpr_bid": "-1"}
+
+
+def single_check(name, clock, plan, *, tol=120):
+    ost = A5.OpenCheckStore(TMP / f"{name}_a5.sqlite3")
+    st_r = ResearchStore(TMP / "main.sqlite3")
+    ss_r = ScanStore(TMP / "main_scans.sqlite3")
+    cli, sess = real_client(clock, plan)
+    chk_r = A5.OpenChecker(ost, ss_r, st_r, CAL, contract_hash=sc.contract_hash, on_time_tolerance_sec=tol)
+    cset = ost.freeze_set({**A5.select_candidates(ss_r, st_r, CAL, D, sc.contract_hash)[0], "selected_at": "x",
+                           "status": "OK", "reason": "시험"},
+                          [c for c in A5.select_candidates(ss_r, st_r, CAL, D, sc.contract_hash)[1] if c["symbol"] == one])
+    res_r = chk_r.run(D, client=cli, now=clock)
+    row = res_r["checks"][0]
+    ost.close()
+    ss_r.close()
+    st_r.close()
+    return row, sess, cset
+
+
+row_a, sess_a, _ = single_check("r2a", Clock(datetime(2026, 10, 1, 15, 29, 57)), [(0, Resp(429, {}))])
+check("4b-4) [A5-R2 재현] 15:29:57 진입 → 호출 간격 대기 뒤 15:29:58 첫 요청 429 → 5초 대기 뒤 재시도 직전 15:30:03 ≥ 마감 → "
+      "재시도 요청을 보내지 않음. "
+      "FETCH_FAILED·시각 MISSED, 가격·가정 체결가격 없음, 보조 조회 없음",
+      [(p[0], p[2]) for p in sess_a.posts] == [("ka10001", datetime(2026, 10, 1, 15, 29, 58))]
+      and row_a["fetch_status"] == "FETCH_FAILED"
+      and row_a["timing"] == "MISSED" and row_a["attempts"] == 1 and "재시도 중 정규장 종료" in row_a["outcome_detail"]
+      and row_a["observed_price"] is None and row_a["assumed_fill_price"] is None and row_a["extra_json"] is None)
+row_b, sess_b, _ = single_check("r2b", Clock(datetime(2026, 10, 1, 15, 29, 57)), [(2, Resp(200, ok_body))])
+check("4b-5) [A5-R2] 마감 전 요청(15:29:58)·마감 뒤 응답(15:30:00) → 원문·실제 요청/수신 시각은 보존하되 AFTER_CLOSE — 관찰가·"
+      "판정·가정 체결가격으로 쓰지 않음, 보조 조회 없음",
+      row_b["fetch_status"] == "RECEIVED_AFTER_CLOSE" and row_b["timing"] == "AFTER_CLOSE" and row_b["outcome"] == "AFTER_CLOSE"
+      and row_b["requested_at"] == "2026-10-01T15:29:58" and row_b["received_at"] == "2026-10-01T15:30:00"
+      and json.loads(row_b["body_json"])["cur_prc"] == ok_body["cur_prc"] and row_b["observed_price"] is None
+      and row_b["assumed_fill_price"] is None and row_b["response_ms"] == 2000 and len(sess_b.posts) == 1)
+row_c, sess_c, _ = single_check("r2c", Clock(datetime(2026, 10, 1, 9, 5, 0)),
+                                [(12, Resp(200, ok_body)), (0, Resp(200, trade_ok)), (0, Resp(200, book_ok))], tol=9)
+check("4b-6) [A5-R2] 요청은 제때(09:05:01), 응답 확보가 늦음(09:05:13, 허용 9초) → LATE_RESPONSE로 구분(판정은 유지)",
+      row_c["timing"] == "LATE_RESPONSE" and row_c["lateness_sec"] == 1 and row_c["response_ms"] == 12000
+      and row_c["outcome"] == "WITHIN_CAP" and row_c["fetch_status"] == "OK")
+row_d, sess_d, _ = single_check("r2d", Clock(datetime(2026, 10, 1, 15, 29, 58)),
+                                [(0, Resp(200, ok_body)), (0, Resp(200, trade_ok)), (0, Resp(200, book_ok))])
+check("4b-7) 마감 직전 ka10001 정상 → 보조 조회는 호출 간격(1초) 대기 뒤 요청 직전이 마감이면 보내지 않음(SKIPPED_AFTER_CLOSE)",
+      row_d["outcome"] == "WITHIN_CAP" and [p[0] for p in sess_d.posts] == ["ka10001"]
+      and json.loads(row_d["extra_json"])["ka10003"]["status"] in ("SKIPPED_AFTER_CLOSE",))
+
+# R3: 같은 초에 다시 실행
+os_r3 = A5.OpenCheckStore(TMP / "r3_a5.sqlite3")
+f_r3 = FakePrice(Clock(TARGET), {c: quote(int(L[c][0]) - 1, CLOSES[c]) for c in PASS_CODES})
+same = Clock(datetime(2026, 10, 1, 9, 6, 0))
+st_r3 = ResearchStore(TMP / "main.sqlite3")
+ss_r3 = ScanStore(TMP / "main_scans.sqlite3")
+chk_r3 = A5.OpenChecker(os_r3, ss_r3, st_r3, CAL, contract_hash=sc.contract_hash)
+f_r3.clock = same
+first_r3 = chk_r3.run(D, client=f_r3, now=Clock(datetime(2026, 10, 1, 9, 6, 0)))
+n_r3 = len(f_r3.calls)
+again_r3 = chk_r3.run(D, client=f_r3, now=Clock(datetime(2026, 10, 1, 9, 6, 0)))
+again2_r3 = chk_r3.run(D, client=f_r3, now=Clock(datetime(2026, 10, 1, 9, 6, 0)))
+check("4b-8) [A5-R3] 같은 초에 다시 실행해도 실행 ID 충돌 없음(대상일·확인 종류·DB 발급 시도 번호), 기존 확인 결과 그대로·추가 조회 0",
+      [r["run_id"] for r in os_r3.runs(D)] == ["a5_20261001_open5m_a1", "a5_20261001_open5m_a2", "a5_20261001_open5m_a3"]
+      and [r["status"] for r in os_r3.runs(D)] == ["COMPLETE"] * 3 and len(f_r3.calls) == n_r3
+      and again2_r3["checks"] == first_r3["checks"] and len(again2_r3["checks"]) == 8)
+os_r3.close()
+ss_r3.close()
+st_r3.close()
 
 # ── 5. CLI ──────────────────────────────────────────────────
 from tools import research_collect as rc  # noqa: E402
@@ -508,6 +654,13 @@ check("4-3) CLI: 목표 30분 안이면 기다렸다가(300초) 확인·보고�
       and js["contract_hash"] == js["active_contract"] == sc.contract_hash
       and (rdir / "a5_open_2026-10-01.md").exists() and (rdir / "a5_open_2026-10-01.json").exists()
       and "body_json" not in (rdir / "a5_open_2026-10-01.json").read_text(encoding="utf-8"))
+n_fc = len(fc.calls)
+for f_ in rdir.glob("a5_open_2026-10-01.*"):
+    f_.unlink()
+outs = [run_cli([], Clock(datetime(2026, 10, 1, 9, 5, 0)), client=fc) for _ in range(2)]
+check("4-3b) [A5-R3] 보고서를 잃은 뒤 같은 초에 두 번 다시 실행 → 오류 없이 0, 추가 가격 조회 없이 기존 결과로 보고서 복구",
+      [o[0] for o in outs] == [0, 0] and len(fc.calls) == n_fc and (rdir / "a5_open_2026-10-01.md").exists()
+      and json.loads(outs[1][1][outs[1][1].index("{"):])["counts"]["outcome"] == {"WITHIN_CAP": 8})
 
 
 def boom():

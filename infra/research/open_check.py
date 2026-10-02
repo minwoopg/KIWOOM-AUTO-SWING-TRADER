@@ -4,16 +4,22 @@ from __future__ import annotations
 
 흐름 (대상 거래일 D, 신호일 t = D의 직전 거래일)
 1. 후보 확정(`candidate_set`·`candidate`, D마다 한 번): 대상 계약 하나(config/research.yaml s1.active_contract)의
-   t 대표 기록 중 **PASS·final=1·actionable=1·스캔 시각 < D 개장**인 것만. signal_id·run_id·contract_hash·
-   진입 상한·참고 손절가·신호일 종가를 저장하고, 이후 실행은 다시 고르지 않고 이 목록을 씁니다.
+   t 대표 기록 중 **PASS·final=1·actionable=1·스캔 시각 < D 개장**이고, 그 대표 기록의 실행이 **D 개장 전에 실제로
+   저장 완료**된 것만(GPT 재검토 14eb8c0 A5-R1 — 관찰 저장소 committed_at, 없으면 finished_at + 1시간 상한).
+   개장 뒤 과거 시각으로 계산·저장한 PASS는 후보가 아님. signal_id·run_id·contract_hash·진입 상한·참고 손절가·
+   신호일 종가를 저장하고, 이후 실행은 다시 고르지 않고 이 목록을 씁니다.
    - 같은 D에는 후보 목록이 하나뿐(대상 계약이 바뀌어도 이미 확정된 D의 목록·계약은 그대로, 새 계약은 다음 D부터)
      → 계약이 여러 개여도 같은 종목이 두 후보가 되지 않음.
    - 대상 계약의 완료된 스캔이 개장 전에 없으면 NO_SCAN, 스캔은 있었는데 후보가 없으면 NO_CANDIDATES로 확정.
 2. 가격 확인(`price_check`, 후보·확인 종류마다 한 행 — 재시작해도 중복 없음, 이미 기록된 후보는 다시 조회하지 않음):
    - 목표 시각 = 달력의 D 개장 시각 + offset_min(일반 09:05, 특수 개장일은 그 개장 시각 기준). 목표 전에는 실행 거부.
-   - 조회 시각이 목표 + on_time_tolerance_sec 이내면 ON_TIME, 넘으면 LATE — **실제 요청·수신 시각을 그대로 기록**하고
-     09:05 가격으로 간주하지 않음. D 정규장 종료 뒤(또는 다음 날)면 조회하지 않고 MISSED. 일봉으로 채우지 않음.
+   - 시각(timing): 요청·수신 모두 목표 + on_time_tolerance_sec 이내 ON_TIME / 요청은 이내인데 수신이 넘음 LATE_RESPONSE /
+     요청이 넘음 LATE — **실제 요청·수신 시각을 그대로 기록**하고 09:05 가격으로 간주하지 않음. 일봉으로 채우지 않음.
+   - 마감(A5-R2): D 정규장 종료를 조회 함수에 넘겨 인증·호출 간격·재시도 대기 뒤 **실제 요청 직전마다** 검사 —
+     지났으면 요청하지 않음(첫 요청 전이면 MISSED, 재시도 중이면 FETCH_FAILED·MISSED). 마감 전에 요청했지만 응답을
+     마감 뒤에 받으면 AFTER_CLOSE — 원문·실제 시각만 보존하고 관찰가·판정·가정 체결로 쓰지 않음.
    - 조회 실패(재시도 후에도)는 FETCH_FAILED, 응답에 필수 필드가 없으면 PARSE_FAILED — 그 확인의 결과로 남김.
+   - 실행 기록(`check_run`) ID = 대상일·확인 종류·DB가 발급하는 시도 번호(A5-R3 — 같은 초에 다시 실행해도 충돌 없음).
 3. 판정(outcome, 관찰 가격 기준 — **실제 체결 아님**):
    NOT_TRADABLE(현재가 없음·거래량 0·상한가) > BASIS_CHANGED(D 기준가 ≠ 신호일 종가 — 액면분할·권리락 등으로 가격
    기준이 달라져 진입 상한을 그대로 비교하지 않음) > ABOVE_CAP(관찰가 > 진입 상한) > BELOW_STOP(관찰가 ≤ 참고 손절가)
@@ -38,7 +44,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from infra.research.kiwoom_readonly import ResearchApiError
+from infra.research.kiwoom_readonly import DeadlinePassed, ResearchApiError
 from infra.research.scan_store import ScanStore
 from infra.research.store import ResearchStore, sqlite_backup
 from utils.trading_calendar import TradingCalendar
@@ -48,11 +54,16 @@ PRICE_API_ID = "ka10001"
 TRADE_API_ID = "ka10003"            # 체결정보 — 원천 가격 시각
 BOOK_API_ID = "ka10004"             # 주식호가 — 최우선 호가
 EXTRA_COLUMNS = (("source_price", "INTEGER"), ("source_exchange", "TEXT"), ("source_lag_sec", "INTEGER"),
-                 ("best_ask", "INTEGER"), ("best_bid", "INTEGER"), ("quote_time", "TEXT"), ("extra_json", "TEXT"))
+                 ("best_ask", "INTEGER"), ("best_bid", "INTEGER"), ("quote_time", "TEXT"), ("extra_json", "TEXT"),
+                 ("response_ms", "INTEGER"))
+# 커밋 시각(committed_at, 관찰 저장소 s4)이 없는 이전 실행: finished_at(저장 트랜잭션 시작) + 1시간을 저장 완료의 상한으로
+# 봄 — 저장 트랜잭션은 수 초, SQLite 잠금 대기는 30초라 실제 커밋이 이보다 늦을 수 없음(보수적). 기록에 근거를 남김.
+LEGACY_COMMIT_MARGIN = timedelta(hours=1)
 SELECTION_RULE = "signal_date=D 직전 거래일 · contract=대상 계약 · PASS · final=1 · actionable=1 · scan_at < D 개장"
 ASSUMED_FILL_RULE = "OBSERVED_PRICE_AT_CHECK(가정 — 실제 체결 아님)"
-ON_TIME, LATE, MISSED = "ON_TIME", "LATE", "MISSED"
+ON_TIME, LATE_RESPONSE, LATE, MISSED, AFTER_CLOSE = "ON_TIME", "LATE_RESPONSE", "LATE", "MISSED", "AFTER_CLOSE"
 FETCHED, FETCH_FAILED, PARSE_FAILED, NOT_RUN = "OK", "FETCH_FAILED", "PARSE_FAILED", "NOT_RUN"
+RECEIVED_AFTER_CLOSE, SKIPPED_AFTER_CLOSE = "RECEIVED_AFTER_CLOSE", "SKIPPED_AFTER_CLOSE"
 WITHIN_CAP, ABOVE_CAP, BELOW_STOP, BASIS_CHANGED, NOT_TRADABLE, NO_PRICE_OUTCOME = (
     "WITHIN_CAP", "ABOVE_CAP", "BELOW_STOP", "BASIS_CHANGED", "NOT_TRADABLE", "NO_PRICE")
 OPTIONAL_FIELDS = {"open_price": "open_pric", "high_price": "high_pric", "low_price": "low_pric",
@@ -77,6 +88,7 @@ CREATE TABLE IF NOT EXISTS price_check(
   observed_price INTEGER, base_price INTEGER, open_price INTEGER, high_price INTEGER, low_price INTEGER,
   upper_limit INTEGER, lower_limit INTEGER, volume INTEGER, source_time TEXT, source_price INTEGER,
   source_exchange TEXT, source_lag_sec INTEGER, best_ask INTEGER, best_bid INTEGER, quote_time TEXT, extra_json TEXT,
+  response_ms INTEGER,
   outcome TEXT NOT NULL, outcome_detail TEXT NOT NULL, gap_vs_close REAL, gap_vs_cap REAL,
   assumed_fill_price INTEGER, assumed_fill_rule TEXT, body_json TEXT, run_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
   PRIMARY KEY(set_id, symbol, check_kind)) WITHOUT ROWID;
@@ -279,16 +291,20 @@ class OpenCheckStore:
                                     f"({', '.join('?' * len(cols))})", [row[c] for c in cols])
         return cur.rowcount == 1
 
-    def begin_run(self, run_id: str, day: date, kind: str, active_contract: str, started_at: datetime) -> list[str]:
-        """끝나지 않은 이전 실행은 ABORTED로 정리하고 새 실행을 RUNNING으로."""
+    def begin_run(self, day: date, kind: str, active_contract: str, started_at: datetime) -> tuple[str, list[str]]:
+        """(실행 ID, 정리한 이전 실행). 끝나지 않은 이전 실행은 ABORTED로 정리하고 새 실행을 RUNNING으로.
+        실행 ID = 대상일·확인 종류·시도 번호(같은 트랜잭션에서 DB가 발급) — 같은 초에 다시 실행해도 겹치지 않음 (A5-R3)."""
         with self.tx():
             stale = [r[0] for r in self.conn.execute("SELECT run_id FROM check_run WHERE status='RUNNING'")]
             self.conn.execute("UPDATE check_run SET status='ABORTED', finished_at=?, note='다음 실행 시작 시 정리'"
                               " WHERE status='RUNNING'", (_ts(started_at),))
+            n = self.conn.execute("SELECT COUNT(*) FROM check_run WHERE target_day=? AND check_kind=?",
+                                  (day.isoformat(), kind)).fetchone()[0] + 1
+            run_id = f"a5_{day:%Y%m%d}_{kind.replace('+', '').lower()}_a{n}"
             self.conn.execute("INSERT INTO check_run(run_id, target_day, check_kind, active_contract, started_at,"
                               " status) VALUES(?,?,?,?,?,'RUNNING')",
                               (run_id, day.isoformat(), kind, active_contract, _ts(started_at)))
-        return stale
+        return run_id, stale
 
     def finish_run(self, run_id: str, *, set_id: str | None, status: str, counts: dict, note: str,
                    now: datetime) -> None:
@@ -307,19 +323,36 @@ class OpenCheckStore:
 # ── 후보 선택 ────────────────────────────────────────────────────
 def select_candidates(sstore: ScanStore, rstore: ResearchStore, cal: TradingCalendar, day: date,
                       contract_hash: str) -> tuple[dict, list[dict]]:
-    """D의 후보 (확정 전 계산). 같은 입력이면 언제 고르든 같음 — 개장 전 스캔·확정 기록만 쓰기 때문."""
+    """D의 후보 (확정 전 계산). 같은 입력이면 언제 고르든 같음 — 개장 전에 **실제로 저장이 끝난** 스캔만 쓰기 때문.
+
+    원천 실행 조건(A5-R1): COMPLETE · 대상 계약 · 지정한 평가 시각(scan_at) < D 개장 · **저장 완료 시각 < D 개장**.
+    저장 완료 시각 = committed_at(커밋 뒤 초 올림). 그 값이 없는 이전 실행은 finished_at + 1시간을 상한으로(보수적).
+    개장 뒤에 과거 시각으로 계산·저장한 실행은 scan_at이 개장 전이어도 후보 원천이 아님. 대표 기록의 run_id도
+    이 조건을 만족하는 실행이어야 함."""
     t = cal.previous_trading_day(day)
     open_at = datetime.combine(day, cal.session_times(day).open)
     open_s = _ts(open_at)
-    runs = [r for r in sstore.runs(t.isoformat()) if r["status"] == "COMPLETE"
+    pool = [r for r in sstore.runs(t.isoformat()) if r["status"] == "COMPLETE"
             and r.get("contract_hash") == contract_hash and r["scan_at"] < open_s]
+    runs, excluded, basis = [], [], {}
+    for r in pool:
+        bound, how = commit_bound(r)
+        basis[r["run_id"]] = {"commit_bound": bound, "basis": how}
+        (runs if bound is not None and bound < open_s else excluded).append(r)
     cset = {"set_id": f"a5_{day.isoformat()}", "target_day": day.isoformat(), "signal_date": t.isoformat(),
             "contract_hash": contract_hash, "open_at": open_s,
-            "source": {"scan_db": sstore.path, "runs": [r["run_id"] for r in runs]}}
+            "source": {"scan_db": sstore.path, "runs": [r["run_id"] for r in runs],
+                       "excluded_runs": [{"run_id": r["run_id"], **basis[r["run_id"]],
+                                          "reason": "저장 완료가 개장 이후(또는 입증 불가)"} for r in excluded],
+                       "commit_basis": {r["run_id"]: basis[r["run_id"]] for r in runs}}}
     if not runs:
-        return {**cset, "status": "NO_SCAN", "reason": f"대상 계약 {contract_hash}의 {t} 신호 스캔이 {open_s} 전에 없음"}, []
+        why = f" — 개장 뒤 저장된 실행 {len(excluded)}회 제외" if excluded else ""
+        return {**cset, "status": "NO_SCAN",
+                "reason": f"대상 계약 {contract_hash}의 {t} 신호 스캔이 {open_s} 전에 저장 완료되지 않음{why}"}, []
+    ok_ids = {r["run_id"] for r in runs}
     obs = [o for o in sstore.observations(t.isoformat(), contract_hash=contract_hash)
-           if o["eligible_signal"] == "PASS" and o["final"] == 1 and o["actionable"] == 1 and o["scan_at"] < open_s]
+           if o["eligible_signal"] == "PASS" and o["final"] == 1 and o["actionable"] == 1 and o["scan_at"] < open_s
+           and o["run_id"] in ok_ids]
     evals: dict[str, dict] = {}
     out = []
     for o in obs:
@@ -342,7 +375,18 @@ def select_candidates(sstore: ScanStore, rstore: ResearchStore, cal: TradingCale
                     "stop_ref": lv.get("stop_ref"), "stock_revision": e["evidence"]["stock"].get("revision"),
                     "base_dt": e["evidence"]["stock"].get("base_dt"), "levels": lv})
     status = "OK" if out else "NO_CANDIDATES"
-    return {**cset, "status": status, "reason": f"후보 {len(out)}건 (스캔 {len(runs)}회)"}, out
+    why = f", 개장 뒤 저장된 실행 {len(excluded)}회 제외" if excluded else ""
+    return {**cset, "status": status, "reason": f"후보 {len(out)}건 (개장 전 저장된 스캔 {len(runs)}회{why})"}, out
+
+
+def commit_bound(run: dict) -> tuple[str | None, str]:
+    """실행의 저장 완료 시각 상한(이보다 늦게 저장됐을 수 없음)과 근거."""
+    if run.get("committed_at"):
+        return run["committed_at"], "COMMITTED_AT"
+    if run.get("finished_at"):
+        return (_ts(datetime.fromisoformat(run["finished_at"]) + LEGACY_COMMIT_MARGIN),
+                "LEGACY_FINISHED_AT+1h(커밋 시각 기록 전 실행)")
+    return None, "UNKNOWN"
 
 
 # ── 확인 실행 ────────────────────────────────────────────────────
@@ -373,8 +417,8 @@ class OpenChecker:
         started = now()
         if started < target:
             raise OpenCheckError(f"목표 시각 {target} 전({started}) — 일찍 조회한 가격을 개장 + N분 가격으로 기록하지 않음")
-        run_id = f"a5_{day:%Y%m%d}_{started:%Y%m%d%H%M%S}"
-        for rid in self.ostore.begin_run(run_id, day, self.kind, self.contract_hash, started):
+        run_id, stale = self.ostore.begin_run(day, self.kind, self.contract_hash, started)
+        for rid in stale:
             self.log(f"[A5] 끝나지 않은 이전 실행 {rid} → ABORTED")
         try:
             cset = self.ostore.get_set(day)
@@ -419,7 +463,17 @@ class OpenChecker:
                     "outcome_detail": f"확인 시각 {_ts(ts)} — D 정규장 종료({_ts(close)}) 뒤라 조회하지 않음",
                     "recorded_at": _ts(ts)}
         try:
-            b = client.fetch_body(PRICE_API_ID, {"stk_cd": c["symbol"]})
+            b = client.fetch_body(PRICE_API_ID, {"stk_cd": c["symbol"]}, not_after=close)
+        except DeadlinePassed as exc:
+            # 대기·재시도 뒤 실제 요청 직전에 마감이 지남 (A5-R2) — 그 요청은 보내지 않음
+            t2 = now()
+            if exc.attempts == 0:
+                return {**base, "timing": MISSED, "fetch_status": NOT_RUN, "outcome": MISSED, "api_id": PRICE_API_ID,
+                        "outcome_detail": f"요청 직전 정규장 종료({_ts(close)}) — 요청하지 않음", "recorded_at": _ts(t2)}
+            return {**base, "requested_at": _ts(ts), "attempts": exc.attempts, "api_id": PRICE_API_ID,
+                    "lateness_sec": int((ts - target).total_seconds()), "timing": MISSED, "fetch_status": FETCH_FAILED,
+                    "error": str(exc)[:300], "outcome": FETCH_FAILED,
+                    "outcome_detail": "재시도 중 정규장 종료 — 더 요청하지 않음", "recorded_at": _ts(t2)}
         except ResearchApiError as exc:
             t2 = now()
             late = int((ts - target).total_seconds())
@@ -428,17 +482,27 @@ class OpenChecker:
                     "error": str(exc)[:300], "outcome": FETCH_FAILED, "outcome_detail": "조회 실패(재시도 후)",
                     "recorded_at": _ts(t2)}
         late = int((b.requested_at - target).total_seconds())
+        if b.requested_at - target > self.tolerance:
+            timing = LATE                                   # 요청 자체가 늦음
+        elif b.received_at - target > self.tolerance:
+            timing = LATE_RESPONSE                          # 요청은 제때, 응답 확보가 늦음
+        else:
+            timing = ON_TIME
         row = {**base, "requested_at": _ts(b.requested_at), "received_at": _ts(b.received_at), "lateness_sec": late,
-               "attempts": b.attempts, "api_id": PRICE_API_ID,
-               "timing": ON_TIME if b.requested_at - target <= self.tolerance else LATE,
+               "attempts": b.attempts, "api_id": PRICE_API_ID, "timing": timing,
+               "response_ms": int((b.received_at - b.requested_at).total_seconds() * 1000),
                "body_json": json.dumps(_redact(b.body), ensure_ascii=False), "recorded_at": _ts(now())}
+        if b.received_at >= close:
+            # 마감 전에 요청했지만 응답을 마감 뒤에 받음 — 원문·실제 시각만 보존, 장중 확인·가정 체결로 쓰지 않음 (A5-R2)
+            return {**row, "timing": AFTER_CLOSE, "fetch_status": RECEIVED_AFTER_CLOSE, "outcome": AFTER_CLOSE,
+                    "outcome_detail": f"응답 수신 {_ts(b.received_at)} ≥ 정규장 종료 {_ts(close)} — 유효한 장중 확인 아님"}
         try:
             q = parse_quote(b.body)
         except ValueError as exc:
             return {**row, "fetch_status": PARSE_FAILED, "error": str(exc)[:300], "outcome": PARSE_FAILED,
                     "outcome_detail": "응답에 필수 가격 필드 없음"}
         outcome, detail = evaluate(c, q)
-        row.update(self._extras(c["symbol"], target.date(), client, now))
+        row.update(self._extras(c["symbol"], target.date(), close, client, now))
         return {**row, "fetch_status": FETCHED, "observed_price": q.price, "base_price": q.base, **q.optional,
                 "outcome": outcome, "outcome_detail": detail,
                 "gap_vs_close": None if not c["signal_close"] else round(q.price / c["signal_close"] - 1, 6),
@@ -447,18 +511,25 @@ class OpenChecker:
                 "assumed_fill_rule": ASSUMED_FILL_RULE if outcome == WITHIN_CAP else None}
 
 
-    def _extras(self, symbol: str, day: date, client, now) -> dict:
-        """보조 조회(기록용): ka10003 최근 체결 시각·가격, ka10004 최우선 호가. 실패해도 판정에 영향 없음."""
+    def _extras(self, symbol: str, day: date, close: datetime, client, now) -> dict:
+        """보조 조회(기록용): ka10003 최근 체결 시각·가격, ka10004 최우선 호가. 실패해도 판정에 영향 없음.
+        마감이 지나면 요청하지 않고(SKIPPED_AFTER_CLOSE), 마감 뒤에 받은 응답은 값으로 쓰지 않음(RECEIVED_AFTER_CLOSE)."""
         out: dict = {"recorded_at": _ts(now())}
         info: dict = {}
         for api_id, parse in ((TRADE_API_ID, parse_trade), (BOOK_API_ID, parse_book)):
             try:
-                b = client.fetch_body(api_id, {"stk_cd": symbol})
+                b = client.fetch_body(api_id, {"stk_cd": symbol}, not_after=close)
+            except DeadlinePassed as exc:
+                info[api_id] = {"status": SKIPPED_AFTER_CLOSE, "attempts": exc.attempts}
+                continue
             except ResearchApiError as exc:
                 info[api_id] = {"status": FETCH_FAILED, "error": str(exc)[:200]}
                 continue
             entry = {"status": FETCHED, "requested_at": _ts(b.requested_at), "received_at": _ts(b.received_at),
                      "attempts": b.attempts}
+            if b.received_at >= close:
+                info[api_id] = {**entry, "status": RECEIVED_AFTER_CLOSE}
+                continue
             try:
                 p = parse(b.body, day)
             except ValueError as exc:

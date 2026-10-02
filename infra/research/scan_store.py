@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""S1 관찰 기록 저장소 (A4-A, SQLite — 기본 data/research/s1_scans.sqlite3, git 제외). 스키마 s3.
+"""S1 관찰 기록 저장소 (A4-A, SQLite — 기본 data/research/s1_scans.sqlite3, git 제외). 스키마 s4.
 
 수집 저장소(research.sqlite3)와 파일을 나눕니다 — 수집 DB를 다시 만들거나 이전해도 관찰 기록은 그대로 남습니다.
 
@@ -8,6 +8,9 @@ from __future__ import annotations
 - scan_run       : 스캔 한 번. run_key = (신호일 | 스캔 시각 | 전략 | 설정 해시 | 분류 정책 | **계산 계약 해시**). 같은
                    run_key의 COMPLETE는 하나뿐(부분 유일 인덱스) → 같은 계약·스캔 시각으로 다시 돌려도 중복 저장 없음,
                    계약(lookback·계산 버전·완성 지연·달력 등)이 다르면 별도 실행. contract_hash 열(s3).
+                   committed_at(s4): 판정·대표 기록·COMPLETE를 **커밋한 뒤** 잰 시각을 초 올림으로 — 실제 저장
+                   완료보다 이르지 않음(A5가 "개장 전에 실제로 확보된 신호"를 가릴 때 씀). finished_at은 저장
+                   트랜잭션 시작 시각이라 그 용도로 쓰지 않음.
                    상태 RUNNING → COMPLETE / FAILED / ABORTED. 시작할 때 남아 있던 RUNNING은 ABORTED로 정리.
 - s1_eval        : 그 실행의 종목별 판정 전부(후보·탈락·보류). 실행마다 쌓이고 고치지 않음(append-only).
                    결과 본문(S1Result, 시장 판정은 실행 context로 분리)·종목별 증거(revision·조정 기준·위험 표시)는
@@ -27,6 +30,7 @@ from __future__ import annotations
   대체될 수 있음. PASS·FAIL로 확정된 대표 기록은 그대로. 실행·종목별 판정(scan_run·s1_eval)은 당시 그대로 보존.
 - s2 → s3 (GPT 재검토 016907a P2): scan_run·s1_observation에 contract_hash 열 추가. 기존 행은 NULL(계약 기록 전 —
   어떤 lookback·달력으로 계산했는지 저장돼 있지 않아 추정하지 않음). 기존 기록은 바꾸지 않음.
+- s3 → s4 (GPT 재검토 14eb8c0 A5-R1): scan_run.committed_at 열 추가. 기존 실행은 NULL(커밋 시각을 재지 않았음).
 
 원자성: 종목별 판정·대표 기록·COMPLETE 표시를 한 트랜잭션에 씁니다. 도중에 끊기면 아무것도 남지 않고 실행은
 RUNNING으로 남아 다음 실행이 ABORTED로 정리합니다. COMPLETE 표시는 `status='RUNNING'`인 행에만 하므로,
@@ -38,12 +42,12 @@ import json
 import sqlite3
 import zlib
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from infra.research.store import sqlite_backup
 
-SCAN_SCHEMA = "s3"
+SCAN_SCHEMA = "s4"
 RUNNING, COMPLETE, FAILED, ABORTED = "RUNNING", "COMPLETE", "FAILED", "ABORTED"
 FINAL_RULE = "inputs_ok+decided"       # 실행 context에 기록 — 이 규칙 전(f837185) 실행과 구분
 
@@ -62,7 +66,7 @@ CREATE TABLE IF NOT EXISTS scan_run(
   feature_version TEXT NOT NULL, market_version TEXT NOT NULL, after_close_min INTEGER NOT NULL,
   started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, snapshot_id INTEGER, snapshot_observed_at TEXT,
   snapshot_status TEXT, context_json TEXT NOT NULL DEFAULT '{}', counts_json TEXT NOT NULL DEFAULT '{}',
-  report_path TEXT, error TEXT NOT NULL DEFAULT '', contract_hash TEXT);
+  report_path TEXT, error TEXT NOT NULL DEFAULT '', contract_hash TEXT, committed_at TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_run_complete ON scan_run(run_key) WHERE status='COMPLETE';
 CREATE INDEX IF NOT EXISTS ix_run_signal_date ON scan_run(signal_date, scan_at);
 CREATE TABLE IF NOT EXISTS s1_eval(
@@ -124,6 +128,12 @@ def _ts(dt: datetime | None) -> str | None:
     return None if dt is None else dt.replace(microsecond=0).isoformat(timespec="seconds")
 
 
+def _ts_up(dt: datetime) -> str:
+    """초 미만을 올림 — 실제 시각보다 이르게 기록하지 않음."""
+    base = dt.replace(microsecond=0)
+    return (base + timedelta(seconds=1) if dt.microsecond else base).isoformat(timespec="seconds")
+
+
 def signal_id(strategy: str, contract_hash: str, symbol: str, signal_date: str) -> str:
     """대표 기록 키 — 계산 계약별로 구분(입력 해시는 넣지 않음). s3 이전 기록은 c: 대신 설정 해시였음."""
     return f"S1|{strategy}|c:{contract_hash}|{symbol}|{signal_date}"
@@ -175,7 +185,7 @@ class ScanStore:
             self.conn.execute("INSERT INTO meta(key, value) VALUES('scan_schema', ?)", (SCAN_SCHEMA,))
         else:
             version = cur[0]
-            if version not in ("s1", "s2", SCAN_SCHEMA):
+            if version not in ("s1", "s2", "s3", SCAN_SCHEMA):
                 raise RuntimeError(f"관찰 저장소 스키마 {version} ≠ {SCAN_SCHEMA}: {self.path}")
             if version != SCAN_SCHEMA:
                 if backup_before_upgrade:
@@ -186,6 +196,9 @@ class ScanStore:
                 version = "s2"
             if version == "s2":
                 self.upgrade_summary.update(self._upgrade_s2_to_s3())
+                version = "s3"
+            if version == "s3":
+                self.upgrade_summary.update(self._upgrade_s3_to_s4())
         self.conn.execute("INSERT OR IGNORE INTO codec(name, zdict) VALUES(?, ?)", (CODEC, ZDICT_V1))
         self._zdict = {r[0]: bytes(r[1]) for r in self.conn.execute("SELECT name, zdict FROM codec")}
 
@@ -225,7 +238,7 @@ class ScanStore:
                        "SELECT COUNT(*) FROM scan_run WHERE contract_hash IS NULL").fetchone()[0],
                    "legacy_observations": self.conn.execute(
                        "SELECT COUNT(*) FROM s1_observation WHERE contract_hash IS NULL").fetchone()[0]}
-            self.conn.execute("UPDATE meta SET value=? WHERE key='scan_schema'", (SCAN_SCHEMA,))
+            self.conn.execute("UPDATE meta SET value='s3' WHERE key='scan_schema'")
             self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_s3', ?)",
                               (json.dumps({"at": _ts(datetime.now()), **out}, ensure_ascii=False),))
         return out
@@ -269,6 +282,19 @@ class ScanStore:
         r = self.conn.execute("SELECT * FROM scan_run WHERE run_key=? AND status=?", (run_key, COMPLETE)).fetchone()
         return None if r is None else self._run_dict(r)
 
+    def _upgrade_s3_to_s4(self) -> dict:
+        """커밋 완료 시각 열(committed_at) 추가. 기존 실행은 NULL — 그때 재지 않은 값을 만들어 넣지 않음."""
+        with self.tx():
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(scan_run)")}
+            if "committed_at" not in cols:
+                self.conn.execute("ALTER TABLE scan_run ADD COLUMN committed_at TEXT")
+            out = {"runs_without_commit_time": self.conn.execute(
+                "SELECT COUNT(*) FROM scan_run WHERE status=? AND committed_at IS NULL", (COMPLETE,)).fetchone()[0]}
+            self.conn.execute("UPDATE meta SET value=? WHERE key='scan_schema'", (SCAN_SCHEMA,))
+            self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_s4', ?)",
+                              (json.dumps({"at": _ts(datetime.now()), **out}, ensure_ascii=False),))
+        return out
+
     def begin_run(self, *, run_key: str, scan_at: datetime, signal_date: str, strategy: str, config_hash: str,
                   universe_policy: str, feature_version: str, market_version: str, after_close_min: int,
                   started_at: datetime, contract_hash: str) -> tuple[str, list[str]]:
@@ -299,8 +325,11 @@ class ScanStore:
 
     def finish_run(self, *, run_id: str, evals: list[dict], context: dict, counts: dict, snapshot: dict | None,
                    snapshot_status: str, scan_at: datetime, now: datetime, strategy: str, config_hash: str,
-                   contract_hash: str, before_commit=None) -> dict:
-        """판정·대표 기록·COMPLETE를 한 트랜잭션에. 반환: 대표 기록 변화 집계."""
+                   contract_hash: str, before_commit=None, clock=None) -> dict:
+        """판정·대표 기록·COMPLETE를 한 트랜잭션에. 반환: 대표 기록 변화 집계.
+
+        커밋이 끝난 뒤 clock()(없으면 지금)을 초 올림해 committed_at에 기록 — 실제 저장 완료보다 이르지 않은 시각.
+        그 기록 전에 프로세스가 끝나면 committed_at은 NULL로 남음(A5는 저장 완료를 입증하지 못한 실행으로 봄)."""
         obs_tally = {"new": 0, "kept_final": 0, "replaced": 0, "kept_newer": 0}
         with self.tx():
             cur = self.conn.execute(
@@ -328,6 +357,10 @@ class ScanStore:
                               (json.dumps(counts, ensure_ascii=False), run_id))
             if before_commit is not None:          # 시험용: 커밋 직전 중단을 흉내
                 before_commit()
+        committed = _ts_up(clock() if clock is not None else datetime.now())
+        with self.tx():
+            self.conn.execute("UPDATE scan_run SET committed_at=? WHERE run_id=? AND status=?",
+                              (committed, run_id, COMPLETE))
         return obs_tally
 
     def _upsert_observation(self, e: dict, *, run_id, scan_at, now, strategy, config_hash, contract_hash) -> str:
