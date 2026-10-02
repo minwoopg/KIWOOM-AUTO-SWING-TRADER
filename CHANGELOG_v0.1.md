@@ -930,4 +930,35 @@ A4 시점 재평가에 영향을 주는 P1 2건.
 ### 전달 파일
 - 패치 0001 (feat), 0002 (docs)
 
+## 2026-10-02 — 저장소 r4: 같은 초 저장 봉의 UNPROVEN 오판정 수정 (사용자 실측 status 후속)
+
+### 배경
+- 사용자 실측(10/2 10:10, a4a 적용 뒤 첫 `status`): schema r3, integrity 전부 OK, 그러나 현재 봉 `UNPROVEN 199`.
+- 원인(실제 r1 `166585b`·r2 `e913df1` 코드로 재현): r3 시각 복원이 봉 수신 시각(초 올림 — r2 저장 규칙)과 저장 기록 시각(초 내림)을
+  그대로 비교. 한 페이지로 끝나는 짧은 시계열(2024년 중반 이후 상장 등)은 두 번째 백필에서 9/30 봉을 받은 같은 초에 저장(EXTEND)돼
+  저장 기록(:17)이 수신(:18)보다 앞서 보여 "저장 기록 없음 → UNPROVEN"으로 잘못 남음. 여러 페이지 시계열은 저장까지 몇 초 걸려 영향 없음.
+- 영향: time_proof가 시계열(revision) 단위라 이 199종목은 A4-A 스캔에서 매일 데이터 보류(UNPROVEN)로 빠짐.
+- 덧붙여 확인: `revision_reasons`의 `BACKFILL:… 2` = REBASE 1건 + 9/30 첫 백필 때 완성 봉이 없던(9/30 상장, 장중 봉만) 1종목의 INIT.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `infra/research/store.py` (스키마 r3→r4) | 이전 판 복원에 같은 초 규칙: '수신 시각 − 1초 이후 첫 저장 기록'을 그 봉의 저장으로 보고 사용 가능 시각 = max(판 활성, 수신, 저장 기록). r3→r4 단계에서 이미 r3인 DB의 MIGRATED·UNPROVEN 봉만 다시 계산(이후 OBSERVED 봉은 그대로). r2→r3 단계도 같은 규칙 |
+| `docs/research_a_stage.md` | 기존 DB 이전에 r3→r4 설명 |
+
+### 테스트 및 검증
+- `test_research_collect` 13-12(같은 초 수신·저장 → MIGRATED, 사용 가능 시각 = 수신), 13-13(이미 r3인 DB의 UNPROVEN → MIGRATED, r3 뒤 OBSERVED 봉 불변) 추가 — 109건(실측 원문 포함 110).
+- 실제 r1·r2 코드로 만든 DB(1페이지 시계열·9/30 상장 종목 포함)를 r3로 연 상태와 r2 상태 둘 다 새 코드로 열어 UNPROVEN 0, 결과 동일.
+- 변이 확인 4종(같은 초 허용 제거·r4가 OBSERVED까지 재계산·사용 가능 시각에서 수신 제외·r3→r4 단계 제거) 모두 잡힘.
+- `run_regression_tests.py --skip test_broker_order_status.py`: 30개 전부 통과. 단타 원본 동등성 18/18. `git status` 깨끗.
+
+### 변경하지 않은 것
+- 수집·검증·스캔 규칙, S1, 주문 경로.
+
+### 다음 작업
+- 사용자: 패치 적용 → `status`(schema r4, time_basis current UNPROVEN 없음) → 18:10 이후 `update`(자동 스캔).
+
+### 전달 파일
+- 패치 0001 (fix: 저장소·테스트·문서·CHANGELOG)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

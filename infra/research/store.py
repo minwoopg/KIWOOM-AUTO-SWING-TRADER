@@ -44,6 +44,8 @@ from __future__ import annotations
   (INIT·REBASE)** 으로 복원하고, 봉 available_at = max(활성 시각, 그 봉 수신 시각 이후 첫 저장 기록 시각)으로
   다시 계산합니다(첫 페이지 수신 시각을 사용 가능 시각으로 쓰지 않음). revision 구간이 겹치거나 기록이 없어
   입증할 수 없으면 time_basis=UNPROVEN — 시점 조회에서 보류. 정합성 이력도 VERIFY_FAILED 기록에서 다시 만듭니다.
+- r3 → r4: 같은 초 규칙으로 다시 계산(저장 기록 시각은 초 내림·수신 시각은 초 올림이라 최대 1초 앞서 보일 수 있음).
+  r3에서 한 페이지짜리 짧은 시계열의 새 봉이 UNPROVEN으로 잘못 남던 것을 바로잡음(MIGRATED·UNPROVEN 봉만).
 """
 
 import gzip
@@ -58,7 +60,8 @@ from typing import Iterable
 from domain.research.series import ResearchBar
 from infra.research.kiwoom_rows import NO_TRADES, RawBar, SourceSpec, to_research_bar
 
-SCHEMA_VERSION = "r3"
+SCHEMA_VERSION = "r4"
+SECOND = timedelta(seconds=1)
 WRITE_EVENTS = ("INIT", "REBASE", "EXTEND", "APPEND")      # 봉을 실제로 저장한 기록
 OBSERVED_TIME, MIGRATED_TIME, UNPROVEN_TIME = "OBSERVED", "MIGRATED", "UNPROVEN"
 NO_REVISION = "NO_REVISION"
@@ -272,6 +275,9 @@ class ResearchStore:
         if version == "r2":
             self._upgrade_r2_to_r3()
             version = "r3"
+        if version == "r3":
+            self._upgrade_r3_to_r4()
+            version = "r4"
         if version != SCHEMA_VERSION:
             raise RuntimeError(f"연구 저장소 스키마 {version} ≠ {SCHEMA_VERSION}: {self.path}")
 
@@ -336,12 +342,38 @@ class ResearchStore:
                 self._repair_migrated_series(sid)
             for (sid,) in c.execute("SELECT series_id FROM series ORDER BY series_id").fetchall():
                 self._rebuild_integrity_log(sid)
-            c.execute("UPDATE meta SET value=? WHERE key='schema_version'", (SCHEMA_VERSION,))
+            c.execute("UPDATE meta SET value='r3' WHERE key='schema_version'")
             c.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_r3', ?)",
                       (datetime.now().isoformat(timespec="seconds"),))
 
-    def _repair_migrated_series(self, sid: str) -> None:
+    def _upgrade_r3_to_r4(self) -> None:
+        """r3 이전의 시각 복원을 같은 초 규칙으로 다시 계산 (사용자 실측 2026-10-02: UNPROVEN 199봉).
+
+        r3 복원은 봉 수신 시각(초 올림)과 저장 기록 시각(초 내림)을 그대로 비교해서, 한 페이지로 끝나는 짧은 시계열
+        (최근 상장 — 수신과 저장이 같은 초)의 새 봉을 저장 기록이 없다고 보고 UNPROVEN으로 남겼습니다.
+        이미 r3로 바뀐 DB의 MIGRATED·UNPROVEN 봉만 다시 계산합니다(r3 뒤 새로 저장된 OBSERVED 봉은 그대로).
+        """
+        with self.tx():
+            migrated = [r[0] for r in self.conn.execute(
+                "SELECT DISTINCT series_id FROM series_revision WHERE reason LIKE 'MIGRATED_R1%' ORDER BY series_id")]
+            for sid in migrated:
+                self._repair_migrated_series(sid, only_basis=(MIGRATED_TIME, UNPROVEN_TIME))
+            self.conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (SCHEMA_VERSION,))
+            self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('upgraded_to_r4', ?)",
+                              (datetime.now().isoformat(timespec="seconds"),))
+
+    def _repair_migrated_series(self, sid: str, only_basis: tuple[str, ...] | None = None) -> None:
+        """only_basis를 주면 그 time_basis인 봉만 다시 계산(r3→r4: 이후 새로 저장된 OBSERVED 봉은 건드리지 않음).
+
+        같은 초 규칙: 저장 기록 시각은 초 내림, 봉 수신 시각은 초 올림으로 남았으므로 실제로 수신 뒤에 저장했어도
+        기록 시각이 수신 시각보다 최대 1초 앞서 보일 수 있습니다. 그래서 '수신 시각 − 1초 이후의 첫 저장 기록'을
+        그 봉을 저장한 기록으로 보고, 사용 가능 시각은 max(판 활성, 수신 시각, 저장 기록 시각)으로 둡니다
+        (수신 시각을 포함하므로 같은 초 경우에도 실제 저장보다 이르게 되지 않음)."""
         c = self.conn
+        basis_cond, basis_args = "", ()
+        if only_basis:
+            basis_cond = f" AND time_basis IN ({','.join('?' * len(only_basis))})"
+            basis_args = tuple(only_basis)
         revs = [dict(r) for r in c.execute("SELECT * FROM series_revision WHERE series_id=? ORDER BY revision", (sid,))]
         events = [(r["at"], r["event"], json.loads(r["detail_json"])) for r in c.execute(
             "SELECT at, event, detail_json FROM series_event WHERE series_id=? ORDER BY event_id", (sid,))]
@@ -376,15 +408,18 @@ class ResearchStore:
                       (act[rv], sup, f"{base_reason}:{'EVENT' if proven[rv] else 'UNPROVEN'}", sid, rv))
             for table in ("bar", "bar_history"):
                 recvs = [r[0] for r in c.execute(
-                    f"SELECT DISTINCT received_at FROM {table} WHERE series_id=? AND revision=?", (sid, rv))]
+                    f"SELECT DISTINCT received_at FROM {table} WHERE series_id=? AND revision=?{basis_cond}",
+                    (sid, rv) + basis_args)]
                 for recv in recvs:
-                    w = next((t for t in writes if t >= recv), None)
+                    floor_recv = (datetime.fromisoformat(recv) - SECOND).isoformat(timespec="seconds")
+                    w = next((t for t in writes if t >= floor_recv), None)
                     if proven[rv] and w is not None:
                         c.execute(f"UPDATE {table} SET available_at=?, time_basis=? WHERE series_id=? AND revision=?"
-                                  " AND received_at=?", (max(act[rv], w), MIGRATED_TIME, sid, rv, recv))
+                                  f" AND received_at=?{basis_cond}",
+                                  (max(act[rv], recv, w), MIGRATED_TIME, sid, rv, recv) + basis_args)
                     else:
-                        c.execute(f"UPDATE {table} SET time_basis=? WHERE series_id=? AND revision=? AND received_at=?",
-                                  (UNPROVEN_TIME, sid, rv, recv))
+                        c.execute(f"UPDATE {table} SET time_basis=? WHERE series_id=? AND revision=? AND received_at=?"
+                                  f"{basis_cond}", (UNPROVEN_TIME, sid, rv, recv) + basis_args)
 
     def _rebuild_integrity_log(self, sid: str) -> None:
         c = self.conn

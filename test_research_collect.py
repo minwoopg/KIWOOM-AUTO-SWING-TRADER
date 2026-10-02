@@ -910,8 +910,8 @@ mdb = TMP / "r1.sqlite3"
 r1_db(mdb)
 st5 = ResearchStore(mdb)
 revs5 = [(x["revision"], x["activated_at"], x["superseded_at"], x["reason"]) for x in st5.revisions(MS)]
-check("13-1) r1 DB를 열면 r3까지 자동 이전 — 봉·작업 보존, 스키마 r3",
-      st5.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r3"
+check("13-1) r1 DB를 열면 r4까지 자동 이전 — 봉·작업 보존, 스키마 r4",
+      st5.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r4"
       and len(st5.load_bars(MS)) == 6 and len(st5.load_history(MS)) == 7 and st5.job_counts("j1") == {"DONE": 1})
 check("13-2) [2차 #1] 과거 판 활성 시각은 저장 기록(INIT·REBASE) 시각으로 복원 — 첫 페이지 수신 시각 아님, 구간 겹침 없음",
       revs5 == [(1, "2026-09-30T19:05:00", "2026-10-01T19:10:00", "MIGRATED_R1_HISTORY:EVENT"),
@@ -943,6 +943,9 @@ st5.close()
 # 이미 r2로 이전된 DB(이전 버전이 만든 잘못된 시각)도 열 때 보정
 class R2Only(ResearchStore):
     def _upgrade_r2_to_r3(self) -> None:          # 이전 버전처럼 r2에서 멈춤
+        pass
+
+    def _upgrade_r3_to_r4(self) -> None:
         pass
 
 
@@ -984,6 +987,40 @@ check("13-11) revision 구간이 겹치면(활성 시각이 증가하지 않음)
       and q8.bars == [] and q8.time_proof == "UNPROVEN"
       and st8.research_series(MS, as_of=datetime(2026, 10, 3, 20, 0)).time_proof == "OK")
 st8.close()
+
+# 같은 초 규칙 (사용자 실측 10/2: 한 페이지짜리 짧은 시계열의 새 봉 199개가 UNPROVEN으로 남음)
+m5 = TMP / "r1_samesec.sqlite3"
+r1_db(m5)
+R2Only(m5).close()                                            # r2 코드 시절
+con = sqlite3.connect(m5)
+con.execute(f"INSERT INTO bar(series_id, date, open_raw, high_raw, low_raw, close_raw, volume, trade_value_raw, quality,"
+            f" run_type, received_at, available_at, first_ready_at, revision) VALUES('{MS}','2026-10-05',101,106,96,101,"
+            "1000,1,'','BACKFILL','2026-10-06T08:52:18','2026-10-06T08:52:18','2026-10-06T08:52:18',3)")
+con.execute("INSERT INTO series_event(series_id, at, event, detail_json) VALUES(?,?,?,?)",
+            (MS, "2026-10-06T08:52:17", "EXTEND", json.dumps({"revision": 3})))  # 수신(올림 :18)과 같은 초에 저장(내림 :17)
+con.commit()
+con.close()
+st9 = ResearchStore(m5)
+b9 = [sb for sb in st9.load_bars(MS) if sb.raw.date == date(2026, 10, 5)][0]
+check("13-12) [실측 재현] 수신(초 올림 08:52:18)과 저장 기록(초 내림 08:52:17)이 같은 초여도 입증 — MIGRATED, "
+      "사용 가능 시각 = 수신 시각(저장보다 이르지 않음), 시계열 time_proof OK",
+      b9.time_basis == "MIGRATED" and b9.available_at == datetime(2026, 10, 6, 8, 52, 18)
+      and st9.research_series(MS).time_proof == "OK")
+st9.conn.execute("UPDATE bar SET time_basis='UNPROVEN' WHERE series_id=? AND date='2026-10-05'", (MS,))   # r3 버그 상태
+st9.conn.execute(f"INSERT INTO bar(series_id, date, open_raw, high_raw, low_raw, close_raw, volume, trade_value_raw,"
+                 f" quality, run_type, received_at, available_at, first_ready_at, time_basis, revision)"
+                 f" VALUES('{MS}','2026-10-06',101,106,96,101,1000,1,'','FORWARD','2026-10-06T19:00:00',"
+                 "'2026-10-06T19:00:00','2026-10-06T19:00:00','OBSERVED',3)")                  # r3 뒤 새로 저장한 봉
+st9.conn.execute("UPDATE meta SET value='r3' WHERE key='schema_version'")
+st9.close()
+st9 = ResearchStore(m5)
+bb = {sb.raw.date: sb for sb in st9.load_bars(MS)}
+check("13-13) 이미 r3로 바뀐 DB: 열면 r4로 다시 계산 — UNPROVEN이던 같은 초 봉은 MIGRATED, r3 뒤 새로 저장한 OBSERVED 봉은 그대로",
+      st9.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "r4"
+      and bb[date(2026, 10, 5)].time_basis == "MIGRATED" and bb[date(2026, 10, 6)].time_basis == "OBSERVED"
+      and bb[date(2026, 10, 6)].available_at == datetime(2026, 10, 6, 19, 0)
+      and st9.research_series(MS).unproven_bars == 0)
+st9.close()
 
 # ── 6. 과거 휴장일 후보 ─────────────────────────────────────
 days = [date(2026, 1, 1) + timedelta(days=i) for i in range(273)]
