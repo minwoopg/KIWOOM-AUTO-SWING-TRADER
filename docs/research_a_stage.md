@@ -169,6 +169,10 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
   남김. r4는 '수신 시각 − 1초 이후의 첫 저장 기록'을 그 봉의 저장으로 보고 사용 가능 시각 = max(판 활성, 수신, 저장 기록)
   (수신 시각을 포함하므로 실제 저장보다 이르지 않음). 이미 r3인 DB는 열 때 MIGRATED·UNPROVEN 봉만 다시 계산
   (r3 뒤 새로 저장된 OBSERVED 봉은 그대로).
+  * 저장 근거는 **같은 revision의 저장 기록**(revision 표시 없는 APPEND 포함)만 인정. 근거 없는 봉은 UNPROVEN 유지(일괄 해제 안 함).
+  * 스키마를 올리기 전에 같은 폴더에 자동 백업(`research.sqlite3.bak-<옛 버전>-<시각>`, SQLite 백업 API). 확인 뒤 지워도 됨.
+  * 보정 전에 `inspect-unproven`(읽기 전용, 이전·백업 없음)으로 UNPROVEN 봉을 종목·날짜·저장 기록과 대조할 수 있음
+    (PROVABLE_SAME_SECOND·PROVABLE은 보정 대상, REVISION_UNPROVEN·NO_EVIDENCE는 계속 보류).
 
 ### 응답·연속조회 계약 (A2-R3)
 - return_code가 **있고 0**이어야 성공(누락을 성공으로 보지 않음). cont-yn 헤더는 Y/N, Y이면 next-key 필수.
@@ -217,10 +221,12 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
 |---|---|
 | `scan_run` | 실행. run_key = 신호일·스캔 시각·전략·설정 해시·분류 정책 — COMPLETE는 하나뿐(유일 인덱스). RUNNING → COMPLETE / FAILED / ABORTED. 실행 공통 증거(지수 revision·판정, 스냅숏, 세션, 버전)는 context |
 | `s1_eval` | 실행마다 종목별 판정 전부(PASS·FAIL·UNKNOWN, 조건별 값·사유, 참고 손절가·진입 상한, 관찰값). append-only. 결과·증거(revision·조정 기준일·지수 revision·스냅숏 ID·위험 표시)는 사전 압축 JSON, 입력 해시는 열 |
-| `s1_observation` | 신호 ID = `S1|전략|설정 해시|종목|신호일`(**입력 해시 없음**)마다 대표 판정. final(데이터·지수·스냅숏 모두 정상)은 절대 안 바뀜 — 이후 정정·새 스냅숏에도 유지. final이 아닌 보류 기록만 더 늦은 스캔 시각의 실행이 대체(이력 보존). 과거 시각 재현 실행은 더 늦은 기록을 되돌리지 않음 |
+| `s1_observation` | 신호 ID = `S1|전략|설정 해시|종목|신호일`(**입력 해시 없음**)마다 대표 판정. final(데이터·지수·스냅숏 모두 정상이고 **판정이 PASS/FAIL로 정해진** 경우)은 절대 안 바뀜 — 이후 정정·새 스냅숏에도 유지. final이 아닌 기록(데이터 보류·UNKNOWN — 거래 없는 봉·이력 부족 등)은 더 늦은 스캔 시각의 실행이 대체(이력 보존). 과거 시각 재현 실행은 더 늦은 기록을 되돌리지 않음 |
 
 - actionable = 스캔 시각 < 다음 거래일 개장 — 개장 뒤에 늦게 해소된 기록은 0(A5에서 진입 가정에 쓰지 않음).
 - 같은 run_key 재실행 → 건너뜀(중복 저장 없음). `--verify`는 다시 계산해 종목별 판정·입력 해시·결과 비교만.
+  건너뛸 때 보고서(md·json)가 없으면 저장된 실행(context·집계·판정)으로 **보고서만 다시 만듦**(재계산 없음).
+- 실행 ID = 신호일·스캔 시각·run_key 해시·시도 번호 — run_key만 다른 실행(분류 정책 등)도 ID가 겹치지 않음.
 - 원자성: 판정·대표 기록·COMPLETE 표시를 한 트랜잭션. 도중 중단 → 아무것도 안 남고 실행은 ABORTED(강제 종료면
   RUNNING으로 남았다가 다음 실행이 ABORTED로 정리). ABORTED로 정리된 실행은 늦게 끝나도 완료 표시 안 됨.
 - 크기: 2,500종목 한 번에 약 3MB(하루 1회면 1년 약 0.75GB). 스캔 약 7~8초.

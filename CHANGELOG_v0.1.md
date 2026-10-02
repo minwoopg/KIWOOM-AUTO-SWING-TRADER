@@ -959,6 +959,50 @@ A4 시점 재평가에 영향을 주는 P1 2건.
 - 사용자: 패치 적용 → `status`(schema r4, time_basis current UNPROVEN 없음) → 18:10 이후 `update`(자동 스캔).
 
 ### 전달 파일
-- 패치 0001 (fix: 저장소·테스트·문서·CHANGELOG)
+- 패치 0001 (fix: 저장소·테스트·문서·CHANGELOG) — 이후 A4-A 보완 R1~R5 묶음(`swing-a4b`)에 포함해 전달
+
+## 2026-10-02 — A4-A 보완 R1~R5 (GPT 재검토 `f837185` + 사용자 실측 status)
+
+### 배경
+GPT가 사용자 `status`와 `f837185`를 함께 검토: 회귀 30/30·스캔 39/39·동등성 18/18 통과, 그러나 테스트가 놓친 경로 5건 재현.
+- R1(P1): `_LazyClient.__getattr__`가 `_ensure_client()` 함수 안에 들어가 있음(들여쓰기 실수) → 일반 CLI의 universe·update·조회 backfill이
+  `AttributeError: fetch_page`. 테스트는 가짜 클라이언트를 직접 넘겨 래퍼를 우회.
+- R2(P1): r3 보정이 수신(초 올림)·저장 기록(초 내림) 시각을 그대로 비교 → 정상 저장 봉이 UNPROVEN. 이미 r3인 DB의 보정 경로 필요,
+  증거가 있는 봉만 보정하고 DB 백업 후 진행. (같은 날 앞서 만든 r4 패치를 이 묶음에 포함 — 사용자는 아직 미적용)
+- R3(P2): 지표 판정이 UNKNOWN이어도 final=1 → 데이터 정정 뒤 PASS가 대표 기록을 대체하지 못함.
+- R4(P2): 보고서 저장 실패 뒤 같은 시각 재실행이 보고서 없이 성공(건너뜀) 처리.
+- R5(P2): run_key에는 분류 정책이 있는데 실행 ID에는 없어 정책만 바꾸면 UNIQUE 충돌.
+
+### 변경 내용
+| ID | 파일 | 내용 |
+|---|---|---|
+| R1 | `tools/research_collect.py` | `__getattr__`를 `_LazyClient` 클래스 안으로(밑줄 속성은 넘기지 않음) |
+| R2 | `infra/research/store.py` (r4) | 저장 근거 규칙 `find_write_evidence`: **같은 revision**의 저장 기록(또는 revision 표시 없는 APPEND) 중 '수신 − 1초' 이후 첫 기록. 근거 없는 봉은 UNPROVEN 유지. 스키마를 올리기 전 SQLite 백업 API로 자동 백업(`<파일>.bak-<옛 버전>-<시각>`) |
+| R2 | `infra/research/store_inspect.py` (새), CLI `inspect-unproven` | 읽기 전용(mode=ro, 이전·백업 없음)으로 UNPROVEN 봉을 종목·revision·수신 시각별로 묶어 저장 기록과 대조, 판정(PROVABLE_SAME_SECOND·PROVABLE·REVISION_UNPROVEN·NO_EVIDENCE)·날짜별 개수 |
+| R3 | `infra/research/s1_scanner.py`, `scan_store.py` | final = 입력 모두 정상 **그리고 판정 PASS/FAIL**. UNKNOWN은 이후 정해진 판정이 대체 |
+| R4 | `tools/research_collect.py`, `scan_store.load_run` | 건너뛸 때 보고서(md·json)가 없으면 저장된 실행으로 보고서만 다시 만듦(재계산 없음). 보고서가 확보돼야 종료 코드 0 |
+| R5 | `infra/research/scan_store.py` | 실행 ID에 run_key 해시(10자리) |
+| 문서 | `docs/research_a_stage.md` | 저장 근거 규칙·자동 백업·inspect-unproven, final 정의, 보고서 복구·실행 ID |
+
+### 테스트 및 검증
+- `test_research_collect` 109→113(실측 원문 포함 114): 7-4 팩토리만 가짜로 바꾼 **실제 `_LazyClient` 경로**로 universe·backfill 조회,
+  13-14 읽기 전용 점검(같은 초 근거 PROVABLE_SAME_SECOND / 기록 없음·다른 revision 기록 NO_EVIDENCE, 점검은 이전·백업 안 함),
+  13-13 근거 있는 봉만 MIGRATED·근거 없는 봉 UNPROVEN 유지, 13-15 이전 전 백업(옛 상태 그대로), 13-16 최신이면 백업 안 함.
+- `test_research_scan` 39→43: 4-4 NO_TRADES UNKNOWN(final=0) → 정정 뒤 PASS가 대표 기록 대체, 8-6 보고서 저장 실패 → 재실행이 재계산 없이
+  보고서만 복구, 8-7 복구 보고서 = 새로 계산한 보고서, 8-8 분류 정책만 다른 실행 둘 다 완료.
+- 실제 r1(`166585b`)→r2(`e913df1`)→r3(`f837185`) 코드로 만든 DB: `inspect-unproven` → 1봉 PROVABLE_SAME_SECOND, 새 코드로 열면
+  백업 생성 후 r4·UNPROVEN 0.
+- 변이 확인 7종(R1 래퍼·R2 revision 무관 근거·백업 제거·근거 없이 일괄 해제·R3 UNKNOWN 확정·R4 복구 제거·R5 해시 제거) 모두 잡힘.
+- `run_regression_tests.py --skip test_broker_order_status.py`: 30개 전부 통과. 단타 원본 동등성 18/18. `git status` 깨끗.
+
+### 변경하지 않은 것
+- S1 조건·기준값, 수집·검증 규칙, 주문 경로.
+
+### 다음 작업
+- 사용자: 패치 적용 → **먼저 `inspect-unproven`**(읽기 전용) 결과 확인 → `status`(자동 백업 후 r4) → 18:10 이후 `update`(자동 스캔) → 보고서.
+- 백업 파일은 r4 결과 확인 뒤 지워도 됨.
+
+### 전달 파일
+- 패치 0001 (r4), 0002 (fix: R1~R5), 0003 (docs)
 
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
