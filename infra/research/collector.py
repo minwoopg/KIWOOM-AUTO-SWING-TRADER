@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Callable
 
 from domain.research.universe import UniversePolicy, classify_rows, summarize
-from infra.research.kiwoom_readonly import Page, ResearchApiError
+from infra.research.kiwoom_readonly import Page, ResearchApiError, ResearchConfigError
 from infra.research.kiwoom_rows import INDEX_DAILY, STOCK_DAILY, RawBar, RowError, SourceSpec, parse_row
 from infra.research.store import (
     COVERAGE_OK, DONE, ERROR, HISTORY_END, INTEGRITY_OK, LISTED_AFTER_START, PAGE_CAP, PENDING, SHORTFALL,
@@ -333,6 +333,8 @@ class ResearchCollector:
                     self.store.set_item(job_id, it["series_id"], status=status, pages=fr.pages,
                                         first_date=fr.first_date, last_date=fr.last_date, reason=reason, now=now(),
                                         in_tx=True)
+            except ResearchConfigError:
+                raise                                   # 설정 오류는 종목 ERROR가 아니라 명령 중단
             except (ResearchApiError, RowError, CollectError, ValueError) as exc:
                 status = ERROR
                 self.store.set_item(job_id, it["series_id"], status=ERROR, pages=0, first_date=None, last_date=None,
@@ -435,6 +437,8 @@ class ResearchCollector:
         for n, (sid, kind, code, reg_day) in enumerate(targets, 1):
             try:
                 res = self.update_series(sid, kind, code, now=now, reg_day=reg_day)
+            except ResearchConfigError:
+                raise
             except (ResearchApiError, RowError, CollectError, ValueError, IntegrityError) as exc:
                 res = {"series_id": sid, "action": "ERROR", "reason": f"{type(exc).__name__}: {exc}"[:300]}
                 self.log(f"[UPDATE] {sid} ERROR {exc}")

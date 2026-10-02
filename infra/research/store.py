@@ -506,9 +506,23 @@ class ResearchStore:
         return StoredBar(raw, r["run_type"], _dt(r["received_at"]), _dt(r["available_at"]),
                          _dt(r["first_ready_at"]), r["revision"], r["time_basis"])
 
-    def load_bars(self, series_id: str) -> list[StoredBar]:
-        return [self._stored(r) for r in self.conn.execute(
-            f"SELECT date, {_COLS}, revision FROM bar WHERE series_id=? ORDER BY date", (series_id,))]
+    def load_bars(self, series_id: str, start: date | None = None) -> list[StoredBar]:
+        q, a = f"SELECT date, {_COLS}, revision FROM bar WHERE series_id=?", [series_id]
+        if start is not None:
+            q, a = q + " AND date>=?", a + [start.isoformat()]
+        return [self._stored(r) for r in self.conn.execute(q + " ORDER BY date", a)]
+
+    @contextmanager
+    def read_tx(self):
+        """여러 조회를 한 시점으로 읽음(사이에 다른 프로세스의 REBASE가 끼지 않게). 이미 트랜잭션 안이면 그대로."""
+        if self.conn.in_transaction:
+            yield
+            return
+        self.conn.execute("BEGIN")
+        try:
+            yield
+        finally:
+            self.conn.execute("COMMIT")
 
     def load_history(self, series_id: str) -> list[dict]:
         return [dict(r) for r in self.conn.execute(
@@ -524,24 +538,33 @@ class ResearchStore:
             q, a = q + " WHERE series_id=?", (series_id,)
         return [{**dict(r), "detail": json.loads(r["detail_json"])} for r in self.conn.execute(q + " ORDER BY event_id", a)]
 
-    def research_series(self, series_id: str, as_of: datetime | None = None) -> ResearchSeries:
+    def research_series(self, series_id: str, as_of: datetime | None = None, *,
+                        start: date | None = None) -> ResearchSeries:
         """연구 계산 입력.
 
         as_of=None : 현재 revision 전체(가정 분석용). integrity = 현재 상태.
         as_of=X    : X에 활성이던 revision에서 available_at ≤ X인 봉만(A2-R1). integrity = **X 시각의 상태**
                      (정합성 이력 series_integrity — 나중에 복구돼도 실패 당시 조회는 REBASE_REQUIRED 그대로).
                      확보 시각을 입증하지 못한 봉(UNPROVEN)은 돌려주지 않고 time_proof로 표시.
+        start      : 이 날짜 이후 봉만(스캔 속도용). time_proof는 start와 무관하게 그 revision 전체로 판정.
+        메타·revision·봉은 한 읽기 트랜잭션에서 읽고, 봉은 revision 번호로 bar·bar_history를 함께 조회합니다
+        (조회 도중 다른 프로세스가 REBASE해도 섞이거나 빠지지 않음).
         """
+        with self.read_tx():
+            return self._research_series(series_id, as_of, start)
+
+    def _research_series(self, series_id: str, as_of: datetime | None, start: date | None) -> ResearchSeries:
         meta = self.get_series(series_id)
         if meta is None:
             raise KeyError(series_id)
         rev_info = None
         if as_of is None:
             mode = "CURRENT"
-            stored, rev = self.load_bars(series_id), meta.revision
+            stored, rev = self.load_bars(series_id, start), meta.revision
             integrity, integrity_detail = meta.integrity, meta.integrity_detail
             basis = AdjustmentBasis(meta.adj_upd_stkpc_tp, meta.adj_base_dt)
-            unproven = sum(1 for sb in stored if sb.time_basis == UNPROVEN_TIME)
+            unproven = self.conn.execute("SELECT COUNT(*) FROM bar WHERE series_id=? AND time_basis=?",
+                                         (series_id, UNPROVEN_TIME)).fetchone()[0]
         else:
             mode = "AS_OF"
             x = _ts(as_of)
@@ -555,13 +578,18 @@ class ResearchStore:
             rev_info = dict(r)
             rev, basis = r["revision"], AdjustmentBasis(r["upd_stkpc_tp"], r["base_dt"])
             integrity, integrity_detail = self.integrity_at(series_id, as_of)
-            table = "bar" if rev == meta.revision else "bar_history"
-            extra = "" if table == "bar" else " AND revision=?"
-            args = (series_id,) + (() if table == "bar" else (rev,))
+            cond = " AND date>=?" if start is not None else ""
+            one = (series_id, rev) + ((start.isoformat(),) if start is not None else ())
             rows = [self._stored(q) for q in self.conn.execute(
-                f"SELECT date, {_COLS}, revision FROM {table} WHERE series_id=?{extra} ORDER BY date", args)]
-            unproven = sum(1 for sb in rows if sb.time_basis == UNPROVEN_TIME)
-            stored = [sb for sb in rows if sb.time_basis != UNPROVEN_TIME and sb.available_at <= as_of.replace(microsecond=0)]
+                f"SELECT date, {_COLS}, revision FROM bar WHERE series_id=? AND revision=?{cond}"
+                f" UNION ALL SELECT date, {_COLS}, revision FROM bar_history WHERE series_id=? AND revision=?{cond}"
+                " ORDER BY date", one + one)]
+            unproven = self.conn.execute(
+                "SELECT (SELECT COUNT(*) FROM bar WHERE series_id=? AND revision=? AND time_basis=?)"
+                " + (SELECT COUNT(*) FROM bar_history WHERE series_id=? AND revision=? AND time_basis=?)",
+                (series_id, rev, UNPROVEN_TIME) * 2).fetchone()[0]
+            limit = as_of.replace(microsecond=0)
+            stored = [sb for sb in rows if sb.time_basis != UNPROVEN_TIME and sb.available_at <= limit]
         spec = meta.spec
         bars, avail, first, rtype = [], {}, {}, {}
         for sb in stored:
@@ -572,6 +600,14 @@ class ResearchStore:
             avail[rb.date], first[rb.date], rtype[rb.date] = sb.available_at, sb.first_ready_at, sb.run_type
         return ResearchSeries(bars, avail, first, rtype, rev, basis, mode, integrity, integrity_detail,
                               UNPROVEN_TIME if unproven else "OK", unproven, as_of, rev_info, meta)
+
+    def snapshot_as_of(self, as_of: datetime) -> dict | None:
+        """as_of까지 **수집이 끝난**(observed_end_at ≤ as_of) 가장 최근 종목 목록 스냅숏 (A4 — latest_snapshot 아님)."""
+        row = self.conn.execute(
+            "SELECT snapshot_id, snapshot_date, observed_at, observed_end_at, market_phase, policy_version, source,"
+            " row_count, summary_json FROM universe_snapshot WHERE observed_end_at<=? ORDER BY observed_end_at DESC,"
+            " snapshot_id DESC LIMIT 1", (_ts(as_of),)).fetchone()
+        return None if row is None else {**dict(row), "summary": json.loads(row["summary_json"])}
 
     # ── 시계열 쓰기 ──────────────────────────────────────────
     def _insert_bars(self, series_id: str, rows: Iterable[tuple]) -> None:

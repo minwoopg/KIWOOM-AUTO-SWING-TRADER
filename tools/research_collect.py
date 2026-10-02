@@ -6,7 +6,9 @@
     python tools/research_collect.py backfill --limit 20      # 시험: 20종목만 (작업은 재개 가능)
     python tools/research_collect.py backfill                 # 이어서 전부 (약 2,546종목 × 4~5페이지, 1초 간격 ≈ 3시간)
         # 끝난 뒤 다시 실행하면 아무것도 하지 않음. 전체를 새로 받을 때만 --new (매일은 update)
-    python tools/research_collect.py update                   # 매일 18:10 이후: 목록 스냅숏 + 새 봉 추가
+    python tools/research_collect.py update                   # 매일 18:10 이후: 목록 스냅숏 + 새 봉 추가 → S1 스캔·보고서
+    python tools/research_collect.py scan                     # S1 스캔만 (지금 시각 기준, 조회 없음)
+    python tools/research_collect.py scan --at 2026-10-02T19:30:00 --verify   # 그 시각 스캔 재현·비교
     python tools/research_collect.py status
     python tools/research_collect.py holidays --from-year 2017 --to-year 2025
 
@@ -14,6 +16,7 @@
 - 인증: .env의 KIWOOM_APP_KEY / KIWOOM_SECRET_KEY. 허용 TR은 ka10099·ka10081·ka20006뿐.
 - 중단(Ctrl+C)해도 그 종목만 저장되지 않고, 다시 실행하면 같은 base_dt로 이어서 받습니다.
 - 당일 봉은 정규장 종료 + 160분(기본 18:10) 이후에 받아야 저장됩니다. 그 전이면 다음 실행 때 추가됩니다.
+- S1 관찰 기록: data/research/s1_scans.sqlite3, 보고서: reports/research/s1/ (둘 다 git 제외). 주문 없음.
 """
 from __future__ import annotations
 
@@ -33,11 +36,15 @@ from infra.research.collector import (  # noqa: E402
     load_probe_list,
 )
 from infra.research.kiwoom_readonly import ReadOnlyResearchClient, ResearchApiError, ResearchConfigError  # noqa: E402
+from infra.research.s1_scanner import S1Scanner, ScanError  # noqa: E402
+from infra.research.scan_report import write_report  # noqa: E402
+from infra.research.scan_store import ScanStore  # noqa: E402
 from infra.research.store import ResearchStore  # noqa: E402
 from utils.time_utils import now_local  # noqa: E402
 from utils.trading_calendar import TradingCalendar  # noqa: E402
 
 DEFAULT_DB = ROOT / "data" / "research" / "research.sqlite3"
+DEFAULT_REPORT_DIR = ROOT / "reports" / "research" / "s1"
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -59,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sleep", type=float, default=1.0, help="호출 간격(초, 0.5 이상)")
     p.add_argument("--after-close-min", type=int, default=int(BAR_COMPLETE_AFTER_CLOSE.total_seconds() // 60),
                    help="당일 봉 완성 기준: 정규장 종료 후 분")
+    p.add_argument("--scan-db", help="S1 관찰 기록 DB (기본: --db와 같은 폴더의 s1_scans.sqlite3)")
+    p.add_argument("--report-dir", default=str(DEFAULT_REPORT_DIR))
     sub = p.add_subparsers(dest="cmd", required=True)
     u = sub.add_parser("universe")
     u.add_argument("--from-probe", help="A1 프로브 jsonl에서 목록을 읽음(호출 없음)")
@@ -76,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("update")
     up.add_argument("--limit", type=int)
     up.add_argument("--skip-universe", action="store_true")
+    up.add_argument("--no-scan", action="store_true", help="갱신 뒤 S1 스캔을 하지 않음")
+    sc = sub.add_parser("scan")
+    sc.add_argument("--at", help="스캔 시각(Asia/Seoul, 예 2026-10-02T19:30:00). 기본: 지금")
+    sc.add_argument("--verify", action="store_true", help="같은 시각 실행이 이미 있으면 다시 계산해 저장값과 비교")
     sub.add_parser("status")
     h = sub.add_parser("holidays")
     h.add_argument("--from-year", type=int, default=2017)
@@ -94,6 +107,67 @@ def make_client(args):
                                   log=print)
 
 
+class _LazyClient:
+    """API 키·세션은 실제 조회가 필요할 때 처음 만듭니다 — 조회 없이 끝나는 명령(끝난 백필 재실행 등)이
+    .env 설정 오류로 실패하지 않게 (GPT a2u 검토 보완)."""
+
+    def __init__(self, factory) -> None:
+        self._factory = factory
+        self._client = None
+
+    @property
+    def created(self) -> bool:
+        return self._client is not None
+
+    def ensure(self) -> None:
+        """조회할 일이 확실할 때 먼저 만들어 설정 오류를 일찍 알림(작업을 만들기 전에)."""
+        if self._client is None:
+            self._client = self._factory()
+
+
+def _ensure_client(client) -> None:
+    if isinstance(client, _LazyClient):
+        client.ensure()
+
+    def __getattr__(self, name):
+        if name in ("calls", "retries") and self._client is None:
+            return 0
+        if self._client is None:
+            self._client = self._factory()
+        return getattr(self._client, name)
+
+
+def run_scan(args, store: ResearchStore, calendar: TradingCalendar, scan_at: datetime, now, *,
+             verify: bool = False) -> int:
+    """S1 관찰 스캔 (읽기만, 주문 없음). 반환: 0 완료·건너뜀 / 2 스캔 실패 / 1 보고서만 실패."""
+    scan_db = args.scan_db or str(Path(args.db).with_name("s1_scans.sqlite3"))
+    with ScanStore(scan_db) as sstore:
+        scanner = S1Scanner(store, sstore, calendar, after_close=timedelta(minutes=args.after_close_min), log=print)
+        try:
+            res = scanner.run(scan_at, now=now, verify=verify)
+        except (ScanError, CollectError) as exc:
+            print(f"[스캔 실패] {exc}")
+            return 2
+        if res["status"] != "COMPLETE":
+            print_json({k: v for k, v in res.items() if k != "evals"})
+            v = res.get("verify")
+            return 0 if (v is None or v["identical"]) else 2
+        try:
+            path = write_report(res, args.report_dir)
+            sstore.set_report_path(res["run_id"], path)
+        except OSError as exc:
+            print(f"[보고서 저장 실패 — 관찰 기록은 저장됨] {exc}")
+            path, code = None, 1
+        else:
+            code = 0
+        c = res["counts"]
+        print_json({"run_id": res["run_id"], "signal_date": res["context"]["signal_date"], "universe": c["universe"],
+                    "signals": c["signals"], "by_signal": c["by_signal"], "data_hold_total": c["data_hold_total"],
+                    "index_status": c["index_status"], "market_regime": c["market_regime"],
+                    "no_trades_hold": c["no_trades_hold"], "observations": c["observations"], "report": path})
+        return code
+
+
 def print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
 
@@ -110,9 +184,8 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
         return 0
 
     with ResearchStore(args.db) as store:
-        need_net = args.cmd in ("backfill", "update") or (args.cmd == "universe" and not args.from_probe)
-        if need_net and client is None:
-            client = make_client(args)
+        if client is None:
+            client = _LazyClient(lambda: make_client(args))
         required_from = (date.fromisoformat(args.required_from) if args.cmd == "backfill"
                          else DEFAULT_REQUIRED_FROM)
         col = ResearchCollector(client, store, calendar, required_from=required_from,
@@ -136,6 +209,7 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                     print(f"[중단] 열린 작업이 있음: {open_jobs[0]['job_id']} — --new 없이 실행하면 이어서 받습니다")
                     return 2
                 job_id = open_jobs[0]["job_id"]
+                _ensure_client(client)
                 print(f"열린 작업 이어서: {job_id} (base_dt={open_jobs[0]['base_dt']} 고정) {store.job_counts(job_id)}")
             else:
                 done_jobs = store.conn.execute("SELECT job_id FROM job ORDER BY created_at DESC").fetchall()
@@ -152,6 +226,7 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                     if not sids:
                         print("다시 받을 HISTORY_END·PAGE_CAP 시계열이 없음")
                         return 0
+                _ensure_client(client)
                 job_id = col.create_backfill_job(now=now(), codes=codes, include_index=not args.no_index,
                                                  series_ids=sids)
                 job = store.get_job(job_id)
@@ -166,16 +241,29 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
             return 0 if res["ERROR"] == 0 else 1
 
         if args.cmd == "update":
-            if not args.skip_universe:
-                snap = col.snapshot_universe()
-                print(f"목록 스냅숏 {snap['snapshot_id']}: 수집 대상 {snap['collect']} / 현재 자격 {snap['eligible_now']}")
-
             def prog(p):
                 if p["n"] % 100 == 0 or p["n"] == p["of"] or p["action"] not in ("APPEND", "UNCHANGED"):
                     print(f"  {p['n']}/{p['of']} {p['series_id']} {p['action']} {p.get('reason', '')}")
-            res = col.run_update(now=now, limit=args.limit, progress=prog)
-            print_json(res)
-            return 0 if res["failed"] == 0 else 1
+            code = 0
+            _ensure_client(client)                       # .env 오류는 갱신·스캔 전에 바로 알림
+            try:
+                if not args.skip_universe:
+                    snap = col.snapshot_universe()
+                    print(f"목록 스냅숏 {snap['snapshot_id']}: 수집 대상 {snap['collect']} / 현재 자격 {snap['eligible_now']}")
+                res = col.run_update(now=now, limit=args.limit, progress=prog)
+                print_json(res)
+                code = 0 if res["failed"] == 0 else 1
+            except (ResearchApiError, CollectError) as exc:      # 갱신이 멈춰도 스캔은 종목별 상태로 판단
+                print(f"[갱신 중단] {type(exc).__name__}: {exc}")
+                code = 1
+            if args.no_scan:
+                return code
+            scan_code = run_scan(args, store, calendar, now(), now)
+            return max(code, scan_code)
+
+        if args.cmd == "scan":
+            scan_at = datetime.fromisoformat(args.at) if args.at else now()
+            return run_scan(args, store, calendar, scan_at, now, verify=args.verify)
 
         if args.cmd == "status":
             snap = store.latest_snapshot()
@@ -195,8 +283,11 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                        "SELECT integrity, COUNT(*) FROM series GROUP BY integrity")},
                    "verify_failed_events": store.conn.execute(
                        "SELECT COUNT(*) FROM series_event WHERE event='VERIFY_FAILED'").fetchone()[0],
-                   "time_basis": {k: v for k, v in store.conn.execute(
-                       "SELECT time_basis, COUNT(*) FROM bar GROUP BY time_basis")},
+                   "time_basis": {
+                       "current": {k: v for k, v in store.conn.execute(
+                           "SELECT time_basis, COUNT(*) FROM bar GROUP BY time_basis")},
+                       "history": {k: v for k, v in store.conn.execute(
+                           "SELECT time_basis, COUNT(*) FROM bar_history GROUP BY time_basis")}},
                    "revision_reasons": {k: v for k, v in store.conn.execute(
                        "SELECT reason, COUNT(*) FROM series_revision GROUP BY reason")},
                    "schema": store.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]}
