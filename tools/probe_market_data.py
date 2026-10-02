@@ -51,6 +51,9 @@ ALLOWED_API = {  # api-id → endpoint (조회 전용 TR만)
     # A1 (연구 원천 확인, tools/probe_research_sources.py) — 이름·경로는 조사 후보, 실측으로 확인
     "ka10099": "/api/dostk/stkinfo",  # 종목정보 리스트 (후보)
     "ka20006": "/api/dostk/chart",    # 업종(지수) 일봉 (후보)
+    # A5-1 (가격 원천 확인, tools/probe_price_sources.py) — 조회 전용 시세 TR, 이름·경로는 조사 후보
+    "ka10003": "/api/dostk/stkinfo",  # 체결정보 (후보 — 체결 시각 필드 확인용)
+    "ka10004": "/api/dostk/mrkcond",  # 주식호가 (후보 — 호가 기준 시각·최우선 호가 확인용)
 }
 ALLOWED_RESPONSE_HEADER_KEYS = ("api-id", "cont-yn", "next-key")
 SENSITIVE_BODY_KEY_MARKERS = (

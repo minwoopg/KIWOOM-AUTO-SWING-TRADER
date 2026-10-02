@@ -5,7 +5,8 @@ from __future__ import annotations
 안전 규칙 (A단계 합의·프로브와 같은 원칙)
 - **모의투자 도메인(https://mockapi.kiwoom.com)에서만** 동작합니다. 우회 옵션 없음.
   (모의 도메인의 시세·목록은 실제 시장 데이터 — A1 실측으로 확인)
-- 허용 TR은 조회 3개뿐: ka10099(종목 목록)·ka10081(종목 일봉)·ka20006(지수 일봉).
+- 허용 TR은 조회 4개뿐: 수집용 ka10099(종목 목록)·ka10081(종목 일봉)·ka20006(지수 일봉)과
+  A5-1 가격 기록용 ka10001(주식기본정보 — 현재가·기준가, 단타 레포에서 실사용 중인 시세 조회).
   주문·계좌 TR은 목록에 없으므로 호출 자체가 막힙니다.
 - 운영 브로커(`infra.broker`)·주문 실행부·원장·commands 폴더와 무관합니다.
 - 토큰·앱키는 예외 메시지나 로그에 넣지 않습니다.
@@ -32,6 +33,10 @@ RESEARCH_API = {
     "ka10081": "/api/dostk/chart",     # 주식 일봉
     "ka20006": "/api/dostk/chart",     # 업종(지수) 일봉
 }
+PRICE_API = {                          # A5-1: 목록이 아닌 한 건짜리 시세 응답 (fetch_body로만)
+    "ka10001": "/api/dostk/stkinfo",   # 주식기본정보 — cur_prc(현재가)·base_pric(기준가) 등
+}
+_ALL_API = {**RESEARCH_API, **PRICE_API}
 
 
 class ResearchConfigError(ValueError):
@@ -53,6 +58,14 @@ def assert_mock_domain(base_url: str) -> None:
             or parsed.port not in (None, 443)):
         raise ResearchConfigError(
             f"연구 수집은 https://{ALLOWED_BASE_URL_HOST} 에서만 실행합니다 (현재 {base_url!r})")
+
+
+@dataclass(frozen=True)
+class Body:
+    body: dict
+    requested_at: datetime         # 마지막 시도의 요청 직전 시각
+    received_at: datetime          # 응답을 받은 시각
+    attempts: int                  # 재시도 포함 시도 횟수
 
 
 @dataclass(frozen=True)
@@ -118,7 +131,7 @@ class ReadOnlyResearchClient:
                 self.sleep(wait)
         self._last_call = self.monotonic()
 
-    def _post_once(self, api_id: str, payload: dict, cont_yn: str, next_key: str) -> tuple[int, dict, Any]:
+    def _post_once(self, api_id: str, payload: dict, cont_yn: str, next_key: str) -> tuple[int, dict, Any, datetime]:
         import requests
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
@@ -127,8 +140,9 @@ class ReadOnlyResearchClient:
         }
         self._pace()
         self.calls += 1
+        requested_at = self.now()
         try:
-            r = self.session.post(f"{self.base_url}{RESEARCH_API[api_id]}", headers=headers, json=payload, timeout=15)
+            r = self.session.post(f"{self.base_url}{_ALL_API[api_id]}", headers=headers, json=payload, timeout=15)
         except requests.RequestException as exc:
             raise _Retryable(f"전송 실패 {type(exc).__name__}") from exc
         resp_headers = {k: str(r.headers.get(k, "") or "").strip() for k in ("cont-yn", "next-key")}
@@ -136,19 +150,17 @@ class ReadOnlyResearchClient:
             body = r.json()
         except ValueError:
             body = None
-        return r.status_code, resp_headers, body
+        return r.status_code, resp_headers, body, requested_at
 
-    def fetch_page(self, api_id: str, payload: dict, list_key: str,
-                   cont_yn: str = "N", next_key: str = "") -> Page:
-        assert_mock_domain(self.base_url)
-        if api_id not in RESEARCH_API:
-            raise ResearchConfigError(f"연구 수집에 허용되지 않은 api-id: {api_id}")
+    def _request(self, api_id: str, payload: dict, cont_yn: str, next_key: str) -> tuple:
+        """(status, 응답 헤더, 본문, 요청 시각, 수신 시각, 시도 횟수). 429·전송 실패 재시도, 401은 한 번 재인증."""
         if not self._token:
             self.authenticate()
-        attempt, reauthed = 0, False
+        attempt, reauthed, tries = 0, False, 0
         while True:
             try:
-                status, h, body = self._post_once(api_id, payload, cont_yn, next_key)
+                tries += 1
+                status, h, body, requested_at = self._post_once(api_id, payload, cont_yn, next_key)
                 if status == 429:
                     raise _Retryable("HTTP 429")
                 if status == 401 and not reauthed:
@@ -165,7 +177,31 @@ class ReadOnlyResearchClient:
                 self.retries += 1
                 self.log(f"[RESEARCH] {api_id} {exc} — {wait}초 후 재시도 ({attempt}/{len(self.retry_backoff_sec)})")
                 self.sleep(wait)
-        received_at = self.now()
+        return status, h, body, requested_at, self.now(), tries
+
+    @staticmethod
+    def _check_ok(api_id: str, payload: dict, status: int, body: Any) -> None:
+        if status != 200 or not isinstance(body, dict):
+            raise ResearchApiError(f"{api_id} {payload}: HTTP {status}")
+        rc = body.get("return_code")
+        if rc is None or isinstance(rc, bool) or str(rc).strip() != "0":
+            raise ResearchApiError(f"{api_id} {payload}: return_code={rc!r} {body.get('return_msg', '')}")
+
+    def fetch_body(self, api_id: str, payload: dict) -> Body:
+        """목록이 아닌 한 건짜리 조회(A5-1 시세). return_code가 있고 0이어야 성공 — 아니면 ResearchApiError."""
+        assert_mock_domain(self.base_url)
+        if api_id not in PRICE_API:
+            raise ResearchConfigError(f"가격 기록에 허용되지 않은 api-id: {api_id}")
+        status, _h, body, requested_at, received_at, tries = self._request(api_id, payload, "N", "")
+        self._check_ok(api_id, payload, status, body)
+        return Body(body, requested_at, received_at, tries)
+
+    def fetch_page(self, api_id: str, payload: dict, list_key: str,
+                   cont_yn: str = "N", next_key: str = "") -> Page:
+        assert_mock_domain(self.base_url)
+        if api_id not in RESEARCH_API:
+            raise ResearchConfigError(f"연구 수집에 허용되지 않은 api-id: {api_id}")
+        status, h, body, _req, received_at, _tries = self._request(api_id, payload, cont_yn, next_key)
         if status != 200 or not isinstance(body, dict):
             raise ResearchApiError(f"{api_id} {payload}: HTTP {status}")
         rc = body.get("return_code")

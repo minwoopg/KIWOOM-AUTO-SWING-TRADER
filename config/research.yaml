@@ -1,0 +1,13 @@
+# 연구(A단계) 운영 설정 — 주문과 무관합니다. (A5-1, 2026-10-02)
+#
+# s1.active_contract : 관찰(이후 매매) 대상 S1 계산 계약 하나.
+#   current      = 지금 코드·기본 설정(update/scan과 같은 완성 지연)으로 만든 계약. 실제 해시는 기록마다 남습니다.
+#   12자리 해시  = 그 계약으로 고정(스캔 출력·보고서의 contract_hash). 다른 계약의 기록은 후보로 쓰지 않습니다.
+# a5.open_check.offset_min            : 다음 거래일 개장 + 몇 분에 가격을 확인할지 (특수 개장일도 달력의 개장 시각 기준)
+# a5.open_check.on_time_tolerance_sec : 목표 시각 뒤 이 시간 안의 조회는 ON_TIME, 넘으면 LATE(실제 조회 시각으로 기록)
+s1:
+  active_contract: current
+a5:
+  open_check:
+    offset_min: 5
+    on_time_tolerance_sec: 120

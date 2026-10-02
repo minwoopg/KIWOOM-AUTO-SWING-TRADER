@@ -12,18 +12,22 @@
     python tools/research_collect.py status
     python tools/research_collect.py inspect-unproven         # 읽기 전용: 시각 보정·관찰 기록 보정 미리 보기(이전·백업 없음)
     python tools/research_collect.py holidays --from-year 2017 --to-year 2025
+    python tools/research_collect.py open-check               # A5-1: 거래일 개장 + 5분(09:05) 후보 가격 기록 (조회만)
+        # 목표 시각 30분 전 안이면 기다렸다가 실행. 지난 날짜는 --day 2026-10-06 (정규장 뒤면 조회 없이 누락으로 기록)
 
 - 저장: data/research/research.sqlite3 (git 제외). 테스트·수집 모두 commands/·원장과 무관.
-- 인증: .env의 KIWOOM_APP_KEY / KIWOOM_SECRET_KEY. 허용 TR은 ka10099·ka10081·ka20006뿐.
+- 인증: .env의 KIWOOM_APP_KEY / KIWOOM_SECRET_KEY. 허용 TR은 ka10099·ka10081·ka20006(수집)·ka10001(A5-1 시세)뿐.
 - 중단(Ctrl+C)해도 그 종목만 저장되지 않고, 다시 실행하면 같은 base_dt로 이어서 받습니다.
 - 당일 봉은 정규장 종료 + 160분(기본 18:10) 이후에 받아야 저장됩니다. 그 전이면 다음 실행 때 추가됩니다.
 - S1 관찰 기록: data/research/s1_scans.sqlite3, 보고서: reports/research/s1/ (둘 다 git 제외). 주문 없음.
+- A5-1 가격 기록: data/research/a5_checks.sqlite3, 보고서: reports/research/a5/ (git 제외). 대상 계약은 config/research.yaml.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -37,7 +41,10 @@ from infra.research.collector import (  # noqa: E402
     load_probe_list,
 )
 from infra.research.kiwoom_readonly import ReadOnlyResearchClient, ResearchApiError, ResearchConfigError  # noqa: E402
-from infra.research.s1_scanner import S1Scanner, ScanError  # noqa: E402
+from infra.research import open_check as A5  # noqa: E402
+from infra.research.research_config import (  # noqa: E402
+    CURRENT, DEFAULT_RESEARCH_CONFIG, ResearchSettingsError, load_research_settings)
+from infra.research.s1_scanner import S1Scanner, ScanError, build_contract  # noqa: E402
 from infra.research.scan_report import write_report  # noqa: E402
 from infra.research.scan_store import ScanStore  # noqa: E402
 from infra.research.store import SCHEMA_VERSION, ResearchStore  # noqa: E402
@@ -46,6 +53,7 @@ from utils.trading_calendar import TradingCalendar  # noqa: E402
 
 DEFAULT_DB = ROOT / "data" / "research" / "research.sqlite3"
 DEFAULT_REPORT_DIR = ROOT / "reports" / "research" / "s1"
+DEFAULT_A5_REPORT_DIR = ROOT / "reports" / "research" / "a5"
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -94,6 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
     iu = sub.add_parser("inspect-unproven", help="읽기 전용 — 스키마를 올리지 않고 UNPROVEN·MIGRATED 봉 재점검, "
                                                  "관찰 기록 final 보정 미리 보기")
     iu.add_argument("--limit", type=int, default=30)
+    oc = sub.add_parser("open-check", help="A5-1: 거래일 개장 + N분 후보 가격 기록 (조회만, 주문 없음)")
+    oc.add_argument("--day", help="대상 거래일 YYYY-MM-DD (기본: 오늘)")
+    oc.add_argument("--no-wait", action="store_true", help="목표 시각 전이면 기다리지 않고 끝냄(기록 없음)")
+    oc.add_argument("--max-wait-min", type=int, default=30, help="목표 시각까지 이 시간 안이면 기다림")
+    oc.add_argument("--a5-db", help="A5 기록 DB (기본: --db와 같은 폴더의 a5_checks.sqlite3)")
+    oc.add_argument("--a5-report-dir", default=str(DEFAULT_A5_REPORT_DIR))
+    oc.add_argument("--config", default=str(DEFAULT_RESEARCH_CONFIG), help="연구 운영 설정(대상 계약·확인 시각)")
     h = sub.add_parser("holidays")
     h.add_argument("--from-year", type=int, default=2017)
     h.add_argument("--to-year", type=int, default=2025)
@@ -199,11 +214,62 @@ def _scan_db(args) -> str:
     return args.scan_db or str(Path(args.db).with_name("s1_scans.sqlite3"))
 
 
+def active_contract(args, calendar: TradingCalendar, settings) -> str:
+    """대상 계약 해시. current면 update·scan과 같은 기본 조건(--after-close-min 포함)으로 만든 계약."""
+    if settings.active_contract != CURRENT:
+        return settings.active_contract
+    return build_contract(calendar, after_close=timedelta(minutes=args.after_close_min))[1]
+
+
+def run_open_check(args, store: ResearchStore, calendar: TradingCalendar, client, now, sleep) -> int:
+    """A5-1. 반환: 0 완료(조회 실패·누락도 기록된 결과) / 1 보고서 실패 / 2 실행 불가(설정·목표 시각 전 등)."""
+    try:
+        settings = load_research_settings(args.config)
+    except ResearchSettingsError as exc:
+        print(f"[설정 오류] {exc}")
+        return 2
+    chash = active_contract(args, calendar, settings)
+    t_now = now()
+    day = date.fromisoformat(args.day) if args.day else t_now.date()
+    if not calendar.is_trading_day(day):
+        print(f"{day}는 거래일이 아님 — 다음 거래일 {calendar.next_trading_day(day)}. 기록 없음")
+        return 0
+    a5_db = args.a5_db or str(Path(args.db).with_name("a5_checks.sqlite3"))
+    with ScanStore(_scan_db(args)) as sstore, A5.OpenCheckStore(a5_db) as ostore:
+        checker = A5.OpenChecker(ostore, sstore, store, calendar, contract_hash=chash,
+                                 offset_min=settings.open_check.offset_min,
+                                 on_time_tolerance_sec=settings.open_check.on_time_tolerance_sec, log=print)
+        target = checker.target_at(day)
+        if t_now < target:
+            wait = (target - t_now).total_seconds()
+            if args.no_wait or wait > args.max_wait_min * 60:
+                print(f"[대기 안 함] 목표 시각 {target}까지 {wait / 60:.1f}분 — 그 뒤에 다시 실행하세요. 기록 없음")
+                return 0
+            print(f"[대기] 목표 시각 {target}까지 {wait:.0f}초")
+            sleep(wait)
+        try:
+            res = checker.run(day, client=client, now=now)
+        except A5.OpenCheckError as exc:
+            print(f"[실행 불가] {exc}")
+            return 2
+        try:
+            path = A5.write_report(res, args.a5_report_dir)
+        except OSError as exc:
+            print(f"[보고서 저장 실패 — 기록은 저장됨, 같은 명령을 다시 실행하면 보고서만 다시 만듦] {exc}")
+            path = None
+        print_json({"run_id": res["run_id"], "target_day": day.isoformat(), "signal_date": res["set"]["signal_date"],
+                    "contract_hash": res["set"]["contract_hash"], "active_contract": chash,
+                    "candidate_status": res["set"]["status"], "target_at": res["target_at"],
+                    "counts": res["counts"], "note": res["note"], "report": path})
+        return 0 if path else 1
+
+
 def print_json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
 
 
-def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar: TradingCalendar | None = None) -> int:
+def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar: TradingCalendar | None = None,
+         sleep=time.sleep) -> int:
     args = build_parser().parse_args(argv)
     calendar = calendar or TradingCalendar.load()
     after_close = timedelta(minutes=args.after_close_min)
@@ -304,6 +370,9 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
         if args.cmd == "scan":
             scan_at = datetime.fromisoformat(args.at) if args.at else now()
             return run_scan(args, store, calendar, scan_at, now, verify=args.verify)
+
+        if args.cmd == "open-check":
+            return run_open_check(args, store, calendar, client, now, sleep)
 
         if args.cmd == "status":
             snap = store.latest_snapshot()

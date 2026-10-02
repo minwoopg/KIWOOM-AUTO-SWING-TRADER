@@ -57,6 +57,20 @@ def calendar_version(cal: TradingCalendar) -> str:
     return "cal:" + hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:12]
 
 
+def build_contract(calendar: TradingCalendar, *, cfg: S1Config | None = None, policy: UniversePolicy | None = None,
+                   after_close: timedelta = BAR_COMPLETE_AFTER_CLOSE,
+                   lookback: int = SCAN_LOOKBACK_SESSIONS) -> tuple[dict, str]:
+    """(계산 계약, 12자리 해시) — 스캐너와 A5(대상 계약 'current' 해석)가 같은 함수를 씁니다."""
+    cfg = cfg or S1Config()
+    policy = policy or UniversePolicy()
+    contract = {"strategy": f"{STRATEGY_ID}_{STRATEGY_VERSION}", "config_hash": cfg.config_hash(),
+                "universe_policy": policy.policy_version, "feature_version": F.FEATURE_VERSION,
+                "market_version": M.MARKET_VERSION, "lookback_sessions": lookback,
+                "after_close_sec": int(after_close.total_seconds()), "calendar": calendar_version(calendar),
+                "final_rule": FINAL_RULE, "scan_rules": SCAN_RULES_VERSION, "index_ids": list(INDEX_IDS)}
+    return contract, hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()[:12]
+
+
 class ScanError(RuntimeError):
     """스캔 자체를 할 수 없음(달력·스냅숏 없음 등)."""
 
@@ -126,16 +140,9 @@ class S1Scanner:
         self.log = log or (lambda m: None)
         self.strategy = f"{STRATEGY_ID}_{STRATEGY_VERSION}"
         self.config_hash = self.cfg.config_hash()
-        self.contract = self._contract()
-        self.contract_hash = hashlib.sha256(json.dumps(self.contract, sort_keys=True).encode()).hexdigest()[:12]
-
-    def _contract(self) -> dict:
-        """계산 계약 — 같은 DB·스캔 시각에서 결과를 바꿀 수 있는 계산 조건 전부(입력 데이터 제외)."""
-        return {"strategy": self.strategy, "config_hash": self.config_hash,
-                "universe_policy": self.policy.policy_version, "feature_version": F.FEATURE_VERSION,
-                "market_version": M.MARKET_VERSION, "lookback_sessions": self.lookback,
-                "after_close_sec": int(self.after_close.total_seconds()), "calendar": calendar_version(self.cal),
-                "final_rule": FINAL_RULE, "scan_rules": SCAN_RULES_VERSION, "index_ids": list(INDEX_IDS)}
+        # 계산 계약 — 같은 DB·스캔 시각에서 결과를 바꿀 수 있는 계산 조건 전부(입력 데이터 제외)
+        self.contract, self.contract_hash = build_contract(calendar, cfg=self.cfg, policy=self.policy,
+                                                           after_close=after_close, lookback=lookback)
 
     def run_key(self, scan_at: datetime, signal_date: date) -> str:
         return (f"{signal_date.isoformat()}|{scan_at.replace(microsecond=0).isoformat(timespec='seconds')}|"
