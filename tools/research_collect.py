@@ -16,7 +16,7 @@
         # 목표 시각 30분 전 안이면 기다렸다가 실행. 지난 날짜는 --day 2026-10-06 (정규장 뒤면 조회 없이 누락으로 기록)
 
 - 저장: data/research/research.sqlite3 (git 제외). 테스트·수집 모두 commands/·원장과 무관.
-- 인증: .env의 KIWOOM_APP_KEY / KIWOOM_SECRET_KEY. 허용 TR은 ka10099·ka10081·ka20006(수집)·ka10001(A5-1 시세)뿐.
+- 인증: .env의 KIWOOM_APP_KEY / KIWOOM_SECRET_KEY. 허용 TR은 ka10099·ka10081·ka20006(수집)·ka10001·ka10003·ka10004(A5-1 시세)뿐.
 - 중단(Ctrl+C)해도 그 종목만 저장되지 않고, 다시 실행하면 같은 base_dt로 이어서 받습니다.
 - 당일 봉은 정규장 종료 + 160분(기본 18:10) 이후에 받아야 저장됩니다. 그 전이면 다음 실행 때 추가됩니다.
 - S1 관찰 기록: data/research/s1_scans.sqlite3, 보고서: reports/research/s1/ (둘 다 git 제외). 주문 없음.
@@ -236,6 +236,8 @@ def run_open_check(args, store: ResearchStore, calendar: TradingCalendar, client
         return 0
     a5_db = args.a5_db or str(Path(args.db).with_name("a5_checks.sqlite3"))
     with ScanStore(_scan_db(args)) as sstore, A5.OpenCheckStore(a5_db) as ostore:
+        if ostore.backup_path:
+            print(f"[A5 기록 저장소 스키마 변경] 바꾸기 전 백업: {ostore.backup_path}")
         checker = A5.OpenChecker(ostore, sstore, store, calendar, contract_hash=chash,
                                  offset_min=settings.open_check.offset_min,
                                  on_time_tolerance_sec=settings.open_check.on_time_tolerance_sec, log=print)

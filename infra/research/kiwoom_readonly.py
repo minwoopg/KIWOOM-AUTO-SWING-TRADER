@@ -5,8 +5,8 @@ from __future__ import annotations
 안전 규칙 (A단계 합의·프로브와 같은 원칙)
 - **모의투자 도메인(https://mockapi.kiwoom.com)에서만** 동작합니다. 우회 옵션 없음.
   (모의 도메인의 시세·목록은 실제 시장 데이터 — A1 실측으로 확인)
-- 허용 TR은 조회 4개뿐: 수집용 ka10099(종목 목록)·ka10081(종목 일봉)·ka20006(지수 일봉)과
-  A5-1 가격 기록용 ka10001(주식기본정보 — 현재가·기준가, 단타 레포에서 실사용 중인 시세 조회).
+- 허용 TR은 조회 6개뿐: 수집용 ka10099(종목 목록)·ka10081(종목 일봉)·ka20006(지수 일봉)과
+  A5-1 가격 기록용 ka10001(주식기본정보 — 현재가·기준가)·ka10003(체결정보 — 체결 시각)·ka10004(주식호가).
   주문·계좌 TR은 목록에 없으므로 호출 자체가 막힙니다.
 - 운영 브로커(`infra.broker`)·주문 실행부·원장·commands 폴더와 무관합니다.
 - 토큰·앱키는 예외 메시지나 로그에 넣지 않습니다.
@@ -33,8 +33,10 @@ RESEARCH_API = {
     "ka10081": "/api/dostk/chart",     # 주식 일봉
     "ka20006": "/api/dostk/chart",     # 업종(지수) 일봉
 }
-PRICE_API = {                          # A5-1: 목록이 아닌 한 건짜리 시세 응답 (fetch_body로만)
-    "ka10001": "/api/dostk/stkinfo",   # 주식기본정보 — cur_prc(현재가)·base_pric(기준가) 등
+PRICE_API = {                          # A5-1: 시세 응답 (fetch_body로만, 첫 페이지만 — 이어 받지 않음)
+    "ka10001": "/api/dostk/stkinfo",   # 주식기본정보 — cur_prc(현재가)·base_pric(기준가) 등 (판정 기준)
+    "ka10003": "/api/dostk/stkinfo",   # 체결정보 — 최근 체결 tm·cur_prc (원천 가격 시각, 10/2 실측 확인)
+    "ka10004": "/api/dostk/mrkcond",   # 주식호가 — 호가 기준 시각·최우선 호가 (10/2 실측 확인)
 }
 _ALL_API = {**RESEARCH_API, **PRICE_API}
 

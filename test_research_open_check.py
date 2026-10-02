@@ -128,7 +128,8 @@ def build(name: str, *, all_down: bool = False) -> ResearchStore:
 
 
 class FakePrice:
-    """ka10001 가짜 응답. 호출마다 시계를 1초 진행(호출 간격 흉내). spec[symbol] = dict | 'FAIL' | 'PARSE' | 'CRASH'."""
+    """시세 가짜 응답(ka10001 기본정보·ka10003 체결·ka10004 호가 — 10/2 실측 응답 모양). 호출마다 시계를 1초 진행.
+    spec[symbol] = dict | 'FAIL' | 'PARSE' | 'CRASH'. dict에 '_extra': 'FAIL'이면 체결 조회 실패·호가 필드 없음."""
 
     def __init__(self, clock: Clock, spec: dict):
         self.clock, self.spec, self.calls = clock, spec, []
@@ -145,8 +146,25 @@ class FakePrice:
             raise KeyboardInterrupt
         if v == "PARSE":
             return Body({"return_code": 0, "stk_cd": sym}, req, req + timedelta(milliseconds=300), 1)
-        return Body({"return_code": 0, "stk_cd": sym, "token": "SECRET-TOKEN", **v}, req,
-                    req + timedelta(milliseconds=300), 2 if sym == PASS_CODES[0] else 1)
+        v = dict(v)
+        extra = v.pop("_extra", None)
+        rcv = req + timedelta(milliseconds=300)
+        if api_id == "ka10003":
+            if extra == "FAIL":
+                raise ResearchApiError("ka10003: HTTP 500")
+            t1 = (req - timedelta(seconds=1)).strftime("%H%M%S")
+            return Body({"return_code": 0, "cntr_infr": [
+                {"tm": t1, "cur_prc": v["cur_prc"], "stex_tp": "KRX", "acc_trde_qty": v["trde_qty"]},
+                {"tm": "090000", "cur_prc": v["cur_prc"], "stex_tp": "KRX"}]}, req, rcv, 1)
+        if api_id == "ka10004":
+            if extra == "FAIL":
+                return Body({"return_code": 0}, req, rcv, 1)
+            p = int(v["cur_prc"].lstrip("+-"))
+            return Body({"return_code": 0, "bid_req_base_tm": req.strftime("%H%M%S"), "sel_fpr_bid": f"+{p + 50}",
+                         "buy_fpr_bid": f"-{p}", "sel_fpr_req": "100", "buy_fpr_req": "200", "sel_1th_pre_req_pre": "--33"},
+                        req, rcv, 1)
+        return Body({"return_code": 0, "stk_cd": sym, "token": "SECRET-TOKEN", **v}, req, rcv,
+                    2 if sym == PASS_CODES[0] else 1)
 
 
 def quote(price, base, *, vol=1000, upl=None):
@@ -239,7 +257,7 @@ check("2-2) 후보에 signal_id·run_id·계약·입력 해시·진입 상한·�
 L = {c: (E[c]["result"]["levels"]["entry_cap"], E[c]["result"]["levels"]["stop_ref"]) for c in PASS_CODES}
 spec = {
     PASS_CODES[0]: quote(int(L[PASS_CODES[0]][0]) - 1, CLOSES[PASS_CODES[0]]),                      # 상한 이내
-    PASS_CODES[1]: quote(int(L[PASS_CODES[1]][0]) + 50, CLOSES[PASS_CODES[1]]),                     # 상한 초과
+    PASS_CODES[1]: {**quote(int(L[PASS_CODES[1]][0]) + 50, CLOSES[PASS_CODES[1]]), "_extra": "FAIL"},  # 상한 초과
     PASS_CODES[2]: quote(int(L[PASS_CODES[2]][1]) - 10, CLOSES[PASS_CODES[2]]),                     # 손절가 이하
     PASS_CODES[3]: quote(CLOSES[PASS_CODES[3]] // 5, CLOSES[PASS_CODES[3]] // 5),                    # 액면분할(기준 변경)
     PASS_CODES[4]: quote(CLOSES[PASS_CODES[4]], CLOSES[PASS_CODES[4]], vol=0),                       # 거래량 0
@@ -250,7 +268,7 @@ spec = {
 }
 clk = Clock(TARGET)
 os2 = A5.OpenCheckStore(TMP / "run_a5.sqlite3")
-chk2 = A5.OpenChecker(os2, ss, st, CAL, contract_hash=sc.contract_hash, on_time_tolerance_sec=3)
+chk2 = A5.OpenChecker(os2, ss, st, CAL, contract_hash=sc.contract_hash, on_time_tolerance_sec=9)
 fake = FakePrice(clk, spec)
 res = chk2.run(D, client=fake, now=clk)
 R = {r["symbol"]: r for r in res["checks"]}
@@ -270,11 +288,23 @@ check("3-1) [GPT] 판정 구분: 상한 이내 / 상한 초과 / 손절가 이�
       and R[PASS_CODES[3]]["gap_vs_cap"] is not None and "보류" in R[PASS_CODES[3]]["outcome_detail"]
       and [R[c]["fetch_status"] for c in PASS_CODES[5:]] == ["OK", "FETCH_FAILED", "PARSE_FAILED"])
 r0 = R[PASS_CODES[0]]
-check("3-2) [GPT] 요청·수신 시각·시도 횟수·지연(초) 기록. 허용(3초) 안은 ON_TIME, 넘으면 LATE — 실제 조회 시각 그대로",
+check("3-2) [GPT] 요청·수신 시각·시도 횟수·지연(초) 기록. 허용(9초) 안은 ON_TIME, 넘으면 LATE — 실제 조회 시각 그대로",
       r0["requested_at"] == "2026-10-01T09:05:00" and r0["received_at"] == "2026-10-01T09:05:00" and r0["attempts"] == 2
       and [R[c]["timing"] for c in PASS_CODES] == ["ON_TIME"] * 4 + ["LATE"] * 4
-      and [R[c]["lateness_sec"] for c in PASS_CODES] == list(range(8))
-      and R[PASS_CODES[7]]["requested_at"] == "2026-10-01T09:05:07")
+      and [R[c]["lateness_sec"] for c in PASS_CODES] == [0, 3, 6, 9, 12, 15, 18, 19]
+      and R[PASS_CODES[7]]["requested_at"] == "2026-10-01T09:05:19")
+x0, x1 = json.loads(r0["extra_json"]), json.loads(R[PASS_CODES[1]]["extra_json"])
+check("3-2b) [GPT·10/2 실측] 원천 가격 시각: ka10001 바로 뒤 ka10003 최근 KRX 체결 tm·가격(지연 초), ka10004 호가 기준 시각·"
+      "최우선 매도/매수호가 기록. 보조 조회가 실패해도 판정은 ka10001 기준 그대로(상태만 기록), 조회 실패·필드 없음엔 보조 조회 안 함",
+      r0["source_time"] == "2026-10-01T09:05:00" and r0["source_price"] == r0["observed_price"]
+      and r0["source_exchange"] == "KRX" and r0["source_lag_sec"] == 1
+      and r0["best_ask"] == r0["observed_price"] + 50 and r0["best_bid"] == r0["observed_price"]
+      and r0["quote_time"] == "2026-10-01T09:05:02" and x0["ka10003"]["status"] == "OK" and x0["ka10004"]["status"] == "OK"
+      and R[PASS_CODES[1]]["outcome"] == "ABOVE_CAP" and R[PASS_CODES[1]]["source_time"] is None
+      and R[PASS_CODES[1]]["best_ask"] is None and x1["ka10003"]["status"] == "FETCH_FAILED"
+      and x1["ka10004"]["status"] == "PARSE_FAILED"
+      and all(R[c]["extra_json"] is None for c in PASS_CODES[6:])
+      and [a for a, s_, _t in fake.calls if s_ == PASS_CODES[6]] == ["ka10001"])
 check("3-3) [GPT] 관찰 가격 ≠ 체결: 가정 체결가격은 상한 이내일 때만 관찰가 + '가정 — 실제 체결 아님' 규칙, 나머지는 비움. "
       "기록·보고서 어디에도 체결(FILLED) 표시 없음",
       r0["assumed_fill_price"] == r0["observed_price"] and "실제 체결 아님" in r0["assumed_fill_rule"]
@@ -282,8 +312,7 @@ check("3-3) [GPT] 관찰 가격 ≠ 체결: 가정 체결가격은 상한 이내
       and "FILLED" not in json.dumps(res["checks"], ensure_ascii=False))
 check("3-4) 응답 본문 보존(가격 원천 필드 확인용) — 토큰처럼 보이는 값은 가림. 선택 필드(시가·상한가·하한가·거래량) 기록",
       json.loads(r0["body_json"])["token"] == "***" and json.loads(r0["body_json"])["cur_prc"].startswith("+")
-      and r0["volume"] == 1000 and r0["upper_limit"] and r0["lower_limit"] and r0["open_price"] == r0["observed_price"]
-      and r0["source_time"] is None)
+      and r0["volume"] == 1000 and r0["upper_limit"] and r0["lower_limit"] and r0["open_price"] == r0["observed_price"])
 n_calls = len(fake.calls)
 res2 = chk2.run(D, client=fake, now=Clock(datetime(2026, 10, 1, 9, 30)))
 check("3-5) [GPT] 같은 후보·같은 확인을 다시 실행해도 조회·저장 없음(중복 없음), 실행 기록만 남음",
@@ -333,7 +362,7 @@ check("3-8) [GPT] 확인 도중 중단 → 기록된 후보는 그대로, 실행
       crashed and set(first_two) == set(PASS_CODES[:2]) and [r["status"] for r in os3.runs(D)] == ["FAILED", "COMPLETE"]
       and all(R4[c]["requested_at"] == first_two[c] and R4[c]["timing"] == "ON_TIME" for c in PASS_CODES[:2])
       and all(R4[c]["timing"] == "LATE" and R4[c]["requested_at"] >= "2026-10-01T09:20:00" for c in PASS_CODES[2:])
-      and len(R4) == 8 and len(f4.calls) == 3 + 6)
+      and len(R4) == 8 and len(f4.calls) == 7 + 18)
 os5 = A5.OpenCheckStore(TMP / "missed_a5.sqlite3")
 f5 = FakePrice(Clock(TARGET), spec)
 res5 = A5.OpenChecker(os5, ss, st, CAL, contract_hash=sc.contract_hash).run(D, client=f5, now=Clock(datetime(2026, 10, 2, 8, 0)))
@@ -342,11 +371,11 @@ check("3-9) [GPT] 다음 날 실행(또는 정규장 뒤) → 조회하지 않�
       and all(r["timing"] == "MISSED" and r["outcome"] == "MISSED" and r["fetch_status"] == "NOT_RUN"
               and r["observed_price"] is None for r in res5["checks"]))
 os6 = A5.OpenCheckStore(TMP / "close_a5.sqlite3")
-clk6 = Clock(datetime(2026, 10, 1, 15, 29, 57))
+clk6 = Clock(datetime(2026, 10, 1, 15, 29, 52))
 f6 = FakePrice(clk6, {c: quote(int(L[c][0]) - 1, CLOSES[c]) for c in PASS_CODES})
 res6 = A5.OpenChecker(os6, ss, st, CAL, contract_hash=sc.contract_hash).run(D, client=f6, now=clk6)
 check("3-10) 정규장 종료(15:30)를 넘기는 실행: 그 전 조회는 LATE로 기록, 종료 뒤 후보는 조회 없이 MISSED",
-      [r["timing"] for r in res6["checks"]] == ["LATE"] * 3 + ["MISSED"] * 5 and len(f6.calls) == 3)
+      [r["timing"] for r in res6["checks"]] == ["LATE"] * 3 + ["MISSED"] * 5 and len(f6.calls) == 9)
 
 # 후보 없음 구분
 st_n = build("none", all_down=True)
@@ -407,7 +436,31 @@ for api, fn in (("ka10081", "body"), ("kt10000", "body"), ("ka10075", "body"), (
 check("4-1) 시세 조회(fetch_body)는 ka10001만, 목록 조회(fetch_page)는 수집 TR 3개만 — 주문·계좌 TR 차단. 429 재시도 후 "
       "시도 횟수·요청/수신 시각, return_code 없으면 오류",
       b.attempts == 2 and b.body["cur_prc"] == "+100" and b.requested_at < b.received_at and no_rc and blocked == 4
-      and set(PRICE_API) == {"ka10001"} and set(RESEARCH_API) == {"ka10099", "ka10081", "ka20006"})
+      and set(PRICE_API) == {"ka10001", "ka10003", "ka10004"} and set(RESEARCH_API) == {"ka10099", "ka10081", "ka20006"})
+
+# a1 DB(이전 버전 — 보조 조회 열 없음) → a2
+a1db = TMP / "old_a1.sqlite3"
+old_schema = A5._SCHEMA.replace(" source_price INTEGER,\n  source_exchange TEXT, source_lag_sec INTEGER, best_ask INTEGER,"
+                                " best_bid INTEGER, quote_time TEXT, extra_json TEXT,", "")
+con = sqlite3.connect(a1db)
+con.executescript(old_schema)
+con.execute("INSERT INTO meta VALUES('a5_schema','a1')")
+con.execute("INSERT INTO price_check(set_id, symbol, check_kind, signal_id, target_at, timing, fetch_status, attempts,"
+            " error, outcome, outcome_detail, run_id, recorded_at) VALUES('a5_x','000100','OPEN+5m','s','t','MISSED',"
+            "'NOT_RUN',0,'','MISSED','x','r','t')")
+con.commit()
+con.close()
+had = {r[1] for r in sqlite3.connect(a1db).execute("PRAGMA table_info(price_check)")}
+with A5.OpenCheckStore(a1db) as oa:
+    cols = {r[1] for r in oa.conn.execute("PRAGMA table_info(price_check)")}
+    old_row = oa.checks("a5_x")[0]
+    ok_a2 = (oa.conn.execute("SELECT value FROM meta WHERE key='a5_schema'").fetchone()[0] == "a2"
+             and oa.backup_path is not None and "best_ask" not in had and {"source_price", "best_ask", "extra_json"} <= cols
+             and old_row["outcome"] == "MISSED" and old_row["best_ask"] is None)
+with A5.OpenCheckStore(a1db) as oa:
+    again_none = oa.backup_path is None
+check("4-1b) A5 기록 저장소 a1 → a2: 백업 후 보조 조회 열 추가, 기존 기록 그대로(보조 값 비움), 다시 열면 백업 없음",
+      ok_a2 and again_none and len(list(TMP.glob("old_a1.sqlite3.bak-a1-*"))) == 1)
 
 # ── 5. CLI ──────────────────────────────────────────────────
 from tools import research_collect as rc  # noqa: E402
@@ -537,6 +590,45 @@ check("6-2) 프로브 실행 경로: 모의 도메인·조회 TR만(ka10001×2�
       pcode == 0 and [p[1] for p in psess.posts[1:]] == ["ka10001", "ka10001", "ka10003", "ka10004"] * 2
       and len(summ) == 1 and len(rawf) == 1 and "A5-1 필수 필드(cur_prc·base_pric) 있음" in txt
       and "LEAK" not in rawf[0].read_text(encoding="utf-8") and "지원하지 않는 TR" in txt)
+
+# 10/2 11:40 모의 도메인 실측 응답(시세만, 계좌 정보 없음) — 파서가 실제 모양을 그대로 읽는지
+REAL_KA10001 = {"stk_cd": "005930", "stk_nm": "삼성전자", "high_pric": "+277000", "open_pric": "-273500",
+                "low_pric": "-271500", "upl_pric": "+358500", "lst_pric": "-193500", "base_pric": "276000",
+                "exp_cntr_pric": "", "250hgst_pric_dt": "20260619", "cur_prc": "-275750", "pre_sig": "5",
+                "pred_pre": "-250", "flu_rt": "-0.09", "trde_qty": "5158006", "return_code": 0,
+                "return_msg": "정상적으로 처리되었습니다"}
+REAL_KA10003 = {"cntr_infr": [
+    {"tm": "114023", "cur_prc": "-275750", "pred_pre": "-250", "pre_rt": "-0.09", "pri_sel_bid_unit": "276000",
+     "pri_buy_bid_unit": "-275500", "cntr_trde_qty": "-1", "sign": "5", "acc_trde_qty": "5158437",
+     "acc_trde_prica": "1418454985000", "cntr_str": "119.50", "stex_tp": "KRX"},
+    {"tm": "114023", "cur_prc": "-275750", "pred_pre": "-250", "pre_rt": "-0.09", "pri_sel_bid_unit": "276000",
+     "pri_buy_bid_unit": "-275500", "cntr_trde_qty": "-18", "sign": "5", "acc_trde_qty": "5158436",
+     "acc_trde_prica": "1418454709250", "cntr_str": "119.50", "stex_tp": "KRX"}],
+    "return_code": 0, "return_msg": "정상적으로 처리되었습니다"}
+REAL_KA10004 = {"bid_req_base_tm": "114024", "sel_fpr_bid": "276000", "sel_fpr_req": "21764", "buy_fpr_bid": "-275500",
+                "buy_fpr_req": "73689", "sel_1th_pre_req_pre": "--33", "tot_sel_req": "961481", "tot_buy_req": "474580",
+                "return_code": 0, "return_msg": "정상적으로 처리되었습니다"}
+D2 = date(2026, 10, 2)
+qr = A5.parse_quote(REAL_KA10001)
+tr = A5.parse_trade(REAL_KA10003, D2)
+bk = A5.parse_book(REAL_KA10004, D2)
+bad_tr = 0
+for body in ({"cntr_infr": []}, {"cntr_infr": [{"tm": "1140", "cur_prc": "1"}]}, {"cntr_infr": [{"tm": "114023",
+              "cur_prc": "x", "stex_tp": "KRX"}]}, {"cntr_infr": [{"tm": "114023", "cur_prc": "1", "stex_tp": "NXT"}]},
+             {"cntr_infr": [{"tm": "11402", "cur_prc": "1"}]}, {"cntr_infr": [{"tm": "1140230", "cur_prc": "1"}]},
+             {"cntr_infr": [{"tm": "254023", "cur_prc": "1"}]}):
+    try:
+        A5.parse_trade(body, D2)
+    except ValueError:
+        bad_tr += 1
+check("6-3) [10/2 실측 응답] ka10001 현재가 275,750(부호 '-'는 전일 대비)·기준가 276,000(현재가 − 기준가 = pred_pre −250)·"
+      "상·하한가·거래량, ka10003 최근 KRX 체결 11:40:23·275,750, ka10004 호가 기준 11:40:24·매도 276,000·매수 275,500. "
+      "시각·가격 형식이 틀리거나 KRX 행이 없으면 원천 시각을 만들지 않음",
+      (qr.price, qr.base, qr.optional["upper_limit"], qr.optional["lower_limit"], qr.optional["volume"])
+      == (275750, 276000, 358500, 193500, 5158006) and qr.base - qr.price == 250
+      and tr["source_time"] == datetime(2026, 10, 2, 11, 40, 23) and tr["source_price"] == 275750
+      and (bk["quote_time"], bk["best_ask"], bk["best_bid"]) == (datetime(2026, 10, 2, 11, 40, 24), 276000, 275500)
+      and bad_tr == 7)
 
 # ── 7. 경계 ────────────────────────────────────────────────
 FORBID = ("infra.broker", "app", "domain.service", "domain.position", "domain.risk", "domain.strategy",

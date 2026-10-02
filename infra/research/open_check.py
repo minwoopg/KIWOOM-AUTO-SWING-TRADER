@@ -19,9 +19,14 @@ from __future__ import annotations
    기준이 달라져 진입 상한을 그대로 비교하지 않음) > ABOVE_CAP(관찰가 > 진입 상한) > BELOW_STOP(관찰가 ≤ 참고 손절가)
    > WITHIN_CAP. 가정 체결가격(assumed_fill_price)은 WITHIN_CAP일 때만 관찰가로 두고 규칙 이름을 함께 기록.
 
-가격 원천: ka10001(주식기본정보) cur_prc(현재가)·base_pric(기준가)는 필수, open_pric·high_pric·low_pric·upl_pric·
-lst_pric·trde_qty는 있으면 기록. 원천 가격 시각 필드는 확인되지 않아 source_time은 비워 둠(응답 본문은 그대로 보존 —
-`tools/probe_price_sources.py` 실측 뒤 보완). 저장: data/research/a5_checks.sqlite3(수집·관찰 DB와 별도 파일).
+가격 원천 (2026-10-02 11:40 실측 `tools/probe_price_sources.py`로 확인)
+- ka10001(주식기본정보, 판정 기준): cur_prc(현재가)·base_pric(기준가 = 전일 종가, pred_pre = 현재가 − 기준가)는 필수,
+  open_pric·high_pric·low_pric·upl_pric·lst_pric·trde_qty는 있으면 기록. 응답에 가격 시각 필드는 없음.
+- ka10003(체결정보, 보조): 최근 체결 목록 cntr_infr의 첫 행(가장 최근, stex_tp=KRX) tm(HHMMSS)·cur_prc →
+  **원천 가격 시각**(source_time)·그 체결가. 실측: 요청보다 약 1초 앞선 체결. ka10001 바로 뒤에 조회.
+- ka10004(주식호가, 보조): bid_req_base_tm(호가 기준 시각)·sel_fpr_bid(최우선 매도호가)·buy_fpr_bid(최우선 매수호가).
+- 보조 조회는 판정·가정 체결가격에 쓰지 않는 기록용 — 실패해도 ka10001 판정은 그대로, 상태는 extra_json에.
+저장: data/research/a5_checks.sqlite3(수집·관찰 DB와 별도 파일). 스키마 a2(a1 DB는 열 때 백업 후 열 추가).
 """
 
 import json
@@ -35,11 +40,15 @@ from typing import Callable
 
 from infra.research.kiwoom_readonly import ResearchApiError
 from infra.research.scan_store import ScanStore
-from infra.research.store import ResearchStore
+from infra.research.store import ResearchStore, sqlite_backup
 from utils.trading_calendar import TradingCalendar
 
-A5_SCHEMA = "a1"
+A5_SCHEMA = "a2"
 PRICE_API_ID = "ka10001"
+TRADE_API_ID = "ka10003"            # 체결정보 — 원천 가격 시각
+BOOK_API_ID = "ka10004"             # 주식호가 — 최우선 호가
+EXTRA_COLUMNS = (("source_price", "INTEGER"), ("source_exchange", "TEXT"), ("source_lag_sec", "INTEGER"),
+                 ("best_ask", "INTEGER"), ("best_bid", "INTEGER"), ("quote_time", "TEXT"), ("extra_json", "TEXT"))
 SELECTION_RULE = "signal_date=D 직전 거래일 · contract=대상 계약 · PASS · final=1 · actionable=1 · scan_at < D 개장"
 ASSUMED_FILL_RULE = "OBSERVED_PRICE_AT_CHECK(가정 — 실제 체결 아님)"
 ON_TIME, LATE, MISSED = "ON_TIME", "LATE", "MISSED"
@@ -66,7 +75,8 @@ CREATE TABLE IF NOT EXISTS price_check(
   target_at TEXT NOT NULL, requested_at TEXT, received_at TEXT, lateness_sec INTEGER, timing TEXT NOT NULL,
   fetch_status TEXT NOT NULL, attempts INTEGER NOT NULL, api_id TEXT, error TEXT NOT NULL,
   observed_price INTEGER, base_price INTEGER, open_price INTEGER, high_price INTEGER, low_price INTEGER,
-  upper_limit INTEGER, lower_limit INTEGER, volume INTEGER, source_time TEXT,
+  upper_limit INTEGER, lower_limit INTEGER, volume INTEGER, source_time TEXT, source_price INTEGER,
+  source_exchange TEXT, source_lag_sec INTEGER, best_ask INTEGER, best_bid INTEGER, quote_time TEXT, extra_json TEXT,
   outcome TEXT NOT NULL, outcome_detail TEXT NOT NULL, gap_vs_close REAL, gap_vs_cap REAL,
   assumed_fill_price INTEGER, assumed_fill_rule TEXT, body_json TEXT, run_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
   PRIMARY KEY(set_id, symbol, check_kind)) WITHOUT ROWID;
@@ -108,7 +118,6 @@ class Quote:
     price: int
     base: int
     optional: dict            # open_price·…·volume (없으면 None)
-    source_time: str | None
 
 
 def parse_quote(body: dict) -> Quote:
@@ -117,7 +126,41 @@ def parse_quote(body: dict) -> Quote:
     missing = [k for k, v in (("cur_prc", price), ("base_pric", base)) if v is None]
     if missing:
         raise ValueError(f"필수 필드 없음·숫자 아님: {missing}")
-    return Quote(price, base, {k: _abs_int(body.get(src)) for k, src in OPTIONAL_FIELDS.items()}, None)
+    return Quote(price, base, {k: _abs_int(body.get(src)) for k, src in OPTIONAL_FIELDS.items()})
+
+
+def _hms(day: date, v) -> datetime | None:
+    s = str(v or "").strip()
+    if len(s) != 6 or not s.isdigit():
+        return None
+    try:
+        return datetime(day.year, day.month, day.day, int(s[:2]), int(s[2:4]), int(s[4:]))
+    except ValueError:
+        return None
+
+
+def parse_trade(body: dict, day: date) -> dict:
+    """ka10003 → 가장 최근 KRX 체결의 시각·가격. 없거나 형식이 틀리면 ValueError."""
+    rows = body.get("cntr_infr")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("cntr_infr 체결 목록 없음")
+    row = next((r for r in rows if isinstance(r, dict) and (r.get("stex_tp") or "KRX") == "KRX"), None)
+    if row is None:
+        raise ValueError("KRX 체결 행 없음")
+    t, price = _hms(day, row.get("tm")), _abs_int(row.get("cur_prc"))
+    if t is None or price is None:
+        raise ValueError(f"체결 시각·가격 형식 오류: tm={row.get('tm')!r} cur_prc={row.get('cur_prc')!r}")
+    return {"source_time": t, "source_price": price, "source_exchange": row.get("stex_tp") or "KRX",
+            "first_row": row}
+
+
+def parse_book(body: dict, day: date) -> dict:
+    """ka10004 → 호가 기준 시각·최우선 매도/매수호가. 없으면 ValueError."""
+    ask, bid, t = _abs_int(body.get("sel_fpr_bid")), _abs_int(body.get("buy_fpr_bid")), _hms(day, body.get("bid_req_base_tm"))
+    if ask is None or bid is None or t is None:
+        raise ValueError("최우선 호가·호가 기준 시각 없음")
+    keys = ("bid_req_base_tm", "sel_fpr_bid", "sel_fpr_req", "buy_fpr_bid", "buy_fpr_req", "tot_sel_req", "tot_buy_req")
+    return {"best_ask": ask, "best_bid": bid, "quote_time": t, "fields": {k: body.get(k) for k in keys}}
 
 
 def evaluate(cand: dict, q: Quote) -> tuple[str, str]:
@@ -150,11 +193,24 @@ class OpenCheckStore:
         self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        self.backup_path: str | None = None
         cur = self.conn.execute("SELECT value FROM meta WHERE key='a5_schema'").fetchone()
         if cur is None:
             self.conn.execute("INSERT INTO meta(key, value) VALUES('a5_schema', ?)", (A5_SCHEMA,))
+        elif cur[0] == "a1":
+            self.backup_path = sqlite_backup(self.conn, self.path, "a1")
+            self._upgrade_a1_to_a2()
         elif cur[0] != A5_SCHEMA:
             raise RuntimeError(f"A5 기록 저장소 스키마 {cur[0]} ≠ {A5_SCHEMA}: {self.path}")
+
+    def _upgrade_a1_to_a2(self) -> None:
+        """보조 조회(체결 시각·호가) 열 추가. 기존 행은 비워 둠(그때 조회하지 않았음)."""
+        with self.tx():
+            cols = {r[1] for r in self.conn.execute("PRAGMA table_info(price_check)")}
+            for name, typ in EXTRA_COLUMNS:
+                if name not in cols:
+                    self.conn.execute(f"ALTER TABLE price_check ADD COLUMN {name} {typ}")
+            self.conn.execute("UPDATE meta SET value=? WHERE key='a5_schema'", (A5_SCHEMA,))
 
     def close(self) -> None:
         self.conn.close()
@@ -353,7 +409,8 @@ class OpenChecker:
         base = {"set_id": cset["set_id"], "symbol": c["symbol"], "check_kind": self.kind, "signal_id": c["signal_id"],
                 "target_at": _ts(target), "requested_at": None, "received_at": None, "lateness_sec": None,
                 "attempts": 0, "api_id": None, "error": "", "observed_price": None, "base_price": None,
-                **{k: None for k in OPTIONAL_FIELDS}, "source_time": None, "gap_vs_close": None, "gap_vs_cap": None,
+                **{k: None for k in OPTIONAL_FIELDS}, "source_time": None, **{k: None for k, _ in EXTRA_COLUMNS},
+                "gap_vs_close": None, "gap_vs_cap": None,
                 "assumed_fill_price": None, "assumed_fill_rule": None, "body_json": None, "run_id": run_id}
         ts = now()
         if ts >= close or ts.date() > target.date():
@@ -381,12 +438,44 @@ class OpenChecker:
             return {**row, "fetch_status": PARSE_FAILED, "error": str(exc)[:300], "outcome": PARSE_FAILED,
                     "outcome_detail": "응답에 필수 가격 필드 없음"}
         outcome, detail = evaluate(c, q)
+        row.update(self._extras(c["symbol"], target.date(), client, now))
         return {**row, "fetch_status": FETCHED, "observed_price": q.price, "base_price": q.base, **q.optional,
-                "source_time": q.source_time, "outcome": outcome, "outcome_detail": detail,
+                "outcome": outcome, "outcome_detail": detail,
                 "gap_vs_close": None if not c["signal_close"] else round(q.price / c["signal_close"] - 1, 6),
                 "gap_vs_cap": None if not c["entry_cap"] else round(q.price / c["entry_cap"] - 1, 6),
                 "assumed_fill_price": q.price if outcome == WITHIN_CAP else None,
                 "assumed_fill_rule": ASSUMED_FILL_RULE if outcome == WITHIN_CAP else None}
+
+
+    def _extras(self, symbol: str, day: date, client, now) -> dict:
+        """보조 조회(기록용): ka10003 최근 체결 시각·가격, ka10004 최우선 호가. 실패해도 판정에 영향 없음."""
+        out: dict = {"recorded_at": _ts(now())}
+        info: dict = {}
+        for api_id, parse in ((TRADE_API_ID, parse_trade), (BOOK_API_ID, parse_book)):
+            try:
+                b = client.fetch_body(api_id, {"stk_cd": symbol})
+            except ResearchApiError as exc:
+                info[api_id] = {"status": FETCH_FAILED, "error": str(exc)[:200]}
+                continue
+            entry = {"status": FETCHED, "requested_at": _ts(b.requested_at), "received_at": _ts(b.received_at),
+                     "attempts": b.attempts}
+            try:
+                p = parse(b.body, day)
+            except ValueError as exc:
+                info[api_id] = {**entry, "status": PARSE_FAILED, "error": str(exc)[:200]}
+                continue
+            if api_id == TRADE_API_ID:
+                out.update(source_time=_ts(p["source_time"]), source_price=p["source_price"],
+                           source_exchange=p["source_exchange"],
+                           source_lag_sec=int((b.requested_at - p["source_time"]).total_seconds()))
+                entry["first_row"] = _redact(p["first_row"])
+            else:
+                out.update(best_ask=p["best_ask"], best_bid=p["best_bid"], quote_time=_ts(p["quote_time"]))
+                entry["fields"] = p["fields"]
+            info[api_id] = entry
+        out["extra_json"] = json.dumps(info, ensure_ascii=False)
+        out["recorded_at"] = _ts(now())
+        return out
 
 
 def _tally(rows: list[dict], key: str) -> dict:
@@ -418,10 +507,11 @@ def build_markdown(res: dict) -> str:
                      _n(x.get("signal_close")), _n(x.get("entry_cap")), _n(x.get("stop_ref")),
                      "-" if k["gap_vs_cap"] is None else f"{k['gap_vs_cap'] * 100:+.2f}%",
                      k["outcome"], k["timing"], k["requested_at"] or "-",
-                     "-" if k["lateness_sec"] is None else str(k["lateness_sec"])])
+                     "-" if k["lateness_sec"] is None else str(k["lateness_sec"]),
+                     (k.get("source_time") or "-")[11:] or "-", _n(k.get("best_ask"))])
     if rows:
         head = ["종목", "이름", "관찰가", "기준가", "신호일 종가", "진입 상한", "참고 손절가", "상한 대비", "판정", "시각",
-                "요청 시각", "지연(초)"]
+                "요청 시각", "지연(초)", "최근 체결 시각", "최우선 매도호가"]
         lines += ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
         lines += ["| " + " | ".join(r) + " |" for r in rows]
     else:
