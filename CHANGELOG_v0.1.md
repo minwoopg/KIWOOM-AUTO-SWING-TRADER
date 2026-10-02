@@ -885,4 +885,49 @@ A4 시점 재평가에 영향을 주는 P1 2건.
 ### 전달 파일
 - 패치 0001 (fix: CLI·테스트·CHANGELOG)
 
+## 2026-10-02 — A4-A: S1 앞으로의 신호 관찰 스캔·저장·일일 보고 (GPT 종합 검토 `3ccb362` 후속)
+
+### 배경
+- GPT 종합 검토(`3ccb362`): a2t·a2u 확인, 추가 P1 없음 → A4-A 진행. 작은 보완 2건을 이 패치에 함께.
+  * status의 time_basis가 현재 봉(bar)만 집계 → 이전 판(bar_history)도 따로.
+  * 조회가 필요 없는 backfill도 먼저 API 설정을 만듦 → 작업 필요가 정해진 뒤에 만들기.
+- A4-A 지시: S1_BASE 그대로, update 뒤 스캔, 스캔 시각 입력만(as_of·integrity·time_proof·revision·기대 세션 봉·
+  as-of 스냅숏·지수 장애 → 보류), 후보·탈락·보류 함께 저장, 신호 ID에 입력 해시 없음, 확정 기록 덮어쓰지 않음, 일일 보고서.
+
+### 변경 내용
+| 구분 | 파일 | 내용 |
+|---|---|---|
+| 스캐너 | `infra/research/s1_scanner.py` (새) | 신호일(완성 기준 160분, 잠정), `research_series(as_of=scan_at, start=)`, 데이터 보류(NO_SERIES·NO_REVISION·INTEGRITY·UNPROVEN·STALE), 지수 보류(지수 없이 평가 → RS·시장 UNKNOWN), as-of 스냅숏·장 마감 전 스냅숏 보류, 현재 정책으로 재분류, 입력 해시, final·actionable, 같은 run_key 건너뜀·`verify` 재계산 비교, 집계 |
+| 저장 | `infra/research/scan_store.py` (새, 스키마 s1, 별도 파일) | scan_run(run_key·COMPLETE 유일, RUNNING→COMPLETE/FAILED/ABORTED, 시작 시 남은 RUNNING 정리), s1_eval(실행별 종목 판정 append-only, 사전 압축), s1_observation(신호 ID 대표 판정 — final 불변, 보류만 더 늦은 실행이 대체·이력), 한 트랜잭션 완료·ABORTED 실행 완료 거부 |
+| 보고서 | `infra/research/scan_report.py` (새) | 요약·시장 환경·시장별·보류 사유·탈락 사유·후보 표(md·json), 수익 아님·잠정 완성 기준 고지 |
+| 수집 저장소 | `infra/research/store.py` | `research_series(start=)`, 메타·revision·봉을 한 읽기 트랜잭션에서 읽고 revision 번호로 bar·bar_history 함께 조회(조회 중 REBASE에도 섞이지 않음), `snapshot_as_of(as_of)` |
+| 수집기 | `infra/research/collector.py` | API 설정 오류(ResearchConfigError)는 종목 ERROR가 아니라 명령 중단 |
+| 도구 | `tools/research_collect.py` | `scan [--at] [--verify]`, `update` 뒤 스캔(`--no-scan`), `--scan-db`·`--report-dir`, API 클라이언트 지연 생성(작업을 만들기 전·갱신 전엔 미리 확인), status time_basis current/history |
+| 문서 | `docs/research_a_stage.md`, `README.md` | A4-A 절(실행·입력 규칙·저장·보고서·다음 단계) |
+
+### 테스트 및 검증
+- 새 `test_research_scan.py` 39건(가짜 데이터·임시 DB): 신호일 경계(18:09/18:10·주말·대체공휴일·달력 밖), PASS 2·FAIL·위험 자격 FAIL,
+  데이터 보류 4종, NO_TRADES 보류, 참고 손절가·진입 상한·조건별 결과·증거 필드, 집계, 같은 시각 재실행 건너뜀·재계산 동일·결정적,
+  **10/1 정정(REBASE)·새 스냅숏·늦은 봉 뒤에도 9/30 기록 재계산 동일**, 확정 기록 유지·보류 기록 대체(이력·actionable 0)·
+  과거 시각 재현이 늦은 기록을 되돌리지 않음, **지수 REBASE_REQUIRED·지수 오래된 봉 → 해당 시장 종목 후보 아님**,
+  스캔 뒤 스냅숏 미사용·장 마감 전 스냅숏 보류·스냅숏 없음 FAILED, **커밋 직전 중단 → 아무것도 안 남고 ABORTED·다음 실행 정상**,
+  강제 종료 RUNNING 정리, ABORTED 실행 완료 거부, COMPLETE 유일, CLI scan·보고서·verify·update 실패해도 스캔·`--no-scan`,
+  status current/history, 설정 없이 끝난 backfill 통과·조회 필요 시 작업 만들기 전 오류, import 경계·운영 폴더 무변경.
+- 변이 확인 15종(latest_snapshot 사용·정합성/시각 입증/오래된 봉 검사 제거·지수 보류 무시·현재 값 사용·final 항상 1·
+  확정 기록 덮어씀·완료 건너뛰기 제거·완료 표시 상태 검사 제거·스냅숏 검사 제거·과거 재현 대체·중단 표시 제거·
+  신호일 장 마감 기준·actionable 항상 1) — 모두 새 테스트가 잡음.
+- 규모: 2,500종목(무작위 시세) 스캔 약 7초, 실행당 저장 약 3MB, verify 일치.
+- `test_research_collect` 107/107(실측 원문 포함 108), 지표 91, S1 49.
+- `run_regression_tests.py --skip test_broker_order_status.py`: 30개 전부 통과. 단타 원본 동등성 18/18. 테스트 후 `git status` 깨끗, `commands/`·`data/`·`reports/` 생성 없음.
+
+### 변경하지 않은 것
+- S1 조건·기준값, 수집·검증 규칙, 주문 경로·운영 원장.
+
+### 다음 작업
+- 사용자: 패치 적용 → `status`(schema r3, time_basis current/history의 UNPROVEN, integrity) → 18:10 이후 `update`(자동 스캔) → 보고서 확인.
+- A4-B 과거 일괄 스캔(과거 달력 확인 후), A5 다음날 확인·이후 움직임.
+
+### 전달 파일
+- 패치 0001 (feat), 0002 (docs)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

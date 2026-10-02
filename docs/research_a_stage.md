@@ -60,7 +60,7 @@ C 전 필수 후속: 원장 정정 도구, ERROR·orphan 종목 guard 이중 차
 - 보고: 신호 수, 서로 다른 종목 수, 신호 발생 거래일 수, 연속·겹침 신호, 시장 환경별, 결과 성숙 표본 수를 따로.
 
 ## 진행 순서
-A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/research/`) → A2 수집 → A4 스캔·저장·보고 → A5 다음날 확인·이후 움직임.
+A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/research/`) → A2 수집 → A4 스캔·저장·보고(A4-A 앞으로의 신호 관찰 완료, A4-B 과거 일괄) → A5 다음날 확인·이후 움직임.
 
 ## A3 구현된 정의 (`domain/research/`)
 | 모듈 | 내용 | 버전 |
@@ -187,3 +187,45 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
    `config/krx_calendar.yaml`에 추가.
 5. `python tools/research_collect.py status` — 스냅숏·작업·커버리지·거래 없는 봉·재수집 횟수·integrity·스키마.
 6. (선택) `python tools/research_collect.py backfill --recheck-shortfall` — HISTORY_END·PAGE_CAP 시계열만 다시 받아 검증.
+
+## A4-A 앞으로의 S1 신호 관찰 (`infra/research/s1_scanner.py`·`scan_store.py`·`scan_report.py`) — 2026-10-02
+
+### 실행
+- `update`가 끝나면(종료 코드와 무관하게) 바로 스캔·보고서. `update --no-scan`으로 끌 수 있음.
+  스캔만: `scan` (지금 시각), 재현: `scan --at 2026-10-02T19:30:00 --verify`.
+- 관찰 기록 `data/research/s1_scans.sqlite3`, 보고서 `reports/research/s1/s1_scan_<신호일>_<실행ID>.md·json` (git 제외).
+- S1_BASE(s1_pullback_v0.1) 조건·기준값 그대로. 주문 경로와 연결하지 않음(import 경계 테스트).
+
+### 스캔 시각의 입력만
+- 신호일 t = 스캔 시각에 완성된 가장 최근 거래일(정규장 종료 + 160분 — **잠정** 기준, 보고서에도 표시).
+  달력이 다루지 않는 해면 스캔 불가.
+- 종목·지수 = `research_series(sid, as_of=scan_at)`. 다음이면 그 종목은 **데이터 보류**(UNKNOWN, 평가 안 함):
+  시계열 없음(NO_SERIES) · revision 없음 · integrity ≠ OK · time_proof ≠ OK(UNPROVEN) · t의 봉 없음(STALE).
+- 지수가 위 조건에 걸리면 **지수 보류** — 그 지수를 쓰는 종목은 지수 없이 평가돼 RS·시장 판정 UNKNOWN(후보 아님).
+- 종목 목록 = 스캔 시각까지 **수집이 끝난** 스냅숏(`snapshot_as_of`, latest_snapshot 아님). 그 스냅숏이 t 장 마감 전
+  관측이면 현재 위험 상태를 모르는 것으로 보고 RISK_STATUS UNKNOWN(스냅숏 보류). 스냅숏의 원래 필드를 **현재 정책(u2)으로
+  다시 분류**(저장 정책·적용 정책 둘 다 기록). 스냅숏이 없으면 스캔 실패(FAILED).
+- 세션 목록은 거래소 달력에서만(최근 300세션). 과거 연도 달력이 없으면 긴 창은 INSUFFICIENT_SESSIONS(보수적).
+
+### 저장 (스키마 s1)
+| 표 | 내용 |
+|---|---|
+| `scan_run` | 실행. run_key = 신호일·스캔 시각·전략·설정 해시·분류 정책 — COMPLETE는 하나뿐(유일 인덱스). RUNNING → COMPLETE / FAILED / ABORTED. 실행 공통 증거(지수 revision·판정, 스냅숏, 세션, 버전)는 context |
+| `s1_eval` | 실행마다 종목별 판정 전부(PASS·FAIL·UNKNOWN, 조건별 값·사유, 참고 손절가·진입 상한, 관찰값). append-only. 결과·증거(revision·조정 기준일·지수 revision·스냅숏 ID·위험 표시)는 사전 압축 JSON, 입력 해시는 열 |
+| `s1_observation` | 신호 ID = `S1|전략|설정 해시|종목|신호일`(**입력 해시 없음**)마다 대표 판정. final(데이터·지수·스냅숏 모두 정상)은 절대 안 바뀜 — 이후 정정·새 스냅숏에도 유지. final이 아닌 보류 기록만 더 늦은 스캔 시각의 실행이 대체(이력 보존). 과거 시각 재현 실행은 더 늦은 기록을 되돌리지 않음 |
+
+- actionable = 스캔 시각 < 다음 거래일 개장 — 개장 뒤에 늦게 해소된 기록은 0(A5에서 진입 가정에 쓰지 않음).
+- 같은 run_key 재실행 → 건너뜀(중복 저장 없음). `--verify`는 다시 계산해 종목별 판정·입력 해시·결과 비교만.
+- 원자성: 판정·대표 기록·COMPLETE 표시를 한 트랜잭션. 도중 중단 → 아무것도 안 남고 실행은 ABORTED(강제 종료면
+  RUNNING으로 남았다가 다음 실행이 ABORTED로 정리). ABORTED로 정리된 실행은 늦게 끝나도 완료 표시 안 됨.
+- 크기: 2,500종목 한 번에 약 3MB(하루 1회면 1년 약 0.75GB). 스캔 약 7~8초.
+
+### 보고서
+- 대상·신호(PASS)·서로 다른 종목·FAIL·UNKNOWN·확정 수, 데이터 미확보 수, 거래 없는 봉 보류 수, 대표 기록 변화.
+- 지수별 데이터 상태·시장 판정, 시장별(KOSPI·KOSDAQ) PASS/FAIL/UNKNOWN, 보류 사유(데이터·지수·스냅숏·조건),
+  탈락 사유(묶음·조건별), 후보 표(참고 손절가·진입 상한·위험 비율·눌림 봉 수·RS60·20일 거래대금·개장 전 스캔 여부).
+- "신호는 관찰 후보이며 수익이 아님" 고지. 체결 검증·이후 움직임은 A5.
+
+### 다음
+- A4-B: 과거 일괄 스캔 — 과거 달력 확인 뒤, 백필은 생존 편향 있는 탐색용 결과로 분리, 현재 위험 상태를 과거에 적용하지 않음.
+- A5: 다음 거래일 09:05 가격 확인, 5·10·20거래일 뒤 움직임 평가(actionable 기록만 진입 가정).
