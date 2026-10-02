@@ -229,13 +229,12 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
   다시 분류**(저장 정책·적용 정책 둘 다 기록). 스냅숏이 없으면 스캔 실패(FAILED).
 - 세션 목록은 거래소 달력에서만(최근 300세션). 과거 연도 달력이 없으면 긴 창은 INSUFFICIENT_SESSIONS(보수적).
 
-### 저장 (스키마 s2)
+### 저장 (스키마 s3)
 | 표 | 내용 |
 |---|---|
-| `scan_run` | 실행. run_key = 신호일·스캔 시각·전략·설정 해시·분류 정책 — COMPLETE는 하나뿐(유일 인덱스). RUNNING → COMPLETE / FAILED / ABORTED. 실행 공통 증거(지수 revision·판정, 스냅숏, 세션, 버전)는 context |
+| `scan_run` | 실행. run_key = 신호일·스캔 시각·전략·설정 해시·분류 정책·**계산 계약 해시** — COMPLETE는 하나뿐(유일 인덱스). RUNNING → COMPLETE / FAILED / ABORTED. 실행 공통 증거(지수 revision·판정, 스냅숏, 세션, 버전)는 context |
 | `s1_eval` | 실행마다 종목별 판정 전부(PASS·FAIL·UNKNOWN, 조건별 값·사유, 참고 손절가·진입 상한, 관찰값). append-only. 결과·증거(revision·조정 기준일·지수 revision·스냅숏 ID·위험 표시)는 사전 압축 JSON, 입력 해시는 열 |
-| `s1_observation` | 신호 ID = `S1|전략|설정 해시|종목|신호일`(**입력 해시 없음**)마다 대표 판정. final(데이터·지수·스냅숏 모두 정상이고 **판정이 PASS/FAIL로 정해진** 경우)은 절대 안 바뀜 — 이후 정정·새 스냅숏에도 유지. final이 아닌 기록(데이터 보류·UNKNOWN — 거래 없는 봉·이력 부족 등)은 더 늦은 스캔 시각의 실행이 대체(이력 보존). 과거 시각 재현 실행은 더 늦은 기록을 되돌리지 않음 |
-
+| `s1_observation` | 신호 ID = `S1|전략|c:<계산 계약>|종목|신호일`(**입력 해시 없음**)마다 대표 판정 — 계약이 다른 판정은 섞이지 않음. final(데이터·지수·스냅숏 모두 정상이고 **판정이 PASS/FAIL로 정해진** 경우)은 절대 안 바뀜 — 이후 정정·새 스냅숏에도 유지. final이 아닌 기록(데이터 보류·UNKNOWN — 거래 없는 봉·이력 부족 등)은 더 늦은 스캔 시각의 실행이 대체(이력 보존). 과거 시각 재현 실행은 더 늦은 기록을 되돌리지 않음 |
 | `obs_audit` | 대표 기록을 실행이 아닌 이유(규칙 변경)로 고친 이력 — 바꾸기 전·후 값과 사유 (s2) |
 
 - final 규칙(`scan_store.final_rule`, 실행 context `final_rule="inputs_ok+decided"`): 종목·지수·스냅숏 입력이 모두 정상이고
@@ -244,6 +243,17 @@ A1 원천 실측(`tools/probe_research_sources.py`) · A3 순수 계산(`domain/
   정상이면 UNKNOWN 판정도 final=1로 고정 → 이후 정상 판정으로 대체되지 않았음. 대표 기록 중 현재 규칙을 만족하지 않는
   final=1을 final=0으로 풀고 `obs_audit`에 남김(PASS·FAIL 확정 기록은 그대로). 실행·종목별 판정(`scan_run`·`s1_eval`)은 당시
   그대로 보존. `--verify`는 저장된 행에 현재 규칙을 적용한 final과 비교하고, 이전 규칙 차이는 `final_rule_changed`로 따로 셈.
+- **계산 계약 (s3, GPT 재검토 `016907a`)**: 같은 DB·같은 스캔 시각이라도 결과를 바꿀 수 있는 계산 조건 전부 —
+  전략·설정 해시·분류 정책·지표/시장 계산 버전·lookback(세션 수)·완성 봉 지연(초)·거래일 달력 내용(`calendar_version`:
+  다루는 해·휴장일·세션 시각의 해시, 휴장일 이름·주석은 무관)·final 규칙·스캔 입력 규칙 버전(`SCAN_RULES_VERSION`)·지수 ID.
+  해시(12자리)를 실행 키·context(`contract_hash`·`contract`)·실행 행·대표 기록 키에 넣음 → 같은 계약 재실행은 건너뛰고,
+  계약이 다르면 별도 실행·별도 대표 기록. 입력 데이터 해시는 계약이 아니라 종목별 증거(`input_hash`)로 그대로.
+  `--verify`는 계약이 다른 실행이면 비교하지 않고 `contract_match=False`·다른 항목(`contract_diff`)만 표시.
+  보고서 머리말에 계약 해시·lookback·달력·규칙 표시. 스캔 입력 규칙(보류 조건·세션 창·입력 해시 구성)을 고치면
+  `SCAN_RULES_VERSION`을 올려야 함.
+- **s2 → s3 (열 때 자동·한 번만, 바꾸기 전 백업 `s1_scans.sqlite3.bak-s2-<시각>`)**: `scan_run`·`s1_observation`에
+  contract_hash 열 추가. 기존 실행·대표 기록은 NULL — 어떤 lookback·달력으로 계산했는지 저장돼 있지 않아 **추정하지 않고**,
+  계약이 있는 기록과 다른 묶음으로 그대로 보존(덮어쓰지 않음). 대표 기록을 볼 때는 `observations(contract_hash=…)`로 한 계약만.
 - actionable = 스캔 시각 < 다음 거래일 개장 — 개장 뒤에 늦게 해소된 기록은 0(A5에서 진입 가정에 쓰지 않음).
 - 같은 run_key 재실행 → 건너뜀(중복 저장 없음). `--verify`는 다시 계산해 종목별 판정·입력 해시·결과 비교만.
   건너뛸 때 보고서(md·json)가 없으면 저장된 실행(context·집계·판정)으로 **보고서만 다시 만듦**(재계산 없음).

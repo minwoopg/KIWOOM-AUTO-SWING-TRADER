@@ -240,10 +240,11 @@ python tools/probe_market_data.py --env-file ..\KIWOOM-AUTO-TRADER\.env --skip-d
 - A2 수집(조회 전용, 모의 도메인만, 허용 TR 3개): `python tools/research_collect.py universe | backfill | update | status | holidays`
   — 종목 목록 스냅숏, 재개 가능한 일봉·지수 백필(2017-01-02부터), 매일 18:10 이후 갱신. 저장은 `data/research/`(git 제외).
   규칙은 `docs/research_a_stage.md`의 A2 절. 저장소 스키마가 바뀌면 새 버전이 기존 DB를 열 때 백업 후 자동 이전합니다
-  (연구 DB r5, 관찰 DB s2). 바꾸기 전에 `inspect-unproven`(읽기 전용)으로 무엇이 바뀔지 미리 볼 수 있습니다.
+  (연구 DB r5, 관찰 DB s3). 바꾸기 전에 `inspect-unproven`(읽기 전용)으로 무엇이 바뀔지 미리 볼 수 있습니다.
 - A4-A S1 관찰 스캔(주문 없음): `update`가 끝나면 자동으로 스캔·보고서(`reports/research/s1/`), 스캔만은 `scan`,
   같은 시각 재현은 `scan --at ... --verify`. 관찰 기록은 `data/research/s1_scans.sqlite3`(git 제외).
   스캔 시각에 알 수 있던 값만 쓰고, 데이터·지수·스냅숏이 불완전하면 후보로 넘기지 않고 보류합니다.
+  실행·대표 기록은 계산 계약(설정·정책·계산 버전·lookback·완성 지연·달력)별로 따로 저장합니다.
 - 과거 일괄 스캔(A4-B)·다음날 확인과 이후 움직임(A5)은 다음 단계입니다.
 
 ## 원본과의 관계 (`provenance.json`)
