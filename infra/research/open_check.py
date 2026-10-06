@@ -5,7 +5,7 @@ from __future__ import annotations
 흐름 (대상 거래일 D, 신호일 t = D의 직전 거래일)
 1. 후보 확정(`candidate_set`·`candidate`, D마다 한 번): 대상 계약 하나(config/research.yaml s1.active_contract)의
    t 대표 기록 중 **PASS·final=1·actionable=1·스캔 시각 < D 개장**이고, 그 대표 기록의 실행이 **D 개장 전에 실제로
-   저장 완료**된 것만(GPT 재검토 14eb8c0 A5-R1 — 관찰 저장소 committed_at, 없으면 finished_at + 1시간 상한).
+   저장 완료**된 것만(GPT 재검토 14eb8c0 A5-R1 — 관찰 저장소 committed_at — 없으면 입증 불가로 제외).
    개장 뒤 과거 시각으로 계산·저장한 PASS는 후보가 아님. signal_id·run_id·contract_hash·진입 상한·참고 손절가·
    신호일 종가를 저장하고, 이후 실행은 다시 고르지 않고 이 목록을 씁니다.
    - 같은 D에는 후보 목록이 하나뿐(대상 계약이 바뀌어도 이미 확정된 D의 목록·계약은 그대로, 새 계약은 다음 D부터)
@@ -29,7 +29,8 @@ from __future__ import annotations
 - ka10001(주식기본정보, 판정 기준): cur_prc(현재가)·base_pric(기준가 = 전일 종가, pred_pre = 현재가 − 기준가)는 필수,
   open_pric·high_pric·low_pric·upl_pric·lst_pric·trde_qty는 있으면 기록. 응답에 가격 시각 필드는 없음.
 - ka10003(체결정보, 보조): 최근 체결 목록 cntr_infr의 첫 행(가장 최근, stex_tp=KRX) tm(HHMMSS)·cur_prc →
-  **원천 가격 시각**(source_time)·그 체결가. 실측: 요청보다 약 1초 앞선 체결. ka10001 바로 뒤에 조회.
+  그 조회 자체의 최근 체결 시각(trade_time)·체결가(trade_price). **ka10001 가격의 원천 시각이 아님**(별도 조회 —
+  GPT 지시). ka10001의 source_time은 원천에 시각 필드가 없어 비워 둠.
 - ka10004(주식호가, 보조): bid_req_base_tm(호가 기준 시각)·sel_fpr_bid(최우선 매도호가)·buy_fpr_bid(최우선 매수호가).
 - 보조 조회는 판정·가정 체결가격에 쓰지 않는 기록용 — 실패해도 ka10001 판정은 그대로, 상태는 extra_json에.
 저장: data/research/a5_checks.sqlite3(수집·관찰 DB와 별도 파일). 스키마 a2(a1 DB는 열 때 백업 후 열 추가).
@@ -53,17 +54,19 @@ A5_SCHEMA = "a2"
 PRICE_API_ID = "ka10001"
 TRADE_API_ID = "ka10003"            # 체결정보 — 원천 가격 시각
 BOOK_API_ID = "ka10004"             # 주식호가 — 최우선 호가
-EXTRA_COLUMNS = (("source_price", "INTEGER"), ("source_exchange", "TEXT"), ("source_lag_sec", "INTEGER"),
+EXTRA_COLUMNS = (("trade_time", "TEXT"), ("trade_price", "INTEGER"), ("trade_exchange", "TEXT"), ("trade_lag_sec", "INTEGER"),
                  ("best_ask", "INTEGER"), ("best_bid", "INTEGER"), ("quote_time", "TEXT"), ("extra_json", "TEXT"),
                  ("response_ms", "INTEGER"))
-# 커밋 시각(committed_at, 관찰 저장소 s4)이 없는 이전 실행: finished_at(저장 트랜잭션 시작) + 1시간을 저장 완료의 상한으로
-# 봄 — 저장 트랜잭션은 수 초, SQLite 잠금 대기는 30초라 실제 커밋이 이보다 늦을 수 없음(보수적). 기록에 근거를 남김.
-LEGACY_COMMIT_MARGIN = timedelta(hours=1)
 SELECTION_RULE = "signal_date=D 직전 거래일 · contract=대상 계약 · PASS · final=1 · actionable=1 · scan_at < D 개장"
 ASSUMED_FILL_RULE = "OBSERVED_PRICE_AT_CHECK(가정 — 실제 체결 아님)"
 ON_TIME, LATE_RESPONSE, LATE, MISSED, AFTER_CLOSE = "ON_TIME", "LATE_RESPONSE", "LATE", "MISSED", "AFTER_CLOSE"
 FETCHED, FETCH_FAILED, PARSE_FAILED, NOT_RUN = "OK", "FETCH_FAILED", "PARSE_FAILED", "NOT_RUN"
 RECEIVED_AFTER_CLOSE, SKIPPED_AFTER_CLOSE = "RECEIVED_AFTER_CLOSE", "SKIPPED_AFTER_CLOSE"
+# 기본 가격(ka10001) 행을 먼저 저장하고 보조 조회는 그 뒤에 — 보조 조회 중 중단돼도 기본 가격은 보존 (GPT 재검토)
+EXTRAS_PENDING = json.dumps({"pending": True})
+EXTRAS_INTERRUPTED = json.dumps({"ka10003": {"status": "INTERRUPTED"}, "ka10004": {"status": "INTERRUPTED"},
+                                 "note": "기본 가격 저장 뒤 보조 조회 중 중단 — 늦은 보조 조회는 하지 않음"},
+                                ensure_ascii=False)
 WITHIN_CAP, ABOVE_CAP, BELOW_STOP, BASIS_CHANGED, NOT_TRADABLE, NO_PRICE_OUTCOME = (
     "WITHIN_CAP", "ABOVE_CAP", "BELOW_STOP", "BASIS_CHANGED", "NOT_TRADABLE", "NO_PRICE")
 OPTIONAL_FIELDS = {"open_price": "open_pric", "high_price": "high_pric", "low_price": "low_pric",
@@ -86,8 +89,8 @@ CREATE TABLE IF NOT EXISTS price_check(
   target_at TEXT NOT NULL, requested_at TEXT, received_at TEXT, lateness_sec INTEGER, timing TEXT NOT NULL,
   fetch_status TEXT NOT NULL, attempts INTEGER NOT NULL, api_id TEXT, error TEXT NOT NULL,
   observed_price INTEGER, base_price INTEGER, open_price INTEGER, high_price INTEGER, low_price INTEGER,
-  upper_limit INTEGER, lower_limit INTEGER, volume INTEGER, source_time TEXT, source_price INTEGER,
-  source_exchange TEXT, source_lag_sec INTEGER, best_ask INTEGER, best_bid INTEGER, quote_time TEXT, extra_json TEXT,
+  upper_limit INTEGER, lower_limit INTEGER, volume INTEGER, source_time TEXT, trade_time TEXT, trade_price INTEGER,
+  trade_exchange TEXT, trade_lag_sec INTEGER, best_ask INTEGER, best_bid INTEGER, quote_time TEXT, extra_json TEXT,
   response_ms INTEGER,
   outcome TEXT NOT NULL, outcome_detail TEXT NOT NULL, gap_vs_close REAL, gap_vs_cap REAL,
   assumed_fill_price INTEGER, assumed_fill_rule TEXT, body_json TEXT, run_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
@@ -162,7 +165,7 @@ def parse_trade(body: dict, day: date) -> dict:
     t, price = _hms(day, row.get("tm")), _abs_int(row.get("cur_prc"))
     if t is None or price is None:
         raise ValueError(f"체결 시각·가격 형식 오류: tm={row.get('tm')!r} cur_prc={row.get('cur_prc')!r}")
-    return {"source_time": t, "source_price": price, "source_exchange": row.get("stex_tp") or "KRX",
+    return {"trade_time": t, "trade_price": price, "trade_exchange": row.get("stex_tp") or "KRX",
             "first_row": row}
 
 
@@ -291,6 +294,20 @@ class OpenCheckStore:
                                     f"({', '.join('?' * len(cols))})", [row[c] for c in cols])
         return cur.rowcount == 1
 
+    def get_check(self, set_id: str, symbol: str, kind: str) -> dict | None:
+        r = self.conn.execute("SELECT * FROM price_check WHERE set_id=? AND symbol=? AND check_kind=?",
+                              (set_id, symbol, kind)).fetchone()
+        return None if r is None else dict(r)
+
+    def update_extras(self, set_id: str, symbol: str, kind: str, values: dict) -> bool:
+        """보조 조회 결과를 기본 가격 행에 덧붙임. 아직 '보조 조회 대기'인 행만 바꿈(한 번만)."""
+        cols = list(values)
+        with self.tx():
+            cur = self.conn.execute(
+                f"UPDATE price_check SET {', '.join(f'{c}=?' for c in cols)} WHERE set_id=? AND symbol=?"
+                f" AND check_kind=? AND extra_json=?", [values[c] for c in cols] + [set_id, symbol, kind, EXTRAS_PENDING])
+        return cur.rowcount == 1
+
     def begin_run(self, day: date, kind: str, active_contract: str, started_at: datetime) -> tuple[str, list[str]]:
         """(실행 ID, 정리한 이전 실행). 끝나지 않은 이전 실행은 ABORTED로 정리하고 새 실행을 RUNNING으로.
         실행 ID = 대상일·확인 종류·시도 번호(같은 트랜잭션에서 DB가 발급) — 같은 초에 다시 실행해도 겹치지 않음 (A5-R3)."""
@@ -326,7 +343,7 @@ def select_candidates(sstore: ScanStore, rstore: ResearchStore, cal: TradingCale
     """D의 후보 (확정 전 계산). 같은 입력이면 언제 고르든 같음 — 개장 전에 **실제로 저장이 끝난** 스캔만 쓰기 때문.
 
     원천 실행 조건(A5-R1): COMPLETE · 대상 계약 · 지정한 평가 시각(scan_at) < D 개장 · **저장 완료 시각 < D 개장**.
-    저장 완료 시각 = committed_at(커밋 뒤 초 올림). 그 값이 없는 이전 실행은 finished_at + 1시간을 상한으로(보수적).
+    저장 완료 시각 = committed_at(커밋 뒤 초 올림). 그 값이 없는 실행은 입증할 수 없어 제외(finished_at으로 추정하지 않음).
     개장 뒤에 과거 시각으로 계산·저장한 실행은 scan_at이 개장 전이어도 후보 원천이 아님. 대표 기록의 run_id도
     이 조건을 만족하는 실행이어야 함."""
     t = cal.previous_trading_day(day)
@@ -383,10 +400,9 @@ def commit_bound(run: dict) -> tuple[str | None, str]:
     """실행의 저장 완료 시각 상한(이보다 늦게 저장됐을 수 없음)과 근거."""
     if run.get("committed_at"):
         return run["committed_at"], "COMMITTED_AT"
-    if run.get("finished_at"):
-        return (_ts(datetime.fromisoformat(run["finished_at"]) + LEGACY_COMMIT_MARGIN),
-                "LEGACY_FINISHED_AT+1h(커밋 시각 기록 전 실행)")
-    return None, "UNKNOWN"
+    # 커밋 시각을 기록하기 전 실행(s4 이전)·커밋 시각 기록 전에 끝난 실행 — 저장 완료 시각을 입증할 수 없음.
+    # finished_at(저장 트랜잭션 시작)에 여유를 더해 입증된 것처럼 쓰지 않음 (GPT 재검토)
+    return None, "UNPROVEN(커밋 시각 미기록)"
 
 
 # ── 확인 실행 ────────────────────────────────────────────────────
@@ -433,9 +449,17 @@ class OpenChecker:
                 self.log(f"[A5] {note}")
             close = self.close_at(day)
             for c in self.ostore.candidates(cset["set_id"]):
-                if self.ostore.has_check(cset["set_id"], c["symbol"], self.kind):
+                old = self.ostore.get_check(cset["set_id"], c["symbol"], self.kind)
+                if old is not None:
+                    if old["extra_json"] == EXTRAS_PENDING:    # 이전 실행이 보조 조회 중 끊김 — 늦게 다시 조회하지 않음
+                        self.ostore.update_extras(cset["set_id"], c["symbol"], self.kind,
+                                                  {"extra_json": EXTRAS_INTERRUPTED})
                     continue
-                self.ostore.record_check(self._check_one(cset, c, target, close, client, now, run_id))
+                row = self._check_one(cset, c, target, close, client, now, run_id)
+                self.ostore.record_check(row)                  # 기본 가격 먼저 저장(한 트랜잭션)
+                if row["extra_json"] == EXTRAS_PENDING:
+                    self.ostore.update_extras(cset["set_id"], c["symbol"], self.kind,
+                                              self._extras(c["symbol"], target.date(), close, client, now))
             checks = self.ostore.checks(cset["set_id"], self.kind)
             counts = {"candidates": cset["count"], "checked": len(checks),
                       "timing": _tally(checks, "timing"), "fetch": _tally(checks, "fetch_status"),
@@ -502,8 +526,7 @@ class OpenChecker:
             return {**row, "fetch_status": PARSE_FAILED, "error": str(exc)[:300], "outcome": PARSE_FAILED,
                     "outcome_detail": "응답에 필수 가격 필드 없음"}
         outcome, detail = evaluate(c, q)
-        row.update(self._extras(c["symbol"], target.date(), close, client, now))
-        return {**row, "fetch_status": FETCHED, "observed_price": q.price, "base_price": q.base, **q.optional,
+        return {**row, "extra_json": EXTRAS_PENDING, "fetch_status": FETCHED, "observed_price": q.price, "base_price": q.base, **q.optional,
                 "outcome": outcome, "outcome_detail": detail,
                 "gap_vs_close": None if not c["signal_close"] else round(q.price / c["signal_close"] - 1, 6),
                 "gap_vs_cap": None if not c["entry_cap"] else round(q.price / c["entry_cap"] - 1, 6),
@@ -514,7 +537,7 @@ class OpenChecker:
     def _extras(self, symbol: str, day: date, close: datetime, client, now) -> dict:
         """보조 조회(기록용): ka10003 최근 체결 시각·가격, ka10004 최우선 호가. 실패해도 판정에 영향 없음.
         마감이 지나면 요청하지 않고(SKIPPED_AFTER_CLOSE), 마감 뒤에 받은 응답은 값으로 쓰지 않음(RECEIVED_AFTER_CLOSE)."""
-        out: dict = {"recorded_at": _ts(now())}
+        out: dict = {}
         info: dict = {}
         for api_id, parse in ((TRADE_API_ID, parse_trade), (BOOK_API_ID, parse_book)):
             try:
@@ -536,16 +559,15 @@ class OpenChecker:
                 info[api_id] = {**entry, "status": PARSE_FAILED, "error": str(exc)[:200]}
                 continue
             if api_id == TRADE_API_ID:
-                out.update(source_time=_ts(p["source_time"]), source_price=p["source_price"],
-                           source_exchange=p["source_exchange"],
-                           source_lag_sec=int((b.requested_at - p["source_time"]).total_seconds()))
+                out.update(trade_time=_ts(p["trade_time"]), trade_price=p["trade_price"],
+                           trade_exchange=p["trade_exchange"],
+                           trade_lag_sec=int((b.requested_at - p["trade_time"]).total_seconds()))
                 entry["first_row"] = _redact(p["first_row"])
             else:
                 out.update(best_ask=p["best_ask"], best_bid=p["best_bid"], quote_time=_ts(p["quote_time"]))
                 entry["fields"] = p["fields"]
             info[api_id] = entry
         out["extra_json"] = json.dumps(info, ensure_ascii=False)
-        out["recorded_at"] = _ts(now())
         return out
 
 
@@ -579,7 +601,7 @@ def build_markdown(res: dict) -> str:
                      "-" if k["gap_vs_cap"] is None else f"{k['gap_vs_cap'] * 100:+.2f}%",
                      k["outcome"], k["timing"], k["requested_at"] or "-",
                      "-" if k["lateness_sec"] is None else str(k["lateness_sec"]),
-                     (k.get("source_time") or "-")[11:] or "-", _n(k.get("best_ask"))])
+                     (k.get("trade_time") or "-")[11:] or "-", _n(k.get("best_ask"))])
     if rows:
         head = ["종목", "이름", "관찰가", "기준가", "신호일 종가", "진입 상한", "참고 손절가", "상한 대비", "판정", "시각",
                 "요청 시각", "지연(초)", "최근 체결 시각", "최우선 매도호가"]

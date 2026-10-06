@@ -300,11 +300,11 @@ check("3-2) [GPT] 요청·수신 시각·시도 횟수·지연(초) 기록. 허�
 x0, x1 = json.loads(r0["extra_json"]), json.loads(R[PASS_CODES[1]]["extra_json"])
 check("3-2b) [GPT·10/2 실측] 원천 가격 시각: ka10001 바로 뒤 ka10003 최근 KRX 체결 tm·가격(지연 초), ka10004 호가 기준 시각·"
       "최우선 매도/매수호가 기록. 보조 조회가 실패해도 판정은 ka10001 기준 그대로(상태만 기록), 조회 실패·필드 없음엔 보조 조회 안 함",
-      r0["source_time"] == "2026-10-01T09:05:00" and r0["source_price"] == r0["observed_price"]
-      and r0["source_exchange"] == "KRX" and r0["source_lag_sec"] == 1
+      r0["trade_time"] == "2026-10-01T09:05:00" and r0["trade_price"] == r0["observed_price"]
+      and r0["trade_exchange"] == "KRX" and r0["trade_lag_sec"] == 1 and r0["source_time"] is None
       and r0["best_ask"] == r0["observed_price"] + 50 and r0["best_bid"] == r0["observed_price"]
       and r0["quote_time"] == "2026-10-01T09:05:02" and x0["ka10003"]["status"] == "OK" and x0["ka10004"]["status"] == "OK"
-      and R[PASS_CODES[1]]["outcome"] == "ABOVE_CAP" and R[PASS_CODES[1]]["source_time"] is None
+      and R[PASS_CODES[1]]["outcome"] == "ABOVE_CAP" and R[PASS_CODES[1]]["trade_time"] is None
       and R[PASS_CODES[1]]["best_ask"] is None and x1["ka10003"]["status"] == "FETCH_FAILED"
       and x1["ka10004"]["status"] == "PARSE_FAILED"
       and all(R[c]["extra_json"] is None for c in PASS_CODES[6:])
@@ -445,7 +445,7 @@ check("4-1) 시세 조회(fetch_body)는 ka10001만, 목록 조회(fetch_page)�
 
 # a1 DB(이전 버전 — 보조 조회 열 없음) → a2
 a1db = TMP / "old_a1.sqlite3"
-old_schema = A5._SCHEMA.replace(" source_price INTEGER,\n  source_exchange TEXT, source_lag_sec INTEGER, best_ask INTEGER,"
+old_schema = A5._SCHEMA.replace(" trade_time TEXT, trade_price INTEGER,\n  trade_exchange TEXT, trade_lag_sec INTEGER, best_ask INTEGER,"
                                 " best_bid INTEGER, quote_time TEXT, extra_json TEXT,\n  response_ms INTEGER,", "")
 con = sqlite3.connect(a1db)
 con.executescript(old_schema)
@@ -461,7 +461,7 @@ with A5.OpenCheckStore(a1db) as oa:
     old_row = oa.checks("a5_x")[0]
     ok_a2 = (oa.conn.execute("SELECT value FROM meta WHERE key='a5_schema'").fetchone()[0] == "a2"
              and oa.backup_path is not None and "best_ask" not in had
-             and {"source_price", "best_ask", "extra_json", "response_ms"} <= cols
+             and {"trade_time", "trade_price", "best_ask", "extra_json", "response_ms"} <= cols
              and old_row["outcome"] == "MISSED" and old_row["best_ask"] is None)
 with A5.OpenCheckStore(a1db) as oa:
     again_none = oa.backup_path is None
@@ -499,14 +499,10 @@ check("4b-2) [A5-R1] 대표 기록의 run_id도 개장 전 저장 실행이어�
       and [x["run_id"] for x in d_m["source"]["excluded_runs"]] == [post_l["run_id"]])
 ss_m.conn.execute("UPDATE scan_run SET committed_at=NULL WHERE run_id=?", (pre["run_id"],))       # 커밋 시각 기록 전 실행
 d_m2, c_m2 = A5.select_candidates(ss_m, st_m, CAL, D, sc_m.contract_hash)
-ss_m.conn.execute("UPDATE scan_run SET committed_at=NULL, finished_at='2026-10-01T08:30:00' WHERE run_id=?",
-                  (pre["run_id"],))
-d_m3, c_m3 = A5.select_candidates(ss_m, st_m, CAL, D, sc_m.contract_hash)
-check("4b-3) 커밋 시각이 없는 이전 실행은 finished_at + 1시간을 저장 완료 상한으로(보수적): 9/30 19:31 → 20:31 < 개장이면 포함, "
-      "10/1 08:30 → 09:30 ≥ 개장이면 제외. 근거를 후보 목록 원천에 기록",
-      len(c_m2) == 8 and d_m2["source"]["commit_basis"][pre["run_id"]]["basis"].startswith("LEGACY_FINISHED_AT+1h")
-      and d_m2["source"]["commit_basis"][pre["run_id"]]["commit_bound"] == "2026-09-30T20:31:00"
-      and d_m3["status"] == "NO_SCAN" and c_m3 == [])
+check("4b-3) [GPT 재검토] 커밋 시각이 없는 실행(finished_at 9/30 19:31이어도)은 저장 완료를 입증할 수 없어 후보 원천 아님 — "
+      "finished_at에 여유를 더해 입증된 것처럼 쓰지 않음, 제외 근거 기록",
+      d_m2["status"] == "NO_SCAN" and c_m2 == []
+      and {x["run_id"]: x["basis"] for x in d_m2["source"]["excluded_runs"]}[pre["run_id"]].startswith("UNPROVEN"))
 ss_m.close()
 st_m.close()
 ss_l.close()
@@ -587,6 +583,43 @@ row_d, sess_d, _ = single_check("r2d", Clock(datetime(2026, 10, 1, 15, 29, 58)),
 check("4b-7) 마감 직전 ka10001 정상 → 보조 조회는 호출 간격(1초) 대기 뒤 요청 직전이 마감이면 보내지 않음(SKIPPED_AFTER_CLOSE)",
       row_d["outcome"] == "WITHIN_CAP" and [p[0] for p in sess_d.posts] == ["ka10001"]
       and json.loads(row_d["extra_json"])["ka10003"]["status"] in ("SKIPPED_AFTER_CLOSE",))
+
+# 기본 가격 먼저 저장 — 보조 조회 중 중단돼도 보존 (GPT 재검토)
+class CrashOnTrade(FakePrice):
+    def fetch_body(self, api_id, payload, not_after=None):
+        if api_id == "ka10003" and payload["stk_cd"] == PASS_CODES[1]:
+            raise KeyboardInterrupt
+        return super().fetch_body(api_id, payload, not_after)
+
+
+os_x = A5.OpenCheckStore(TMP / "extra_crash_a5.sqlite3")
+st_x = ResearchStore(TMP / "main.sqlite3")
+ss_x = ScanStore(TMP / "main_scans.sqlite3")
+chk_x = A5.OpenChecker(os_x, ss_x, st_x, CAL, contract_hash=sc.contract_hash)
+clk_x = Clock(TARGET)
+f_x = CrashOnTrade(clk_x, {c: quote(int(L[c][0]) - 1, CLOSES[c]) for c in PASS_CODES})
+try:
+    chk_x.run(D, client=f_x, now=clk_x)
+    crashed_x = False
+except KeyboardInterrupt:
+    crashed_x = True
+saved = os_x.get_check("a5_2026-10-01", PASS_CODES[1], chk_x.kind)
+n_x = len(f_x.calls)
+f_x2 = FakePrice(clk_x, {c: quote(int(L[c][0]) - 1, CLOSES[c]) for c in PASS_CODES})
+res_x = chk_x.run(D, client=f_x2, now=clk_x)
+RX = {r["symbol"]: r for r in res_x["checks"]}
+check("4b-9) [GPT 재검토] 기본 가격(ka10001)을 먼저 저장 → 보조 조회(ka10003) 중 중단돼도 그 종목의 관찰가·판정·요청 시각 보존. "
+      "재시작하면 그 종목은 다시 조회하지 않고 보조 조회만 INTERRUPTED로 마감, 남은 종목만 조회",
+      crashed_x and saved is not None and saved["outcome"] == "WITHIN_CAP" and saved["observed_price"] is not None
+      and saved["extra_json"] == A5.EXTRAS_PENDING and saved["requested_at"] == "2026-10-01T09:05:03"
+      and RX[PASS_CODES[1]]["requested_at"] == "2026-10-01T09:05:03"
+      and json.loads(RX[PASS_CODES[1]]["extra_json"])["ka10003"]["status"] == "INTERRUPTED"
+      and RX[PASS_CODES[1]]["trade_time"] is None and RX[PASS_CODES[0]]["trade_time"] is not None
+      and not any(s_ == PASS_CODES[1] for _a, s_, _t in f_x2.calls) and len(RX) == 8
+      and all(RX[c]["outcome"] == "WITHIN_CAP" for c in PASS_CODES))
+os_x.close()
+ss_x.close()
+st_x.close()
 
 # R3: 같은 초에 다시 실행
 os_r3 = A5.OpenCheckStore(TMP / "r3_a5.sqlite3")
@@ -779,7 +812,7 @@ check("6-3) [10/2 실측 응답] ka10001 현재가 275,750(부호 '-'는 전일 
       "시각·가격 형식이 틀리거나 KRX 행이 없으면 원천 시각을 만들지 않음",
       (qr.price, qr.base, qr.optional["upper_limit"], qr.optional["lower_limit"], qr.optional["volume"])
       == (275750, 276000, 358500, 193500, 5158006) and qr.base - qr.price == 250
-      and tr["source_time"] == datetime(2026, 10, 2, 11, 40, 23) and tr["source_price"] == 275750
+      and tr["trade_time"] == datetime(2026, 10, 2, 11, 40, 23) and tr["trade_price"] == 275750
       and (bk["quote_time"], bk["best_ask"], bk["best_bid"]) == (datetime(2026, 10, 2, 11, 40, 24), 276000, 275500)
       and bad_tr == 7)
 
