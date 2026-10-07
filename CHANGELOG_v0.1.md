@@ -1305,4 +1305,40 @@ GPT 지시: 관심/수동 보유 분리, 최초 오류 시 감시 시작 안 함
 ### 전달 파일
 - 패치 0001 (feat: 지정 종목 설정·검증·준비), 0002 (docs) — 기준 `5edb518`
 
+## 2026-10-07 — 지정 종목 보완 W1-R1~R4 (GPT 재검토 `0fcfa15`)
+
+### 배경
+GPT가 3단계 상시 관리자 연결 전에 4건을 재현.
+- R1: YAML을 직접 고쳐 보유를 지우면 APPLIED — 보유 감시가 사라짐.
+- R2: 새 목록의 투자경고가 진입 관찰에 반영되지 않음(준비 기록의 옛 위험 값), 경고·목록 변화가 이력에서 생략.
+- R3: 기준일 봉 거래량 0도 READY(S1은 NO_TRADES_AT_T로 보류).
+- R4: 인코딩·권한 오류가 예외로 터져 마지막 정상 설정으로 복구되지 않음.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `infra/watch/manager.py` | `holding_guard`: 마지막 정상 설정의 수동 보유가 사라지면 같은 값의 청산 기록이 있을 때만 적용, 아니면 REJECTED. `refresh_risk`: 설정을 읽을 때마다 최신 목록으로 위험 자격 갱신. 준비 상태를 가격 데이터(status)와 S1 분석(analysis_status — `SeriesView.window` 계약)으로 분리. `entry_gate`에 위험 자격·목록 스냅숏·분석 준비 반영. `read_config_text`: UnicodeError·OSError를 설정 오류로 |
+| `infra/watch/store.py` | 스키마 wa2(wa1은 백업 후 이전): `holding_close`(OPEN/USED/VOID), `symbol_risk`·`symbol_risk_log`, `config_check`(목록이 바뀐 재검증), readiness·log에 분석 준비 열. 설정 기록 중복 판단에 경고 포함 |
+| `tools/watchlist.py` | 공통 파일 읽기, `holding-close`가 청산 기록 후 적용, status에 가격 데이터·S1 분석·위험 자격(목록 스냅숏 기준) 열 |
+| `test_watchlist.py` | 25 → 33건 |
+| 문서 | `docs/watchlist.md` |
+
+### 테스트 및 검증
+- 수정 전 코드(`fe04b30`)에서 4건 모두 재현: R1 보유 삭제 APPLIED·감시 대상에서 빠짐, R2 투자경고 뒤 진입 관찰 가능, R3 거래량 0 기준일 READY·가능,
+  R4 `UnicodeDecodeError`. 수정 후: R1 REJECTED·보유 유지, R2 RISK_FLAGS 차단, R3 S1 분석 HOLD(NO_TRADES_AT_T), R4 REJECTED·마지막 정상 유지.
+- 새 검사 8건: 6-1~6-3 보유 보호·청산 기록 USED/VOID, 6-4~6-5 prepare 없이 위험 차단·위험 이력·재검증 기록·RISK_STALE,
+  6-6 NO_TRADES_AT_T·창 안 NO_TRADES·DATA_GAP(보유 가격 감시는 유지), 6-7 최초·운영 중 인코딩·읽기 오류, 6-8 wa1 → wa2 이전.
+- 변이 확인 8종(보유 보호·청산 무효화·위험 갱신·위험 차단·경고 변화·분석 창·인코딩·OSError) 모두 잡힘.
+- 회귀 32개 파일·수집 120(실측 원문 포함)·스캔 56·A5 45·지정 종목 33·단타 동등성 18/18. `git status` 깨끗.
+
+### 변경하지 않은 것
+- 연구 수집·S1 스캔·A5, 주문 경로. 160봉 기본값(S1_BASE). 연구 DB 삭제·재수집 없음.
+
+### 다음 작업
+- 3단계 조회 전용 상시 실행 관리자(재시작 후 이어서, 중복 실행 잠금, 수집 중 보유 가격 감시 지속, 기존 스케줄러 정리).
+- 연초·긴 지표 대비 이전 연도 거래일 달력 확보.
+
+### 전달 파일
+- 패치 0001 (fix: W1-R1~R4), 0002 (docs) — 기준 `0fcfa15`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
