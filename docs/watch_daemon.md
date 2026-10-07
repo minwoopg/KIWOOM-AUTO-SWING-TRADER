@@ -52,7 +52,13 @@
   S1 `committed_at`과 같은 방식)을 따로 가짐. 개장 후보에 쓰는 개장 전 근거는 **둘 다 개장 전**이어야 함(같은 초 경계 09:00:00도 아님).
   커밋 뒤 시각을 적기 전에 강제 종료한 행은 NULL = 저장 완료 증거 없음. 개장 전이면 관리자가 그런 행을 다시 판정해 새 근거를 남김.
   관리자 DB wd2 → wd3: `candidate_gate.committed_at` 열만 더하고 이전 행은 NULL로 둠(evaluated_at으로 추정하지 않음) — 업그레이드가
-  개장 뒤라 다시 판정하지 못한 그날 후보는 근거 없음으로 제외(보수적).
+  개장 뒤라 다시 판정하지 못한 그날 후보는 근거 없음으로 제외(보수적). 올리기 전에 복구용 사본 `<DB>.bak-<이전 스키마>-<시각>`을
+  SQLite 백업 API로 남기고 경로를 `meta.upgrade_backup`에 기록 — 이전 코드로 돌아가야 하면 이 사본을 씀(열이 추가된 원본을 되돌려
+  쓰지 않음).
+- **이미 확정된 후보의 재개에도 같은 개장 전 근거 검사 (R7)**: 재개 판정(`RESUME`)은 지금 자격만이 아니라 원래 후보(신호일·확정
+  계약·종목·대상 개장)의 개장 전 SCAN 근거 — 판정·저장 완료 모두 개장 전 — 도 확인. 이전 형식 DB에서 확정된 후보를 개장 뒤 올려
+  재개하면 근거의 저장 완료 시각이 없으므로 `NO_GATE_EVIDENCE`로 조회하지 않음(`source.gate`가 있다는 것만으로 통과시키지 않음).
+  이미 저장된 가격은 그대로.
 
 ## 작업 키·상태·재시도
 - task_key = `CLOSE_PREP|D|scope:v2:<해시>` / `OPEN_CHECK|D|OPEN+5m`. CLOSE_PREP 범위(W2 검토 R4)는 결과를 바꾸는 것만 넣음:
@@ -202,11 +208,18 @@ python tools/watch_daemon.py status --json > exports\watch_$d\status.json    # �
 python tools/watchlist.py status > exports\watch_$d\watchlist_status.txt
 Copy-Item logs\watch_daemon.log exports\watch_$d\ -ErrorAction SilentlyContinue
 Copy-Item -Recurse reports\watch exports\watch_$d\reports -ErrorAction SilentlyContinue
-Copy-Item data\watch\daemon.sqlite3 exports\watch_$d\ -ErrorAction SilentlyContinue   # 작업·게이트·호출 수(계좌 정보 없음)
-Select-String -Path exports\watch_$d\* -Pattern "token|appkey|secret|acnt" -SimpleMatch | Select-Object -First 20   # 가려졌는지(***) 확인
+python tools/watch_daemon.py export-db --out exports\watch_$d\db           # 관리자·S1 관찰·개장 확인 DB 사본(SQLite 백업 API)
+# 지정 단어가 든 줄을 찾아 눈으로 확인하는 보조 수단 — 결과가 없다고 민감정보가 없다는 자동 판정은 아님
+Get-ChildItem "exports\watch_$d" -Recurse -File |
+    Where-Object { $_.Extension -in '.log', '.txt', '.json', '.md' } |
+    Select-String -Pattern 'token', 'appkey', 'secret', 'acnt' -SimpleMatch |
+    Select-Object -First 20
 Compress-Archive -Force exports\watch_$d exports\watch_bundle_$d.zip
 ```
-- `.env`·`config/watchlist.yaml`(수동 보유 값)은 번들에 넣지 않음. 필요하면 `watchlist.py status` 출력만.
+- `.env`·`config/watchlist.yaml`(수동 보유 값)·감시 설정 DB(`watch.sqlite3`)·장기 연구 DB는 번들에 넣지 않음. 필요하면
+  `watchlist.py status` 출력만.
+- `export-db`는 파일마다 일관된 사본(실행 중이어도)이고 복사 시각을 `export_db.json`에 남김. 세 사본이 **같은 시점**이라는 보장은
+  없음 — 같은 시점이 필요하면 `stop` → status '중지됨' 확인 → `export-db` → 다시 `run`.
 - 실행 옵션(상한·예약·poll·완성 지연·개장 offset)·달력 버전·스키마는 관리자 시작 로그 줄에, 계약·설정 버전·게이트 사유(SCAN·OPEN·
   RESUME)·호출 수는 `daemon.sqlite3`(task·candidate_gate·call_usage)와 일일 보고서에 있음.
 
