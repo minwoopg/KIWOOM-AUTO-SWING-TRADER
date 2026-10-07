@@ -33,7 +33,13 @@ from __future__ import annotations
   GPT 지시). ka10001의 source_time은 원천에 시각 필드가 없어 비워 둠.
 - ka10004(주식호가, 보조): bid_req_base_tm(호가 기준 시각)·sel_fpr_bid(최우선 매도호가)·buy_fpr_bid(최우선 매수호가).
 - 보조 조회는 판정·가정 체결가격에 쓰지 않는 기록용 — 실패해도 ka10001 판정은 그대로, 상태는 extra_json에.
-저장: data/research/a5_checks.sqlite3(수집·관찰 DB와 별도 파일). 스키마 a2(a1 DB는 열 때 백업 후 열 추가).
+저장: data/research/a5_checks.sqlite3(수집·관찰 DB와 별도 파일). 스키마 a3.
+- 이전(a1·a2 → a3, 열 때 백업 후 한 번 — GPT 재검토 0e494dd P1): `53e56e5` a2는 ka10003 최근 체결을 source_time·
+  source_price·source_exchange·source_lag_sec에 저장했음 → 새 trade_* 열로 옮김. 근거(extra_json의 ka10003 OK
+  응답 첫 행 tm·cur_prc가 저장값과 일치)가 있을 때만 옮기고(trade_basis=LEGACY_KA10003), 근거가 없으면 값을
+  legacy_json·옛 열에 그대로 두고 trade_basis=UNKNOWN. 어느 경우든 source_time은 비움 — 이제 source_time은
+  ka10001 가격의 원천 시각 자리(원천에 없어 항상 비어 있음)라 옛 체결 시각이 그것으로 오해되지 않게.
+  후보·기본 가격·판정·가정 체결 등 다른 열은 바꾸지 않음. 옛 열(source_price 등)은 지우지 않고 그대로 둠.
 """
 
 import json
@@ -50,13 +56,17 @@ from infra.research.scan_store import ScanStore
 from infra.research.store import ResearchStore, sqlite_backup
 from utils.trading_calendar import TradingCalendar
 
-A5_SCHEMA = "a2"
+A5_SCHEMA = "a3"
 PRICE_API_ID = "ka10001"
 TRADE_API_ID = "ka10003"            # 체결정보 — 원천 가격 시각
 BOOK_API_ID = "ka10004"             # 주식호가 — 최우선 호가
 EXTRA_COLUMNS = (("trade_time", "TEXT"), ("trade_price", "INTEGER"), ("trade_exchange", "TEXT"), ("trade_lag_sec", "INTEGER"),
                  ("best_ask", "INTEGER"), ("best_bid", "INTEGER"), ("quote_time", "TEXT"), ("extra_json", "TEXT"),
-                 ("response_ms", "INTEGER"))
+                 ("response_ms", "INTEGER"), ("trade_basis", "TEXT"))
+# trade_basis: 체결 시각·가격(trade_*)의 근거 — 이 코드가 ka10003에서 직접 / a2에서 근거 확인 후 옮김 / 근거 불명
+TRADE_KA10003, TRADE_LEGACY_KA10003, TRADE_UNKNOWN = "KA10003", "LEGACY_KA10003", "UNKNOWN"
+LEGACY_SOURCE_COLUMNS = ("source_time", "source_price", "source_exchange", "source_lag_sec")   # a2(53e56e5)의 ka10003 값
+MIGRATION_COLUMNS = EXTRA_COLUMNS + (("legacy_json", "TEXT"),)
 SELECTION_RULE = "signal_date=D 직전 거래일 · contract=대상 계약 · PASS · final=1 · actionable=1 · scan_at < D 개장"
 ASSUMED_FILL_RULE = "OBSERVED_PRICE_AT_CHECK(가정 — 실제 체결 아님)"
 ON_TIME, LATE_RESPONSE, LATE, MISSED, AFTER_CLOSE = "ON_TIME", "LATE_RESPONSE", "LATE", "MISSED", "AFTER_CLOSE"
@@ -91,7 +101,7 @@ CREATE TABLE IF NOT EXISTS price_check(
   observed_price INTEGER, base_price INTEGER, open_price INTEGER, high_price INTEGER, low_price INTEGER,
   upper_limit INTEGER, lower_limit INTEGER, volume INTEGER, source_time TEXT, trade_time TEXT, trade_price INTEGER,
   trade_exchange TEXT, trade_lag_sec INTEGER, best_ask INTEGER, best_bid INTEGER, quote_time TEXT, extra_json TEXT,
-  response_ms INTEGER,
+  response_ms INTEGER, trade_basis TEXT, legacy_json TEXT,
   outcome TEXT NOT NULL, outcome_detail TEXT NOT NULL, gap_vs_close REAL, gap_vs_cap REAL,
   assumed_fill_price INTEGER, assumed_fill_rule TEXT, body_json TEXT, run_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
   PRIMARY KEY(set_id, symbol, check_kind)) WITHOUT ROWID;
@@ -169,6 +179,21 @@ def parse_trade(body: dict, day: date) -> dict:
             "first_row": row}
 
 
+def _trade_evidence(extra_json, day: date, t: str | None, price) -> bool:
+    """저장된 체결 시각·가격이 같은 행 extra_json의 ka10003 OK 응답 첫 행(tm·cur_prc)과 일치하는지 (a3 이전의 근거)."""
+    if t is None or price is None or not extra_json:
+        return False
+    try:
+        info = json.loads(extra_json)
+        k = info.get("ka10003") if isinstance(info, dict) else None
+        if not isinstance(k, dict) or k.get("status") != FETCHED or not isinstance(k.get("first_row"), dict):
+            return False
+        row = k["first_row"]
+        return _ts(_hms(day, row.get("tm"))) == t and _abs_int(row.get("cur_prc")) == price
+    except (ValueError, TypeError):
+        return False
+
+
 def parse_book(body: dict, day: date) -> dict:
     """ka10004 → 호가 기준 시각·최우선 매도/매수호가. 없으면 ValueError."""
     ask, bid, t = _abs_int(body.get("sel_fpr_bid")), _abs_int(body.get("buy_fpr_bid")), _hms(day, body.get("bid_req_base_tm"))
@@ -209,22 +234,64 @@ class OpenCheckStore:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
         self.backup_path: str | None = None
+        self.upgrade_summary: dict | None = None
         cur = self.conn.execute("SELECT value FROM meta WHERE key='a5_schema'").fetchone()
         if cur is None:
             self.conn.execute("INSERT INTO meta(key, value) VALUES('a5_schema', ?)", (A5_SCHEMA,))
-        elif cur[0] == "a1":
-            self.backup_path = sqlite_backup(self.conn, self.path, "a1")
-            self._upgrade_a1_to_a2()
+        elif cur[0] in ("a1", "a2"):
+            self.backup_path = sqlite_backup(self.conn, self.path, cur[0])
+            self._upgrade_to_a3(cur[0])
         elif cur[0] != A5_SCHEMA:
             raise RuntimeError(f"A5 기록 저장소 스키마 {cur[0]} ≠ {A5_SCHEMA}: {self.path}")
 
-    def _upgrade_a1_to_a2(self) -> None:
-        """보조 조회(체결 시각·호가) 열 추가. 기존 행은 비워 둠(그때 조회하지 않았음)."""
+    def _upgrade_to_a3(self, old: str) -> None:
+        """a1·a2 → a3 (한 트랜잭션). 열 추가 후 옛 체결 값을 근거가 있을 때만 trade_*로 옮김 — 모듈 설명 참고."""
         with self.tx():
             cols = {r[1] for r in self.conn.execute("PRAGMA table_info(price_check)")}
-            for name, typ in EXTRA_COLUMNS:
+            for name, typ in MIGRATION_COLUMNS:
                 if name not in cols:
                     self.conn.execute(f"ALTER TABLE price_check ADD COLUMN {name} {typ}")
+            legacy = [c for c in LEGACY_SOURCE_COLUMNS if c in cols]
+            tally = {"rows": 0, "moved_to_trade": 0, "unknown": 0, "ka10003": 0, "unchanged": 0}
+            for r in self.conn.execute(
+                    f"SELECT set_id, symbol, check_kind, target_at, extra_json, trade_time, trade_price, trade_basis,"
+                    f" {', '.join(legacy)} FROM price_check").fetchall():
+                tally["rows"] += 1
+                key = (r["set_id"], r["symbol"], r["check_kind"])
+                day = datetime.fromisoformat(r["target_at"]).date()
+                if r["trade_time"] is not None and r["trade_basis"] is None:
+                    # 0e494dd 코드(스키마 표시는 a2)가 이미 trade_*에 쓴 행 — 같은 근거 검사로 표시만
+                    ok = _trade_evidence(r["extra_json"], day, r["trade_time"], r["trade_price"])
+                    self.conn.execute("UPDATE price_check SET trade_basis=? WHERE set_id=? AND symbol=? AND check_kind=?",
+                                      (TRADE_KA10003 if ok else TRADE_UNKNOWN, *key))
+                    tally["ka10003" if ok else "unknown"] += 1
+                    continue
+                old_vals = {c: r[c] for c in legacy if r[c] is not None}
+                if not old_vals:
+                    tally["unchanged"] += 1
+                    continue
+                ok = ("source_price" in old_vals and r["trade_time"] is None
+                      and _trade_evidence(r["extra_json"], day, old_vals.get("source_time"), old_vals["source_price"]))
+                note = {"from": old, "values": old_vals,
+                        "verdict": "MOVED_TO_TRADE" if ok else "UNKNOWN",
+                        "reason": ("extra_json의 ka10003 OK 응답 첫 행 tm·cur_prc와 일치 — 최근 체결 값" if ok else
+                                   "ka10003 응답과 대조할 근거 없음 — 값만 보존, ka10001 원천 시각으로 쓰지 않음")}
+                if ok:
+                    self.conn.execute(
+                        "UPDATE price_check SET trade_time=?, trade_price=?, trade_exchange=?, trade_lag_sec=?,"
+                        " trade_basis=?, source_time=NULL, legacy_json=? WHERE set_id=? AND symbol=? AND check_kind=?",
+                        (old_vals.get("source_time"), old_vals["source_price"], old_vals.get("source_exchange"),
+                         old_vals.get("source_lag_sec"), TRADE_LEGACY_KA10003, json.dumps(note, ensure_ascii=False), *key))
+                    tally["moved_to_trade"] += 1
+                else:
+                    self.conn.execute(
+                        "UPDATE price_check SET trade_basis=?, source_time=NULL, legacy_json=?"
+                        " WHERE set_id=? AND symbol=? AND check_kind=?",
+                        (TRADE_UNKNOWN, json.dumps(note, ensure_ascii=False), *key))
+                    tally["unknown"] += 1
+            self.upgrade_summary = {"from": old, "to": A5_SCHEMA, **tally}
+            self.conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('a3_upgrade', ?)",
+                              (json.dumps(self.upgrade_summary, ensure_ascii=False),))
             self.conn.execute("UPDATE meta SET value=? WHERE key='a5_schema'", (A5_SCHEMA,))
 
     def close(self) -> None:
@@ -561,7 +628,8 @@ class OpenChecker:
             if api_id == TRADE_API_ID:
                 out.update(trade_time=_ts(p["trade_time"]), trade_price=p["trade_price"],
                            trade_exchange=p["trade_exchange"],
-                           trade_lag_sec=int((b.requested_at - p["trade_time"]).total_seconds()))
+                           trade_lag_sec=int((b.requested_at - p["trade_time"]).total_seconds()),
+                           trade_basis=TRADE_KA10003)
                 entry["first_row"] = _redact(p["first_row"])
             else:
                 out.update(best_ask=p["best_ask"], best_bid=p["best_bid"], quote_time=_ts(p["quote_time"]))
@@ -601,7 +669,7 @@ def build_markdown(res: dict) -> str:
                      "-" if k["gap_vs_cap"] is None else f"{k['gap_vs_cap'] * 100:+.2f}%",
                      k["outcome"], k["timing"], k["requested_at"] or "-",
                      "-" if k["lateness_sec"] is None else str(k["lateness_sec"]),
-                     (k.get("trade_time") or "-")[11:] or "-", _n(k.get("best_ask"))])
+                     _trade_cell(k), _n(k.get("best_ask"))])
     if rows:
         head = ["종목", "이름", "관찰가", "기준가", "신호일 종가", "진입 상한", "참고 손절가", "상한 대비", "판정", "시각",
                 "요청 시각", "지연(초)", "최근 체결 시각", "최우선 매도호가"]
@@ -610,6 +678,12 @@ def build_markdown(res: dict) -> str:
     else:
         lines.append("확인한 후보 없음")
     return "\n".join(lines) + "\n"
+
+
+def _trade_cell(k: dict) -> str:
+    if k.get("trade_basis") == TRADE_UNKNOWN:
+        return "UNKNOWN(근거 불명)"
+    return (k.get("trade_time") or "-")[11:] or "-"
 
 
 def _n(v) -> str:

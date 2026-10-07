@@ -443,30 +443,146 @@ check("4-1) 시세 조회(fetch_body)는 ka10001만, 목록 조회(fetch_page)�
       b.attempts == 2 and b.body["cur_prc"] == "+100" and b.requested_at < b.received_at and no_rc and blocked == 4
       and set(PRICE_API) == {"ka10001", "ka10003", "ka10004"} and set(RESEARCH_API) == {"ka10099", "ka10081", "ka20006"})
 
-# a1 DB(이전 버전 — 보조 조회 열 없음) → a2
-a1db = TMP / "old_a1.sqlite3"
-old_schema = A5._SCHEMA.replace(" trade_time TEXT, trade_price INTEGER,\n  trade_exchange TEXT, trade_lag_sec INTEGER, best_ask INTEGER,"
-                                " best_bid INTEGER, quote_time TEXT, extra_json TEXT,\n  response_ms INTEGER,", "")
-con = sqlite3.connect(a1db)
-con.executescript(old_schema)
-con.execute("INSERT INTO meta VALUES('a5_schema','a1')")
-con.execute("INSERT INTO price_check(set_id, symbol, check_kind, signal_id, target_at, timing, fetch_status, attempts,"
-            " error, outcome, outcome_detail, run_id, recorded_at) VALUES('a5_x','000100','OPEN+5m','s','t','MISSED',"
-            "'NOT_RUN',0,'','MISSED','x','r','t')")
-con.commit()
-con.close()
-had = {r[1] for r in sqlite3.connect(a1db).execute("PRAGMA table_info(price_check)")}
+# ── 4-1b~d. A5 저장소 이전 a1·a2 → a3 (GPT 재검토 0e494dd P1) ─────────
+# 옛 버전 price_check 정의를 그대로 옮겨 둠(9fc5637 = a1, 53e56e5 = a2). 다른 표는 현재와 같음.
+PC_HEAD = ("CREATE TABLE price_check(\n  set_id TEXT NOT NULL, symbol TEXT NOT NULL, check_kind TEXT NOT NULL, signal_id TEXT NOT NULL,\n"
+           "  target_at TEXT NOT NULL, requested_at TEXT, received_at TEXT, lateness_sec INTEGER, timing TEXT NOT NULL,\n"
+           "  fetch_status TEXT NOT NULL, attempts INTEGER NOT NULL, api_id TEXT, error TEXT NOT NULL,\n"
+           "  observed_price INTEGER, base_price INTEGER, open_price INTEGER, high_price INTEGER, low_price INTEGER,\n"
+           "  upper_limit INTEGER, lower_limit INTEGER, volume INTEGER, source_time TEXT,")
+PC_TAIL = ("\n  outcome TEXT NOT NULL, outcome_detail TEXT NOT NULL, gap_vs_close REAL, gap_vs_cap REAL,\n"
+           "  assumed_fill_price INTEGER, assumed_fill_rule TEXT, body_json TEXT, run_id TEXT NOT NULL, recorded_at TEXT NOT NULL,\n"
+           "  PRIMARY KEY(set_id, symbol, check_kind)) WITHOUT ROWID;")
+PC_A1 = PC_HEAD + PC_TAIL
+PC_A2_53E = PC_HEAD + (" source_price INTEGER,\n  source_exchange TEXT, source_lag_sec INTEGER, best_ask INTEGER, best_bid INTEGER,"
+                       " quote_time TEXT, extra_json TEXT,\n  response_ms INTEGER,") + PC_TAIL
+PC_A2_0E4 = PC_HEAD + (" trade_time TEXT, trade_price INTEGER,\n  trade_exchange TEXT, trade_lag_sec INTEGER, best_ask INTEGER,"
+                       " best_bid INTEGER, quote_time TEXT, extra_json TEXT,\n  response_ms INTEGER,") + PC_TAIL
+KEEP = ("signal_id", "target_at", "requested_at", "received_at", "timing", "fetch_status", "attempts", "observed_price",
+        "base_price", "volume", "best_ask", "best_bid", "quote_time", "extra_json", "outcome", "outcome_detail",
+        "gap_vs_cap", "assumed_fill_price", "assumed_fill_rule", "body_json", "run_id", "recorded_at")
+
+
+def old_db(name, pc_sql, version, rows):
+    path = TMP / name
+    con = sqlite3.connect(path)
+    con.executescript(pc_sql)
+    con.executescript(A5._SCHEMA)          # 나머지 표(IF NOT EXISTS — price_check는 위 옛 정의 유지)
+    con.execute("INSERT INTO meta VALUES('a5_schema', ?)", (version,))
+    con.execute("INSERT INTO candidate_set VALUES('a5_20261001','2026-10-01','2026-09-30','abc','OK','x',"
+                "'2026-10-01T09:00:00','2026-10-01T08:00:00','r','{}',1)")
+    for r in rows:
+        base = {"set_id": "a5_20261001", "check_kind": "OPEN+5m", "signal_id": "S1|" + r["symbol"],
+                "target_at": "2026-10-01T09:05:00", "timing": "ON_TIME", "fetch_status": "OK", "attempts": 1,
+                "error": "", "outcome": "WITHIN_CAP", "outcome_detail": "d", "run_id": "a5_20261001_open5m_a1",
+                "recorded_at": "2026-10-01T09:05:03"} | r
+        con.execute(f"INSERT INTO price_check({', '.join(base)}) VALUES({', '.join('?' * len(base))})", list(base.values()))
+    con.commit()
+    con.close()
+    return path
+
+
+def snap(path):
+    con = sqlite3.connect(path)
+    con.row_factory = sqlite3.Row
+    out = {r["symbol"]: {k: r[k] for k in KEEP if k in r.keys()} for r in con.execute("SELECT * FROM price_check")}
+    cs = [tuple(r) for r in con.execute("SELECT * FROM candidate_set")]
+    con.close()
+    return out, cs
+
+
+def x3(tm, prc):
+    return json.dumps({"ka10003": {"status": "OK", "requested_at": "2026-10-01T09:05:02",
+                                   "first_row": {"tm": tm, "cur_prc": prc, "stex_tp": "KRX"}},
+                       "ka10004": {"status": "OK"}}, ensure_ascii=False)
+
+
+# a1: 보조 조회 열 없음 — 행 하나는 (a1 코드는 쓰지 않았지만) source_time이 채워진 근거 불명 값
+a1db = old_db("old_a1.sqlite3", PC_A1, "a1", [
+    {"symbol": "000100", "timing": "MISSED", "fetch_status": "NOT_RUN", "attempts": 0, "outcome": "MISSED"},
+    {"symbol": "000110", "observed_price": 1000, "source_time": "2026-10-01T09:04:00"}])
+before_a1 = snap(a1db)
 with A5.OpenCheckStore(a1db) as oa:
     cols = {r[1] for r in oa.conn.execute("PRAGMA table_info(price_check)")}
-    old_row = oa.checks("a5_x")[0]
-    ok_a2 = (oa.conn.execute("SELECT value FROM meta WHERE key='a5_schema'").fetchone()[0] == "a2"
-             and oa.backup_path is not None and "best_ask" not in had
-             and {"trade_time", "trade_price", "best_ask", "extra_json", "response_ms"} <= cols
-             and old_row["outcome"] == "MISSED" and old_row["best_ask"] is None)
+    R1 = {r["symbol"]: r for r in oa.checks("a5_20261001")}
+    sm1 = oa.upgrade_summary
+    ok_a1 = (oa.conn.execute("SELECT value FROM meta WHERE key='a5_schema'").fetchone()[0] == "a3"
+             and oa.backup_path is not None and {c for c, _ in A5.MIGRATION_COLUMNS} <= cols
+             and R1["000100"]["outcome"] == "MISSED" and R1["000100"]["trade_basis"] is None
+             and R1["000100"]["legacy_json"] is None
+             and R1["000110"]["source_time"] is None and R1["000110"]["trade_time"] is None
+             and R1["000110"]["trade_basis"] == "UNKNOWN"
+             and json.loads(R1["000110"]["legacy_json"])["values"] == {"source_time": "2026-10-01T09:04:00"})
 with A5.OpenCheckStore(a1db) as oa:
-    again_none = oa.backup_path is None
-check("4-1b) A5 기록 저장소 a1 → a2: 백업 후 보조 조회 열 추가, 기존 기록 그대로(보조 값 비움), 다시 열면 백업 없음",
-      ok_a2 and again_none and len(list(TMP.glob("old_a1.sqlite3.bak-a1-*"))) == 1)
+    again_none = oa.backup_path is None and oa.upgrade_summary is None
+check("4-1b) A5 저장소 a1 → a3: 백업 후 열 추가, 기존 판정·가격 그대로. 근거 없는 source_time은 값 보존(legacy_json)·"
+      "UNKNOWN 표시·source_time 비움. 다시 열면 백업·이전 없음",
+      ok_a1 and again_none and all({k: v for k, v in snap(a1db)[0][s_].items() if k in before_a1[0][s_]} == before_a1[0][s_]
+                                for s_ in before_a1[0]) and snap(a1db)[1] == before_a1[1] and len(list(TMP.glob("old_a1.sqlite3.bak-a1-*"))) == 1
+      and sm1 == {"from": "a1", "to": "a3", "rows": 2, "moved_to_trade": 0, "unknown": 1, "ka10003": 0,
+                  "unchanged": 1})
+
+# a2(53e56e5): ka10003 최근 체결을 source_*에 저장했던 DB
+OK_ROW = {"symbol": "000100", "observed_price": 72400, "base_price": 72000, "best_ask": 72600, "best_bid": 72400,
+          "quote_time": "2026-10-01T09:05:02", "assumed_fill_price": 72400, "assumed_fill_rule": A5.ASSUMED_FILL_RULE,
+          "source_time": "2026-10-01T09:04:59", "source_price": 72500, "source_exchange": "KRX", "source_lag_sec": 3,
+          "extra_json": x3("090459", "+72500"), "gap_vs_cap": -0.01}
+a2db = old_db("old_a2.sqlite3", PC_A2_53E, "a2", [
+    OK_ROW,
+    {"symbol": "000200", "observed_price": 50000, "source_time": "2026-10-01T09:04:58", "source_price": 50000,
+     "source_exchange": "KRX", "source_lag_sec": 4, "extra_json": x3("090458", "+50100"), "outcome": "ABOVE_CAP"},
+    {"symbol": "000300", "observed_price": 30000, "source_time": "2026-10-01T09:04:57", "source_price": 30000,
+     "source_exchange": "KRX", "source_lag_sec": 5, "outcome": "BELOW_STOP"},
+    {"symbol": "000400", "fetch_status": "FETCH_FAILED", "outcome": "FETCH_FAILED", "error": "HTTP 500",
+     "extra_json": json.dumps({"ka10003": {"status": "FETCH_FAILED"}})}])
+before_a2 = snap(a2db)
+with A5.OpenCheckStore(a2db) as oa:
+    R2 = {r["symbol"]: r for r in oa.checks("a5_20261001")}
+    sm2, bk2 = oa.upgrade_summary, oa.backup_path
+    m = R2["000100"]
+    moved = (m["trade_time"] == "2026-10-01T09:04:59" and m["trade_price"] == 72500 and m["trade_exchange"] == "KRX"
+             and m["trade_lag_sec"] == 3 and m["trade_basis"] == "LEGACY_KA10003" and m["source_time"] is None
+             and m["source_price"] == 72500 and json.loads(m["legacy_json"])["verdict"] == "MOVED_TO_TRADE")
+    unk = all(R2[s_]["trade_time"] is None and R2[s_]["trade_price"] is None and R2[s_]["trade_basis"] == "UNKNOWN"
+              and R2[s_]["source_time"] is None and R2[s_]["source_price"] == p_
+              and json.loads(R2[s_]["legacy_json"])["values"]["source_price"] == p_
+              for s_, p_ in (("000200", 50000), ("000300", 30000)))
+    untouched = R2["000400"]["trade_basis"] is None and R2["000400"]["legacy_json"] is None
+    cells = [A5._trade_cell(R2[s_]) for s_ in ("000100", "000200", "000400")]
+    # 이전 뒤 새 기록(기본 가격 먼저 → 보조 조회 덧붙임)이 그대로 동작 — 이전에는 trade_time 열이 없어 OperationalError
+    newrow = {**{k: None for k in R2["000400"] if k not in ("source_price", "source_exchange", "source_lag_sec")},
+              **{k: R2["000100"][k] for k in ("set_id", "check_kind", "signal_id", "target_at", "timing", "fetch_status",
+                                               "attempts", "error", "outcome", "outcome_detail", "run_id", "recorded_at")},
+              "symbol": "000500", "observed_price": 9000, "extra_json": A5.EXTRAS_PENDING}
+    wrote = oa.record_check(newrow) and oa.update_extras(
+        "a5_20261001", "000500", "OPEN+5m",
+        {"trade_time": "2026-10-01T09:05:01", "trade_price": 9010, "trade_exchange": "KRX", "trade_lag_sec": 1,
+         "trade_basis": A5.TRADE_KA10003, "extra_json": x3("090501", "9010")})
+    n5 = oa.get_check("a5_20261001", "000500", "OPEN+5m")
+with A5.OpenCheckStore(a2db) as oa:
+    again2 = oa.backup_path is None and oa.upgrade_summary is None and len(oa.checks("a5_20261001")) == 5
+after_a2 = snap(a2db)
+check("4-1c) [GPT 0e494dd P1] A5 저장소 a2(53e56e5) → a3: 백업 후 이전. ka10003 응답 첫 행과 일치하는 source_*만 trade_*로 "
+      "옮김(LEGACY_KA10003), 불일치·근거 없음은 값 보존·UNKNOWN, source_time은 모두 비움. 후보·기본 가격·판정·가정 체결 그대로, "
+      "이전 뒤 새 기록 성공, 다시 열면 이전 없음",
+      bk2 is not None and "bak-a2-" in bk2 and moved and unk and untouched
+      and sm2 == {"from": "a2", "to": "a3", "rows": 4, "moved_to_trade": 1, "unknown": 2, "ka10003": 0, "unchanged": 1}
+      and cells == ["09:04:59", "UNKNOWN(근거 불명)", "-"]
+      and wrote and n5["trade_time"] == "2026-10-01T09:05:01" and n5["trade_basis"] == "KA10003" and again2
+      and {k: v for k, v in after_a2[0].items() if k != "000500"} == before_a2[0] and after_a2[1] == before_a2[1])
+
+# a2 표시인데 이미 trade_* 열인 DB(0e494dd 코드가 새로 만든 경우) — 열만 추가하고 근거 표시
+a2bdb = old_db("old_a2b.sqlite3", PC_A2_0E4, "a2", [
+    {"symbol": "000100", "observed_price": 72400, "trade_time": "2026-10-01T09:04:59", "trade_price": 72500,
+     "trade_exchange": "KRX", "trade_lag_sec": 3, "extra_json": x3("090459", "+72500")},
+    {"symbol": "000200", "observed_price": 50000, "extra_json": A5.EXTRAS_INTERRUPTED}])
+with A5.OpenCheckStore(a2bdb) as oa:
+    R3 = {r["symbol"]: r for r in oa.checks("a5_20261001")}
+    sm3 = oa.upgrade_summary
+check("4-1d) a2 표시·trade_* 열(0e494dd) DB → a3: 값은 그대로, 근거가 맞는 체결 값은 KA10003 표시, 보조 조회 중단 행은 그대로",
+      R3["000100"]["trade_basis"] == "KA10003" and R3["000100"]["trade_time"] == "2026-10-01T09:04:59"
+      and R3["000200"]["trade_basis"] is None and R3["000200"]["extra_json"] == A5.EXTRAS_INTERRUPTED
+      and sm3 == {"from": "a2", "to": "a3", "rows": 2, "moved_to_trade": 0, "unknown": 0, "ka10003": 1, "unchanged": 1})
 
 # ── 4b. GPT 재검토 14eb8c0 A5-R1~R3 ─────────────────────────
 # R1: 개장 뒤에 과거 시각(scan_at 9/30 19:30)으로 계산·저장한 실행은 후보 원천이 아님

@@ -238,6 +238,8 @@ def run_open_check(args, store: ResearchStore, calendar: TradingCalendar, client
     with ScanStore(_scan_db(args)) as sstore, A5.OpenCheckStore(a5_db) as ostore:
         if ostore.backup_path:
             print(f"[A5 기록 저장소 스키마 변경] 바꾸기 전 백업: {ostore.backup_path}")
+        if ostore.upgrade_summary:
+            print(f"[A5 기록 저장소 이전] {json.dumps(ostore.upgrade_summary, ensure_ascii=False)}")
         checker = A5.OpenChecker(ostore, sstore, store, calendar, contract_hash=chash,
                                  offset_min=settings.open_check.offset_min,
                                  on_time_tolerance_sec=settings.open_check.on_time_tolerance_sec, log=print)
