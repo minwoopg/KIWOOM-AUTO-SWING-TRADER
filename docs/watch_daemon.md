@@ -42,6 +42,17 @@
 - 이전 형식: 게이트 근거가 없는 관찰은 `NO_GATE_EVIDENCE`로 제외(유효로 추정하지 않음). 이 판 전에 게이트 없이 이미 확정된 개장 후보
   목록은 그대로 두되 `LEGACY_NO_EVIDENCE`로 표시하고 가격 조회 안 함(운영 표본으로 쓰지 않음).
 - 연구 CLI(`research_collect.py open-check`)의 A5는 게이트 없이 이전과 같음(전체 시장 연구 기록).
+- **재시도·재기동 때도 현재 자격 확인 (W2 재검토 R6)**: 개장 확인이 확정된 후보 목록을 다시 쓸 때(양보 뒤 재시도·강제 종료 뒤
+  재기동), 가격 조회 전에 **아직 기본 가격이 없는 후보**만 지금 상태로 다시 판정해 `RESUME` 근거(사유 `CURRENT:…`·설정 버전·판정
+  시각·A5 실행 ID)를 따로 남김. 부적격이면 그 실행에서 조회하지 않음. 한 번 제외한 후보는 그날 다시 넣지 않음(`EXCLUDED_EARLIER`).
+  확정 목록·계산 PASS·이미 저장한 가격은 바꾸지 않고, 기본 가격 뒤 끊긴 보조 조회는 기존대로 INTERRUPTED(다시 조회 안 함).
+  작업 detail `current_gate`·일일 보고서 '마지막 실행 시점 자격'·A5 보고서 '이번 실행 시점 운영 자격 없음'에 표시 — 후보 확정 때
+  OPEN 통과만으로 지금 유효하다고 쓰지 않음. 이번 실행에서 막 확정한 목록이면 확정 직전 판정과 같은 상태라 다시 기록하지 않음.
+- **근거의 판정 시각과 저장 완료 시각 (I1 — 채택)**: 근거 행은 `evaluated_at`(판정)과 `committed_at`(커밋한 **뒤** 잰 시각, 초 올림 —
+  S1 `committed_at`과 같은 방식)을 따로 가짐. 개장 후보에 쓰는 개장 전 근거는 **둘 다 개장 전**이어야 함(같은 초 경계 09:00:00도 아님).
+  커밋 뒤 시각을 적기 전에 강제 종료한 행은 NULL = 저장 완료 증거 없음. 개장 전이면 관리자가 그런 행을 다시 판정해 새 근거를 남김.
+  관리자 DB wd2 → wd3: `candidate_gate.committed_at` 열만 더하고 이전 행은 NULL로 둠(evaluated_at으로 추정하지 않음) — 업그레이드가
+  개장 뒤라 다시 판정하지 못한 그날 후보는 근거 없음으로 제외(보수적).
 
 ## 작업 키·상태·재시도
 - task_key = `CLOSE_PREP|D|scope:v2:<해시>` / `OPEN_CHECK|D|OPEN+5m`. CLOSE_PREP 범위(W2 검토 R4)는 결과를 바꾸는 것만 넣음:
@@ -50,7 +61,7 @@
   날 다시 준비하지 않음. 실행한 계산 계약·**실제로 쓴** 설정 버전(목록 갱신 뒤 다시 읽은 버전)은 행에 기록.
 - 범위가 바뀌면 같은 날 새 키로 한 번 더(받은 일봉은 다시 받지 않음). 개장 전이면 새 관찰이 그날 후보 원천, 개장 뒤면 actionable=0이라
   소급하지 않음. 목록 갱신 뒤 다시 읽은 설정 범위가 키와 다르면 그 작업은 `SUPERSEDED`(새 키 작업이 맡음).
-- 이전 키 이전(wd1 → wd2): 관리자 DB를 열면 표·열만 더하고(기존 행 보존, `meta.upgraded_from=wd1`) 이전 형식 키
+- 이전 키 이전(wd1 → 최신): 관리자 DB를 열면 표·열만 더하고(기존 행 보존, `meta.upgraded_from`) 이전 형식 키
   `scope:<10자리>`의 COMPLETE 행은 그대로. 진행 중 거래일은 새 키로 한 번 다시 준비될 수 있음(이때 게이트 근거가 생김).
 - 상태: PENDING → RUNNING → COMPLETE / PARTIAL(일부 조회 실패) / YIELDED(양보·미룸) / FAILED(예외) / ABORTED(중단) / MISSED /
   SUPERSEDED.
@@ -148,7 +159,7 @@ python tools/watch_daemon.py report --day 2026-10-08
 | 설정 적용 중 중단 | 적용 저널로 다음 실행이 원래 파일 복원 또는 확정 확인(docs/watchlist.md 적용 경계) | — |
 
 ## 저장·보고서
-- `data/watch/daemon.sqlite3`(wd2 — task·task_event·daemon_run(+진척·중지 요청 시각)·call_usage·candidate_gate; wd1은 열 때 자동으로 올림), `watch_s1.sqlite3`(지정 종목 S1 관찰, 관찰 DB s4 형식),
+- `data/watch/daemon.sqlite3`(wd3 — task·task_event·daemon_run(+진척·중지 요청 시각)·call_usage·candidate_gate(+저장 완료 시각); wd1·wd2는 열 때 자동으로 올림), `watch_s1.sqlite3`(지정 종목 S1 관찰, 관찰 DB s4 형식),
   `watch_open.sqlite3`(개장 확인, A5 a3 형식). 기존 DB는 바꾸지 않음(새 파일).
 - 보고서 `reports/watch/daily/watch_<D>.md`(작업·설정 버전·준비·관찰(계산)·운영 진입 게이트·개장 확인), `reports/watch/s1/`, `reports/watch/open/`. 로그
   `logs/watch_daemon.log`(토큰·앱키·계좌 값 가림). 모두 git 제외.
@@ -184,7 +195,10 @@ python tools/watch_daemon.py stop; python tools/watch_daemon.py status; python t
 ```powershell
 $d = Get-Date -Format yyyyMMdd
 New-Item -ItemType Directory -Force exports\watch_$d | Out-Null
-python tools/watch_daemon.py status --json > exports\watch_$d\status.json
+git rev-parse HEAD > exports\watch_$d\code_version.txt                       # 코드 버전
+git status --short >> exports\watch_$d\code_version.txt                     # 로컬 수정 여부
+Get-Date -Format o > exports\watch_$d\bundle_time.txt                        # 모은 시각(PC 시계 — +09:00인지 확인)
+python tools/watch_daemon.py status --json > exports\watch_$d\status.json    # 달력 버전·설정 버전·호출 수·작업·KST 시각
 python tools/watchlist.py status > exports\watch_$d\watchlist_status.txt
 Copy-Item logs\watch_daemon.log exports\watch_$d\ -ErrorAction SilentlyContinue
 Copy-Item -Recurse reports\watch exports\watch_$d\reports -ErrorAction SilentlyContinue
@@ -193,6 +207,8 @@ Select-String -Path exports\watch_$d\* -Pattern "token|appkey|secret|acnt" -Simp
 Compress-Archive -Force exports\watch_$d exports\watch_bundle_$d.zip
 ```
 - `.env`·`config/watchlist.yaml`(수동 보유 값)은 번들에 넣지 않음. 필요하면 `watchlist.py status` 출력만.
+- 실행 옵션(상한·예약·poll·완성 지연·개장 offset)·달력 버전·스키마는 관리자 시작 로그 줄에, 계약·설정 버전·게이트 사유(SCAN·OPEN·
+  RESUME)·호출 수는 `daemon.sqlite3`(task·candidate_gate·call_usage)와 일일 보고서에 있음.
 
 ## 미실측
 - 실제 API로 운영한 로그·보고서는 아직 없음 — 가짜 API·가짜 시계 시험 출력만('2거래일' 시험도 가짜 날짜 전환). 토큰 `expires_dt`
