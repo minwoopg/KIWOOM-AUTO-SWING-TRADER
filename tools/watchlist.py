@@ -9,6 +9,8 @@
     python tools/watchlist.py enable 005930
     python tools/watchlist.py holding-close 000660          # 수동 보유 정보 지우기(청산) — YAML에서 이미 지웠어도 됨
     python tools/watchlist.py restore                       # 파일을 마지막 정상 설정(또는 --version N)으로 되돌림
+                                                            #   (미해결 적용 저널이 있으면 격리한 뒤 — 사람이 정상 버전을 고름)
+    python tools/watchlist.py resolve-journal --keep-file   # 미해결 저널을 격리하고 지금 파일을 일반 규칙으로 적용
     python tools/watchlist.py remove 005930                 # 항목 삭제(보유가 있으면 거부)
     python tools/watchlist.py validate                      # 검사만(기록 안 함)
     python tools/watchlist.py apply                         # 파일을 직접 고친 뒤 적용(이력 기록)
@@ -45,8 +47,8 @@ from infra.watch.manager import (  # noqa: E402
     prepare_data, read_config_text,
 )
 from infra.watch.apply import (  # noqa: E402
-    DEFAULT_LOCK_TIMEOUT, CommitResult, ConfigLockTimeout, commit_config_text, config_lock, sync_file,
-    write_config_file,
+    DEFAULT_LOCK_TIMEOUT, CommitResult, ConfigLockTimeout, commit_config_text, config_lock,
+    resolve_journal_keep_file, sync_file, write_config_file,
 )
 from infra.watch.store import WatchStore  # noqa: E402
 from tools.research_collect import _LazyClient, make_client  # noqa: E402
@@ -105,6 +107,8 @@ def build_parser() -> argparse.ArgumentParser:
             a.add_argument("--holding", action="store_true", help="(보유 감시는 끌 수 없음 — 안내만)")
     rs = sub.add_parser("restore", help="파일을 마지막 정상(APPLIED) 설정으로 되돌림")
     rs.add_argument("--version", type=int, help="되돌릴 APPLIED 버전(기본: 사용 중 버전)")
+    rj = sub.add_parser("resolve-journal", help="미해결 적용 저널을 격리하고 지금 파일을 적용(파일을 확인한 뒤)")
+    rj.add_argument("--keep-file", action="store_true", required=True)
     pr = sub.add_parser("prepare")
     pr.add_argument("--codes", help="쉼표로 구분한 등록 종목만 조회(상태 판정은 전체)")
     pr.add_argument("--no-list-refresh", action="store_true", help="오늘 종목 목록을 다시 받지 않음")
@@ -247,7 +251,8 @@ def _report_commit(r: CommitResult) -> None:
         for m in r.messages:
             print(f"[주의] {m}")
         return
-    tag = {"REJECTED_PRECHECK": "[거부]", "CONFLICT": "[충돌]", "UNCERTAIN": "[불확정]"}.get(r.outcome, "[실패]")
+    tag = {"REJECTED_PRECHECK": "[거부]", "CONFLICT": "[충돌]", "UNCERTAIN": "[불확정]",
+           "JOURNAL_UNRESOLVED": "[저널 미해결]"}.get(r.outcome, "[실패]")
     for m in r.messages:
         print(f"{tag} {m}")
     _print_issues(r.errors or [], [])
@@ -264,7 +269,10 @@ def _edit_command(args, cfg_path, wstore, listing, snap_id, now) -> tuple[int, o
             print(f"[거부] 되돌릴 정상(APPLIED) 설정이 없음{'' if args.version is None else f': v{args.version}'}")
             return 2, None
         r = commit_config_text(wstore, cfg_path, pick["raw_text"], listing, snap_id, now=now,
-                               origin=f"CLI:restore v{pick['version']}", lock_timeout=args.lock_timeout)
+                               origin=f"CLI:restore v{pick['version']}", lock_timeout=args.lock_timeout,
+                               quarantine_unresolved=True)
+        if r.recovered and r.recovered.get("quarantined"):
+            print(f"[저널 격리] {r.recovered['quarantined']}")
         _report_commit(r)
         if r.code:
             return r.code, None
@@ -449,6 +457,18 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
             r = next(x for x in res2["rows"] if x["code"] == _code(args.code) and x["kind"] == "STOCK")
             print(f"데이터: {_ready_cell(r)} (준비 실행 {res2['run_id']}, 조회 {res2['calls']}회)")
             return 0
+
+        if args.cmd == "resolve-journal":
+            try:
+                state, att, q = resolve_journal_keep_file(wstore, cfg_path, listing, snap_id, now=now,
+                                                          lock_timeout=args.lock_timeout)
+            except ConfigLockTimeout as exc:
+                print(f"[잠금] {exc}")
+                return 2
+            print(f"[저널 격리] {q}" if q else "남은 적용 저널 없음")
+            print(f"지금 파일 적용 → v{att['version']} {att['status']}")
+            _print_issues(att["errors"], att["warnings"])
+            return 0 if att["status"] == "APPLIED" else 2
 
         if args.cmd == "prepare":
             snap = rstore.latest_snapshot()

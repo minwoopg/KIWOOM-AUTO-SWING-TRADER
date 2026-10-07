@@ -74,6 +74,7 @@ class WatchState:
     active: dict | None                 # 사용 중(마지막 APPLIED) 버전 기록
     latest: dict | None                 # 가장 최근 시도
     config: WatchConfig | None = field(default=None)
+    journal_block: str | None = None    # 미해결 적용 저널(R5) — REJECTED 기록이 실패해도 신규 진입 차단
 
     @property
     def active_version(self) -> int | None:
@@ -91,12 +92,15 @@ class WatchState:
 
     @property
     def entry_blocked(self) -> bool:
-        return self.config is None or bool(self.config_error)
+        return self.config is None or bool(self.config_error) or self.journal_block is not None
 
     @property
     def block_reason(self) -> str:
         if self.config is None:
             return "NO_VALID_CONFIG(정상 설정 없음 — 감시 시작 안 함)"
+        if self.journal_block is not None:
+            return (f"JOURNAL_UNRESOLVED({self.journal_block} — 마지막 정상 v{self.active_version}로 감시 유지, 신규 매수 "
+                    "차단; restore 또는 resolve-journal --keep-file)")
         if self.config_error:
             return (f"CONFIG_ERROR(v{self.latest['version']} 거부 — 마지막 정상 v{self.active_version}로 감시 유지, "
                     "신규 매수 차단)")
@@ -108,7 +112,7 @@ class WatchState:
                 "latest_version": None if self.latest is None else self.latest["version"],
                 "latest_status": None if self.latest is None else self.latest["status"],
                 "config_error": self.config_error, "entry_blocked": self.entry_blocked,
-                "block_reason": self.block_reason,
+                "block_reason": self.block_reason, "journal_block": self.journal_block,
                 "warnings": [] if self.active is None else self.active["warnings"]}
 
 

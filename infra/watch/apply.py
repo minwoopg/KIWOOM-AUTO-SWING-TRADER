@@ -26,11 +26,22 @@ CLI가 설정을 바꿀 때 (`commit_config_text`)
 | 새 내용 | 그 밖 | 확정 전 중단 | 원래 파일 복원(실패 시 REJECTED 기록·저널 유지) |
 | 원래 내용 | — | 교체 전 중단 | 저널 삭제 |
 | 둘 다 아님 | — | 그 뒤 사용자가 고침 | 저널 삭제(이 파일은 일반 적용 규칙·보유 보호로 검사) |
+
+복구 결과 분류 (W2 검토 R5)
+- 해결됨: COMMITTED(저널 삭제 실패여도 파일·DB 일치) · ROLLED_BACK · NOT_REPLACED · FILE_CHANGED → 일반 적용 계속.
+- 미해결(사용자 확인 필요): JOURNAL_UNREADABLE(읽기·JSON 실패) · JOURNAL_INVALID(키·타입·base64·원래 내용 해시 불일치) ·
+  RESTORE_FAILED(원래 파일 복원 실패) → **일반 적용·편집을 하지 않음**: 이전 정상 설정 유지, REJECTED(같은 내용이면 한 번만
+  기록)로 신규 진입 차단. status·관리자 순회가 저절로 승인하지 않음.
+- 해결은 사람이: `watchlist.py restore [--version N]`(저널을 격리하고 정상 버전 원문으로 되돌려 적용) 또는
+  `watchlist.py resolve-journal --keep-file`(저널을 격리하고 지금 파일을 일반 규칙·보유 보호로 적용). 격리한 저널은
+  `<저널>.<시각>.quarantined`로 남김.
 """
 
 import base64
+import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
@@ -186,6 +197,57 @@ def _remove(path: Path) -> str | None:
         return f"{type(exc).__name__}: {exc}"
 
 
+RESOLVED_ACTIONS = ("COMMITTED", "ROLLED_BACK", "NOT_REPLACED", "FILE_CHANGED")
+_SHA = re.compile(r"^(MISSING|UNREADABLE(:[0-9a-f]{16})?|[0-9a-f]{16})$")
+
+
+def _content_sha(data: bytes | None) -> str:
+    if data is None:
+        return "MISSING"
+    try:
+        return hashlib.sha256(data.decode("utf-8").encode("utf-8")).hexdigest()[:16]
+    except UnicodeDecodeError:
+        return "UNREADABLE:" + hashlib.sha256(data).hexdigest()[:16]
+
+
+def _validate_journal(j) -> tuple[bytes | None, str]:
+    """(원래 내용, 오류). 오류가 있으면 근거로 쓰지 않음(JOURNAL_INVALID)."""
+    if not isinstance(j, dict):
+        return None, "JSON 객체가 아님"
+    need = {"origin": str, "started_at": str, "pid": int, "old_sha": str, "new_sha": str}
+    for k, t in need.items():
+        if not isinstance(j.get(k), t) or isinstance(j.get(k), bool):
+            return None, f"{k} 없음·형식 오류"
+    ev = j.get("expect_version")
+    if not (ev is None or (isinstance(ev, int) and not isinstance(ev, bool))):
+        return None, "expect_version 형식 오류"
+    if "old_b64" not in j or not (j["old_b64"] is None or isinstance(j["old_b64"], str)):
+        return None, "old_b64 없음·형식 오류"
+    if not _SHA.match(j["old_sha"]) or not _SHA.match(j["new_sha"]):
+        return None, "해시 형식 오류"
+    try:
+        datetime.fromisoformat(j["started_at"])
+        old = None if j["old_b64"] is None else base64.b64decode(j["old_b64"], validate=True)
+    except (ValueError, TypeError) as exc:
+        return None, f"시각·base64 오류({type(exc).__name__})"
+    if _content_sha(old) != j["old_sha"]:
+        return None, "원래 내용과 old_sha가 다름"
+    return old, ""
+
+
+def quarantine_journal(cfg_path: Path, now: datetime) -> str | None:
+    """남은 저널을 옆으로 치움(사람이 해결할 때). 반환: 격리한 경로(없으면 None)."""
+    jp = journal_path(cfg_path)
+    if not jp.exists():
+        return None
+    dest = jp.with_name(f"{jp.name}.{now:%Y%m%d_%H%M%S}.quarantined")
+    n = 1
+    while dest.exists():
+        dest, n = jp.with_name(f"{jp.name}.{now:%Y%m%d_%H%M%S}_{n}.quarantined"), n + 1
+    os.replace(jp, dest)
+    return str(dest)
+
+
 def _matches(active: dict | None, new_sha: str) -> bool:
     """사용 중(APPLIED) 설정의 원문이 새 파일 내용과 같음 — 파일과 DB가 일치하므로 파일을 되돌리지 않음."""
     return active is not None and active["raw_sha"] == new_sha
@@ -196,42 +258,73 @@ def recover_journal(wstore: WatchStore, cfg_path: Path, *, now: datetime) -> dic
     jp = journal_path(cfg_path)
     if not jp.exists():
         return None
+    hint = ("정상 버전으로 되돌리려면 `python tools/watchlist.py restore`, 지금 파일을 확인했으면 "
+            "`python tools/watchlist.py resolve-journal --keep-file`")
     try:
         j = json.loads(jp.read_text(encoding="utf-8"))
-        old = None if j["old_b64"] is None else base64.b64decode(j["old_b64"])
-        new_sha, old_sha = j["new_sha"], j["old_sha"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        msg = f"적용 저널을 읽을 수 없음({type(exc).__name__}) — 설정 파일을 확인한 뒤 apply 또는 restore: {jp}"
+    except (OSError, ValueError) as exc:
+        msg = f"적용 저널을 읽을 수 없음({type(exc).__name__}) — 일반 적용 중단, 이전 정상 설정 유지. {hint}"
         rec = _record_failure(wstore, cfg_path, now=now, origin="RECOVER", message=msg)
-        return {"action": "JOURNAL_UNREADABLE", "message": msg, "record_error": rec}
+        return {"action": "JOURNAL_UNREADABLE", "resolved": False, "message": msg, "record_error": rec}
+    old, why = _validate_journal(j)
+    if why:
+        msg = f"적용 저널 형식이 맞지 않음({why}) — 근거로 쓰지 않음, 일반 적용 중단·이전 정상 설정 유지. {hint}"
+        rec = _record_failure(wstore, cfg_path, now=now, origin="RECOVER", message=msg)
+        return {"action": "JOURNAL_INVALID", "resolved": False, "message": msg, "record_error": rec}
+    new_sha, old_sha = j["new_sha"], j["old_sha"]
     text, rerr = read_config_text(cfg_path)
     cur = file_sha(text, rerr, Path(cfg_path))
     active = wstore.active_version()
     if cur == new_sha:
         if _matches(active, new_sha):
-            err = _remove(jp)
-            return {"action": "COMMITTED", "journal": j, "remove_error": err}
+            err = _remove(jp)               # 삭제 실패여도 파일·DB 일치 — 해결됨(다음 실행이 다시 지움)
+            return {"action": "COMMITTED", "resolved": True, "journal": j, "remove_error": err}
         rerr2 = _restore(cfg_path, old)
         if rerr2 is None:
             err = _remove(jp)
-            return {"action": "ROLLED_BACK", "journal": j, "remove_error": err,
+            return {"action": "ROLLED_BACK", "resolved": True, "journal": j, "remove_error": err,
                     "message": f"확정 전에 중단된 적용({j.get('origin')})을 되돌림 — 원래 설정 파일 복원"}
-        msg = (f"중단된 적용({j.get('origin')})의 설정 파일을 되돌리지 못함({rerr2}) — 파일과 사용 중 설정이 다름. "
-               "파일을 확인한 뒤 apply 또는 restore")
+        msg = (f"중단된 적용({j.get('origin')})의 설정 파일을 되돌리지 못함({rerr2}) — 파일과 사용 중 설정이 다름, "
+               f"일반 적용 중단·이전 정상 설정 유지. {hint}")
         rec = _record_failure(wstore, cfg_path, now=now, origin="RECOVER", message=msg)
-        return {"action": "RESTORE_FAILED", "journal": j, "message": msg, "record_error": rec}
+        return {"action": "RESTORE_FAILED", "resolved": False, "journal": j, "message": msg, "record_error": rec}
     err = _remove(jp)
-    return {"action": "NOT_REPLACED" if cur == old_sha else "FILE_CHANGED", "journal": j, "remove_error": err}
+    return {"action": "NOT_REPLACED" if cur == old_sha else "FILE_CHANGED", "resolved": True, "journal": j,
+            "remove_error": err}
+
+
+def _blocked_by_journal(wstore: WatchStore, rec: dict) -> tuple[WatchState, dict]:
+    """미해결 저널 — 일반 적용을 하지 않고 지금 상태(이전 정상 설정 + REJECTED)를 돌려줌."""
+    state = load_state(wstore)
+    state.journal_block = rec["action"]
+    latest = state.latest
+    return state, {"version": None if latest is None else latest["version"], "status": REJECTED, "new": False,
+                   "errors": [{"code": "-", "field": "journal", "message": rec["message"]}], "warnings": [],
+                   "blocked_by_journal": rec["action"], "record_error": rec.get("record_error")}
 
 
 # ── 일반 설정 반영 (apply·status·prepare·관리자) ─────────────────
 def sync_file(wstore: WatchStore, cfg_path: Path, listing, snapshot_id, *, now: Callable[[], datetime],
               origin: str = "FILE", lock_timeout: float = DEFAULT_LOCK_TIMEOUT) -> tuple[WatchState, dict, dict | None]:
-    """잠금 → 남은 저널 복구 → 파일을 읽어 적용(sync_config). 반환 (상태, 시도, 복구 결과)."""
+    """잠금 → 남은 저널 복구 → 파일을 읽어 적용(sync_config). 반환 (상태, 시도, 복구 결과).
+    복구가 미해결이면 적용하지 않음(R5) — 이전 정상 설정 유지, 시도는 REJECTED(같은 내용이면 새 행 없음)."""
     with config_lock(wstore, timeout=lock_timeout):
         rec = recover_journal(wstore, Path(cfg_path), now=now())
+        if rec is not None and not rec["resolved"]:
+            state, att = _blocked_by_journal(wstore, rec)
+            return state, att, rec
         state, att = sync_config(wstore, cfg_path, listing, snapshot_id, now=now(), origin=origin)
     return state, att, rec
+
+
+def resolve_journal_keep_file(wstore: WatchStore, cfg_path: Path, listing, snapshot_id, *,
+                              now: Callable[[], datetime], lock_timeout: float = DEFAULT_LOCK_TIMEOUT
+                              ) -> tuple[WatchState, dict, str | None]:
+    """사람이 지금 파일을 확인했다고 할 때: 저널을 격리하고 파일을 일반 규칙(검증·보유 보호)으로 적용."""
+    with config_lock(wstore, timeout=lock_timeout):
+        q = quarantine_journal(Path(cfg_path), now())
+        state, att = sync_config(wstore, cfg_path, listing, snapshot_id, now=now(), origin="CLI:resolve-journal")
+    return state, att, q
 
 
 # ── CLI 변경 적용 ──────────────────────────────────────────
@@ -249,13 +342,19 @@ class CommitResult:
 
 def commit_config_text(wstore: WatchStore, cfg_path: Path, text: str, listing, snapshot_id, *,
                        now: Callable[[], datetime], origin: str, close_codes: list[str] | None = None,
-                       lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+                       lock_timeout: float = DEFAULT_LOCK_TIMEOUT, quarantine_unresolved: bool = False,
                        hook: Callable[[str], None] = test_point) -> CommitResult:
     """바꾼 원문을 적용. close_codes = 이 명령이 청산하는 종목(holding-close) — 보유 값은 잠금 안에서 사용 중 설정에서 읽음.
     모듈 설명의 순서·규칙. 확정(DB COMMIT) 전 실패는 모두 이전 설정 유지 + 원래 파일 복원."""
     cfg_path = Path(cfg_path)
     with config_lock(wstore, timeout=lock_timeout):
         rec = recover_journal(wstore, cfg_path, now=now())
+        if rec is not None and not rec["resolved"]:
+            if not quarantine_unresolved:
+                return CommitResult(2, "JOURNAL_UNRESOLVED", recovered=rec,
+                                    messages=["미해결 적용 저널이 있어 바꾸지 않았습니다 — restore 또는 "
+                                              "resolve-journal --keep-file로 먼저 해결"])
+            rec = {**rec, "quarantined": quarantine_journal(cfg_path, now())}   # restore: 사람이 정상 버전을 고름
         before = load_state(wstore)
         held = {} if before.config is None else {s.code: s for s in before.config.symbols if s.holding is not None}
         from dataclasses import asdict

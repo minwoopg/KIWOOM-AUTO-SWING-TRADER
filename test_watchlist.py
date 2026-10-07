@@ -1033,6 +1033,122 @@ pb.communicate(timeout=60)
 check("9-8) [C1] 잠금 대기 상한(0.3초)을 넘기면 아무것도 바꾸지 않고 종료 코드 2·[잠금] 안내",
       rc_d == 2 and "[잠금]" in out_d and pb.returncode == 0)
 
+import json  # noqa: E402
+
+
+# ── 10. W2 검토 R5 — 미해결 적용 저널은 사람이 해결할 때까지 일반 적용을 막음 ─────────────
+def wstate(env):
+    with WatchStore(env["wdb"]) as w:
+        st = M.load_state(w)
+        return st, [(h["version"], h["status"]) for h in w.history()]
+
+
+def sync_twice(env):
+    out = []
+    with ResearchStore(env["db"]) as rs, WatchStore(env["wdb"]) as w:
+        lst, sid = M.listing_from_store(rs)
+        for _ in range(2):
+            st, att, rec = AP.sync_file(w, env["cfg"], lst, sid, now=env["clock"])
+            out.append((rec["action"] if rec else None, att["status"], st.entry_blocked, st.block_reason.split("(")[0]))
+    return out
+
+
+E30 = setup("r5-corrupt")
+held(E30)
+AP.journal_path(E30["cfg"]).write_text("{bad json", encoding="utf-8")
+c30a, o30a = cli(E30, "status")
+c30b, o30b = cli(E30, "status")
+ticks30 = sync_twice(E30)
+st30, hist30 = wstate(E30)
+check("10-1) [R5 재현] 손상 저널({bad json}) → JOURNAL_UNREADABLE: 일반 적용 안 함(이전 정상 v1·보유 10주 유지), REJECTED 한 번만 기록, "
+      "신규 진입 차단·저널 유지 — status 2번·관리자 순회(sync_file) 2번 반복해도 APPLIED로 덮거나 이력이 늘지 않음",
+      hist30 == [(2, "REJECTED"), (1, "APPLIED")] and st30.active_version == 1 and st30.entry_blocked
+      and st30.config.symbol("000660").holding.quantity == 10 and AP.journal_path(E30["cfg"]).exists()
+      and all(t == ("JOURNAL_UNREADABLE", "REJECTED", True, "JOURNAL_UNRESOLVED") for t in ticks30)
+      and "restore" in o30a and "JOURNAL_UNRESOLVED" in o30b)
+E31 = setup("r5-invalid")
+b31 = held(E31)
+bad = {"origin": "CLI:set", "started_at": "2026-10-07T10:00:00", "pid": 1, "old_sha": "0" * 16, "new_sha": "1" * 16,
+       "expect_version": 1, "old_b64": __import__("base64").b64encode(b31).decode()}
+inv31 = {}
+for label, j in (("old_sha 불일치", bad), ("키 없음", {k: v for k, v in bad.items() if k != "new_sha"}),
+                 ("base64 오류", {**bad, "old_b64": "@@@"}), ("배열", [1, 2])):
+    AP.journal_path(E31["cfg"]).write_text(json.dumps(j), encoding="utf-8")
+    with ResearchStore(E31["db"]) as rs, WatchStore(E31["wdb"]) as w:
+        lst, sid = M.listing_from_store(rs)
+        st, att, rec = AP.sync_file(w, E31["cfg"], lst, sid, now=E31["clock"])
+    inv31[label] = (rec["action"], rec["resolved"], att["status"], st.entry_blocked, E31["cfg"].read_bytes() == b31)
+check("10-2) [R5] 저널 형식 검증: old_sha가 원래 내용과 다름·필수 키 없음·base64 오류·객체 아님 → JOURNAL_INVALID(근거로 쓰지 않음 — "
+      "그 내용으로 파일을 되돌리지 않음), 일반 적용 중단·차단",
+      all(v == ("JOURNAL_INVALID", False, "REJECTED", True, True) for v in inv31.values()) and len(inv31) == 4)
+E32 = setup("r5-restorefail")
+b32 = held(E32)
+rc32, _ = proc(E32, "set", "000660", "--memo", "중단될 변경", extra={"WATCH_TEST_CRASH_AT": "after_replace"})
+b32_new = E32["cfg"].read_bytes()
+AP._restore = lambda path, old: "PermissionError: 시험 — 복원 실패"
+try:
+    c32, o32 = cli(E32, "status")
+    ticks32 = sync_twice(E32)
+finally:
+    AP._restore = real_restore
+st32, hist32 = wstate(E32)
+check("10-3) [R5] 실제 프로세스가 파일 교체 뒤 강제 종료 + 복구 때 원래 파일 복원 실패 → RESTORE_FAILED: 바뀐 파일(메모 변경)을 일반 "
+      "적용하지 않음 — 사용 중 v1 그대로·차단·저널 유지(이전 코드는 그 파일을 APPLIED)",
+      rc32 == 97 and b32_new != b32 and "RESTORE_FAILED" in o32 and st32.active_version == 1 and st32.entry_blocked
+      and all(t[0] == "RESTORE_FAILED" and t[2] for t in ticks32) and not any(s == "APPLIED" and v > 1 for v, s in hist32)
+      and AP.journal_path(E32["cfg"]).exists())
+E33 = setup("r5-dblock")
+held(E33)
+AP.journal_path(E33["cfg"]).write_text("{bad json", encoding="utf-8")
+AP._record_failure = lambda *a, **k: "OperationalError: database is locked"
+try:
+    ticks33 = sync_twice(E33)
+finally:
+    AP._record_failure = real_rf
+st33, hist33 = wstate(E33)
+check("10-4) [R5] 복구 실패 기록까지 DB 잠김으로 실패 → REJECTED 행이 없어도 이번 반영 결과는 차단(JOURNAL_UNRESOLVED), 일반 적용 안 함",
+      hist33 == [(1, "APPLIED")] and all(t[2] and t[3] == "JOURNAL_UNRESOLVED" and t[1] == "REJECTED" for t in ticks33))
+E34 = setup("r5-blockcmd")
+b34 = held(E34)
+AP.journal_path(E34["cfg"]).write_text("{bad json", encoding="utf-8")
+c34, o34 = cli(E34, "set", "000660", "--memo", "막혀야 함")
+check("10-5) [R5] 미해결 저널이 있으면 일반 편집 명령(set)도 바꾸지 않음 — 종료 코드 2·해결 명령 안내, 파일 그대로",
+      c34 == 2 and "restore" in o34 and E34["cfg"].read_bytes() == b34)
+c35, o35 = cli(E34, "restore")
+st35, hist35 = wstate(E34)
+q35 = list(E34["cfg"].parent.glob("watchlist.yaml.apply-journal.json.*.quarantined"))
+c35b, o35b = cli(E34, "status")
+check("10-6) [R5] 명시적 restore: 저널을 격리(.quarantined로 보존)하고 마지막 정상 버전 원문으로 되돌려 적용 → 차단 해제, 다음 status 정상",
+      c35 == 0 and "[저널 격리]" in o35 and len(q35) == 1 and not AP.journal_path(E34["cfg"]).exists()
+      and not st35.entry_blocked and hist35[0][1] == "APPLIED" and c35b == 0 and "신규 진입 차단" not in o35b)
+E36 = setup("r5-keepfile")
+held(E36)
+AP.journal_path(E36["cfg"]).write_text("{bad json", encoding="utf-8")
+y36 = yaml.safe_load(E36["cfg"].read_text(encoding="utf-8"))
+y36["symbols"][0]["memo"] = "사람이 확인한 파일"
+E36["cfg"].write_text(dump_document(y36), encoding="utf-8")
+c36, o36 = cli(E36, "resolve-journal", "--keep-file")
+st36, _ = wstate(E36)
+check("10-7) [R5] resolve-journal --keep-file: 저널을 격리하고 지금 파일을 일반 규칙(검증·보유 보호)으로 적용 → 새 버전 사용, 차단 해제",
+      c36 == 0 and not st36.entry_blocked and st36.config.symbol("000660").memo == "사람이 확인한 파일"
+      and not AP.journal_path(E36["cfg"]).exists() and list(E36["cfg"].parent.glob("*.quarantined")))
+E37 = setup("r5-commit-rm")
+held(E37)
+rc37, _ = proc(E37, "holding-close", "000660", extra={"WATCH_TEST_CRASH_AT": "after_commit"})
+real_remove = AP._remove
+AP._remove = lambda path: "PermissionError: 시험 — 삭제 실패"
+try:
+    c37, o37 = cli(E37, "status")
+finally:
+    AP._remove = real_remove
+st37, _ = wstate(E37)
+left37 = AP.journal_path(E37["cfg"]).exists()
+c37b, o37b = cli(E37, "status")
+check("10-8) [R5] 확정(COMMITTED) 뒤 저널 삭제만 실패 → 파일·DB 일치하므로 해결됨으로 분류(차단 안 함, 사용 중 v2), 저널은 남고 다음 "
+      "실행이 지움",
+      rc37 == 97 and c37 == 0 and "COMMITTED" in o37 and not st37.entry_blocked and st37.active_version == 2 and left37
+      and c37b == 0 and not AP.journal_path(E37["cfg"]).exists() and consistent(E37, holding=False))
+
 # ── 5. 경계 ────────────────────────────────────────────────
 FORBIDDEN = ("infra.broker", "infra.storage", "infra.notify", "domain.strategy", "domain.service", "commands",
              "domain.position", "infra.market_data")
