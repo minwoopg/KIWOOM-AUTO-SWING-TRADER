@@ -13,6 +13,10 @@ from __future__ import annotations
 
 호출 간격: 모든 요청을 이 객체 하나로 통과시켜 `min_interval_sec`(기본 1초 — 0.5초 간격에서 429 실측)를 지킵니다.
 429·전송 실패는 대기 후 재시도(조회 전용이라 안전), HTTP 401은 한 번 재인증 후 재시도.
+장기 실행(W2): 토큰 응답의 expires_dt(YYYYMMDDHHMMSS — 운영 브로커 코드와 같은 필드, 형식은 미실측)를 읽을 수 있으면
+만료 `token_refresh_margin_sec` 전부터 요청 전에 새로 발급. 읽을 수 없으면 HTTP 401 재인증에만 의존.
+재인증(401·만료 갱신)은 `reauth_window_sec` 안에 `max_reauth`번까지 — 넘으면 ResearchApiError(무한 재발급 방지).
+401 말고 다른 오류(return_code≠0 등)는 인증 오류로 보지 않음.
 그 밖의 HTTP 오류·return_code≠0·목록 없음은 재시도하지 않고 `ResearchApiError`.
 
 응답 계약 (A2-R3): return_code가 **있고 0**이어야 성공. cont-yn 헤더는 Y 또는 N이어야 하고,
@@ -21,7 +25,7 @@ Y이면 next-key가 있어야 합니다. 어기면 `ResearchApiError`(이력 끝
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Sequence
 from urllib.parse import urlparse
 
@@ -62,6 +66,17 @@ class DeadlinePassed(RuntimeError):
         self.attempts = attempts
 
 
+def _parse_expires(v) -> datetime | None:
+    """토큰 응답 expires_dt(YYYYMMDDHHMMSS) → datetime. 형식이 다르면 None(만료 예측 없이 401에만 의존)."""
+    s = str(v or "").strip()
+    if len(s) != 14 or not s.isdigit():
+        return None
+    try:
+        return datetime.strptime(s, "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+
+
 def assert_mock_domain(base_url: str) -> None:
     parsed = urlparse(base_url or "")
     if ((parsed.scheme or "").lower() != "https"
@@ -98,7 +113,9 @@ class ReadOnlyResearchClient:
                  now: Callable[[], datetime] = now_local,
                  monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
-                 log: Callable[[str], None] | None = None) -> None:
+                 log: Callable[[str], None] | None = None,
+                 token_refresh_margin_sec: float = 600.0, max_reauth: int = 3,
+                 reauth_window_sec: float = 600.0) -> None:
         assert_mock_domain(base_url)
         if min_interval_sec < 0.5:
             raise ResearchConfigError("min_interval_sec는 0.5 이상 (실측상 0.5초 간격에서도 429)")
@@ -113,9 +130,15 @@ class ReadOnlyResearchClient:
         self.sleep = sleep
         self.log = log or (lambda msg: None)
         self._token = ""
+        self._token_expires_at: datetime | None = None
+        self.token_refresh_margin_sec = token_refresh_margin_sec
+        self.max_reauth = max_reauth
+        self.reauth_window_sec = reauth_window_sec
+        self._reauth_times: list[float] = []
         self._last_call: float | None = None
         self.calls = 0
         self.retries = 0
+        self.token_issues = 0
 
     # ── 인증 ──
     def authenticate(self) -> None:
@@ -133,6 +156,29 @@ class ReadOnlyResearchClient:
             msg = body.get("return_msg") if isinstance(body, dict) else ""
             raise ResearchApiError(f"토큰 발급 실패: http={r.status_code} return_msg={msg}")
         self._token = str(token)
+        self.token_issues += 1
+        self._token_expires_at = _parse_expires(body.get("expires_dt"))
+
+    @property
+    def token_expires_at(self) -> datetime | None:
+        return self._token_expires_at
+
+    def _reauth(self, why: str) -> None:
+        """재인증 — 창 안 횟수 상한을 넘으면 오류(같은 원인으로 계속 재발급하지 않음)."""
+        t = self.monotonic()
+        self._reauth_times = [x for x in self._reauth_times if t - x < self.reauth_window_sec]
+        if len(self._reauth_times) >= self.max_reauth:
+            raise ResearchApiError(f"재인증이 {self.reauth_window_sec:.0f}초 안에 {self.max_reauth}번 넘게 필요 — 중단({why})")
+        self._reauth_times.append(t)
+        self.log(f"[RESEARCH] {why} — 토큰 다시 발급")
+        self.authenticate()
+
+    def _ensure_token(self) -> None:
+        if not self._token:
+            self.authenticate()
+        elif (self._token_expires_at is not None
+              and self.now() >= self._token_expires_at - timedelta(seconds=self.token_refresh_margin_sec)):
+            self._reauth(f"토큰 만료 임박(expires_dt {self._token_expires_at})")
 
     # ── 조회 ──
     def _pace(self) -> None:
@@ -170,8 +216,7 @@ class ReadOnlyResearchClient:
                  deadline: datetime | None = None) -> tuple:
         """(status, 응답 헤더, 본문, 요청 시각, 수신 시각, 시도 횟수). 429·전송 실패 재시도, 401은 한 번 재인증.
         deadline이 있으면 매 요청 직전에 검사해 지났으면 DeadlinePassed(요청하지 않음)."""
-        if not self._token:
-            self.authenticate()
+        self._ensure_token()
         attempt, reauthed, calls0 = 0, False, self.calls
         while True:
             try:
@@ -181,8 +226,7 @@ class ReadOnlyResearchClient:
                     raise _Retryable("HTTP 429")
                 if status == 401 and not reauthed:
                     reauthed = True
-                    self.log(f"[RESEARCH] {api_id} HTTP 401 — 재인증 후 재시도")
-                    self.authenticate()
+                    self._reauth(f"{api_id} HTTP 401")
                     continue
                 break
             except _Retryable as exc:

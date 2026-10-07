@@ -21,6 +21,9 @@ from __future__ import annotations
   전략·설정 해시·분류 정책·지표/시장 계산 버전·lookback(세션 수)·완성 봉 지연·거래일 달력 내용·final 규칙·
   스캔 입력 규칙 버전·지수 ID. 해시를 실행 키·context·대표 기록 키에 넣어, 조건이 다르면 별도 실행·별도 대표 기록.
   입력 데이터 해시는 계약이 아니라 종목별 증거(input_hash)로 그대로 둡니다.
+- 선정 방식(W2): `selection`을 주면 그 종목만 계산하고 계약에 선정 방식·대상 코드를 넣음(예: 지정 종목 관찰
+  {"kind": "watchlist", "codes": [...]}). 주지 않으면 계약·해시는 이전과 바이트까지 같음(전체 시장 연구 기록 그대로).
+  선정 방식이 다르면 계약 해시가 달라 실행·대표 기록·신호 ID가 섞이지 않음. 지정 종목 관찰은 별도 DB 파일에 저장.
 """
 
 import hashlib
@@ -59,8 +62,9 @@ def calendar_version(cal: TradingCalendar) -> str:
 
 def build_contract(calendar: TradingCalendar, *, cfg: S1Config | None = None, policy: UniversePolicy | None = None,
                    after_close: timedelta = BAR_COMPLETE_AFTER_CLOSE,
-                   lookback: int = SCAN_LOOKBACK_SESSIONS) -> tuple[dict, str]:
-    """(계산 계약, 12자리 해시) — 스캐너와 A5(대상 계약 'current' 해석)가 같은 함수를 씁니다."""
+                   lookback: int = SCAN_LOOKBACK_SESSIONS, selection: dict | None = None) -> tuple[dict, str]:
+    """(계산 계약, 12자리 해시) — 스캐너와 A5(대상 계약 'current' 해석)가 같은 함수를 씁니다.
+    selection이 None이면 계약에 넣지 않음(전체 시장 — 이전과 같은 해시)."""
     cfg = cfg or S1Config()
     policy = policy or UniversePolicy()
     contract = {"strategy": f"{STRATEGY_ID}_{STRATEGY_VERSION}", "config_hash": cfg.config_hash(),
@@ -68,6 +72,8 @@ def build_contract(calendar: TradingCalendar, *, cfg: S1Config | None = None, po
                 "market_version": M.MARKET_VERSION, "lookback_sessions": lookback,
                 "after_close_sec": int(after_close.total_seconds()), "calendar": calendar_version(calendar),
                 "final_rule": FINAL_RULE, "scan_rules": SCAN_RULES_VERSION, "index_ids": list(INDEX_IDS)}
+    if selection is not None:
+        contract["selection"] = {**selection, "codes": sorted(selection.get("codes", []))}
     return contract, hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -131,8 +137,11 @@ class S1Scanner:
     def __init__(self, rstore: ResearchStore, sstore: ScanStore, calendar: TradingCalendar, *,
                  cfg: S1Config | None = None, policy: UniversePolicy | None = None,
                  after_close: timedelta = BAR_COMPLETE_AFTER_CLOSE, lookback: int = SCAN_LOOKBACK_SESSIONS,
-                 log: Callable[[str], None] | None = None) -> None:
+                 log: Callable[[str], None] | None = None, selection: dict | None = None,
+                 context_extra: dict | None = None) -> None:
         self.rstore, self.sstore, self.cal = rstore, sstore, calendar
+        self.selection = selection
+        self.context_extra = dict(context_extra or {})          # 계약이 아닌 기록용(예: 지정 종목 설정 버전)
         self.cfg = cfg or S1Config()
         self.policy = policy or UniversePolicy()
         self.after_close = after_close
@@ -142,7 +151,8 @@ class S1Scanner:
         self.config_hash = self.cfg.config_hash()
         # 계산 계약 — 같은 DB·스캔 시각에서 결과를 바꿀 수 있는 계산 조건 전부(입력 데이터 제외)
         self.contract, self.contract_hash = build_contract(calendar, cfg=self.cfg, policy=self.policy,
-                                                           after_close=after_close, lookback=lookback)
+                                                           after_close=after_close, lookback=lookback,
+                                                           selection=selection)
 
     def run_key(self, scan_at: datetime, signal_date: date) -> str:
         return (f"{signal_date.isoformat()}|{scan_at.replace(microsecond=0).isoformat(timespec='seconds')}|"
@@ -195,6 +205,9 @@ class S1Scanner:
                                       M.classify_market(view))
 
         rows = self.rstore.snapshot_rows(snap["snapshot_id"])
+        if self.selection is not None:
+            want = set(self.selection.get("codes", []))
+            rows = [r for r in rows if r["code"] in want]
         evals = []
         for row in rows:
             rec = classify_row(_row_to_raw(row), self.policy)
@@ -257,7 +270,8 @@ class S1Scanner:
                    "applied_policy": self.policy.policy_version, "strategy": self.strategy,
                    "config_hash": self.config_hash, "config": asdict(self.cfg),
                    "feature_version": F.FEATURE_VERSION, "market_version": M.MARKET_VERSION,
-                   "final_rule": FINAL_RULE, "contract_hash": self.contract_hash, "contract": self.contract}
+                   "final_rule": FINAL_RULE, "contract_hash": self.contract_hash, "contract": self.contract,
+                   **({"selection_context": self.context_extra} if self.context_extra else {})}
         return {"signal_date": t, "snapshot": snap, "snapshot_status": snap_status, "evals": evals,
                 "context": context}
 

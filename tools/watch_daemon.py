@@ -1,0 +1,281 @@
+"""W2 조회 전용 상시 실행 관리자 (주문 없음) — docs/watch_daemon.md
+
+사용법 (스윙 레포 루트, PowerShell)
+    python tools/watch_daemon.py run                 # 시작(창에서 실행 — Ctrl+C로 종료). 이미 실행 중이면 종료 코드 2
+    python tools/watch_daemon.py run --until-idle    # 지금 할 일만 하고 끝냄(작업 스케줄러로 돌릴 때)
+    python tools/watch_daemon.py status              # 실행 여부·heartbeat·설정 버전·작업 결과·다음 예정·오늘 호출 수
+    python tools/watch_daemon.py stop                # 실행 중인 관리자에 중지 요청(다음 순회·대상 사이에서 멈춤)
+    python tools/watch_daemon.py report --day 2026-10-08   # 그날 일일 보고서 다시 만들기(재실행 없음)
+    python tools/watch_daemon.py doctor              # 기존 Windows 작업 스케줄러 항목과 겹치는지 확인(읽기만 — 바꾸지 않음)
+
+- 대상: 지정 종목(관심 켜짐·수동 보유) + KOSPI·KOSDAQ. 전체 시장 수집·S1 스캔은 tools/research_collect.py(별도).
+- 저장: data/watch/daemon.sqlite3(작업 상태), watch_s1.sqlite3(지정 종목 S1 관찰), watch_open.sqlite3(개장 확인),
+  보고서 reports/watch/, 로그 logs/watch_daemon.log. 모의 도메인·조회 TR만.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE  # noqa: E402
+from infra.research.kiwoom_readonly import ResearchApiError, ResearchConfigError  # noqa: E402
+from infra.research.research_config import (  # noqa: E402
+    DEFAULT_RESEARCH_CONFIG, ResearchSettingsError, load_research_settings)
+from infra.watch.apply import ConfigLockTimeout, file_lock  # noqa: E402
+from infra.watch.daemon import (  # noqa: E402
+    DaemonPaths, DaemonSettings, DaemonStore, WatchDaemon, daemon_lock, write_daily_report)
+from infra.watch.manager import load_state  # noqa: E402
+from infra.watch.store import WatchStore  # noqa: E402
+from tools.research_collect import _LazyClient, make_client  # noqa: E402
+from utils.time_utils import now_local  # noqa: E402
+from utils.trading_calendar import TradingCalendar  # noqa: E402
+
+DATA = ROOT / "data"
+SCHEDULER_HINTS = ("research_collect", "watchlist.py", "watch_daemon", "main.py", "daily_report", "update_daily_bars")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="W2 조회 전용 상시 실행 관리자")
+    p.add_argument("--config", default=str(ROOT / "config" / "watchlist.yaml"))
+    p.add_argument("--watch-db", default=str(DATA / "watch" / "watch.sqlite3"))
+    p.add_argument("--db", default=str(DATA / "research" / "research.sqlite3"))
+    p.add_argument("--daemon-db", default=str(DATA / "watch" / "daemon.sqlite3"))
+    p.add_argument("--watch-scan-db", default=str(DATA / "watch" / "watch_s1.sqlite3"))
+    p.add_argument("--watch-open-db", default=str(DATA / "watch" / "watch_open.sqlite3"))
+    p.add_argument("--report-dir", default=str(ROOT / "reports" / "watch"))
+    p.add_argument("--log-file", default=str(ROOT / "logs" / "watch_daemon.log"))
+    p.add_argument("--research-config", default=str(DEFAULT_RESEARCH_CONFIG), help="개장 확인 offset·허용 시간")
+    p.add_argument("--env-file", default=str(ROOT / ".env"))
+    p.add_argument("--base-url", default="https://mockapi.kiwoom.com")
+    p.add_argument("--sleep", type=float, default=1.0, help="API 호출 간격(초, 0.5 이상)")
+    p.add_argument("--after-close-min", type=int, default=int(BAR_COMPLETE_AFTER_CLOSE.total_seconds() // 60))
+    sub = p.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("--poll-sec", type=float, default=60.0)
+    r.add_argument("--daily-call-cap", type=int, default=3000, help="하루 조회 호출 상한(모든 작업 합계)")
+    r.add_argument("--max-task-sec", type=float, default=1800.0, help="작업 하나의 시간 상한 — 넘으면 양보")
+    r.add_argument("--max-ticks", type=int, help="시험용: 순회 횟수 상한")
+    r.add_argument("--until-idle", action="store_true", help="지금 실행할 작업이 없어질 때까지만")
+    st = sub.add_parser("status")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--poll-sec", type=float, default=60.0, help="응답 없음 판단 기준(heartbeat > 3×poll)")
+    sub.add_parser("stop")
+    rp = sub.add_parser("report")
+    rp.add_argument("--day", required=True)
+    sub.add_parser("doctor")
+    return p
+
+
+def paths_of(args) -> DaemonPaths:
+    return DaemonPaths(Path(args.config), Path(args.watch_db), Path(args.db), Path(args.daemon_db),
+                       Path(args.watch_scan_db), Path(args.watch_open_db), Path(args.report_dir),
+                       Path(args.log_file) if args.log_file else None)
+
+
+def _settings(args) -> DaemonSettings:
+    rs = load_research_settings(args.research_config)
+    return DaemonSettings(poll_sec=getattr(args, "poll_sec", 60.0), daily_call_cap=getattr(args, "daily_call_cap", 3000),
+                          max_task_sec=getattr(args, "max_task_sec", 1800.0),
+                          open_offset_min=rs.open_check.offset_min,
+                          on_time_tolerance_sec=rs.open_check.on_time_tolerance_sec,
+                          after_close=timedelta(minutes=args.after_close_min))
+
+
+def running(daemon_db: Path) -> bool:
+    """관리자 잠금이 잡혀 있으면 실행 중."""
+    try:
+        with file_lock(Path(str(daemon_db) + ".lock"), timeout=0, what="상태 확인"):
+            return False
+    except ConfigLockTimeout:
+        return True
+
+
+def cmd_status(args, *, now, calendar) -> int:
+    p = paths_of(args)
+    if not p.daemon_db.exists():
+        print("관리자 기록 없음 — 아직 한 번도 실행하지 않음(`run`)")
+        return 2
+    alive = running(p.daemon_db)
+    with DaemonStore(p.daemon_db) as ds:
+        last = ds.last_run()
+        t_now = now()
+        state = "기록 없음"
+        if last is not None:
+            age = (t_now - datetime.fromisoformat(last["heartbeat_at"])).total_seconds()
+            if alive:
+                state = (f"실행 중 · heartbeat {age:.0f}초 전" if age <= 3 * args.poll_sec
+                         else f"응답 없음 — 잠금은 있으나 heartbeat {age:.0f}초 전(멈춤 의심: stop 후 다시 run)")
+            elif last["state"] == "RUNNING":
+                state = "비정상 종료 — 잠금 없음(프로세스가 끝남). 다시 run하면 중단된 작업을 이어서 함"
+            else:
+                state = f"중지됨({last['state']} {last['stopped_at']})"
+        tasks = ds.tasks(limit=12)
+        usage = ds.calls(t_now.date())
+        since = ds.meta("since")
+    with WatchStore(p.watch_db) as ws:
+        st = load_state(ws)
+    nxt = None
+    try:
+        d = WatchDaemon(p, calendar, None, settings=_settings(args), now=now, log=lambda m: None, hook=lambda x: None)
+        nxt = d.next_due(t_now)
+        d.dstore.close()
+    except ResearchSettingsError:
+        pass
+    out = {"daemon": state, "run": last, "since": since, "config": st.summary(), "calls_today": usage,
+           "next_due": nxt.isoformat() if nxt else None,
+           "tasks": [{k: t[k] for k in ("kind", "trading_day", "status", "attempts", "failures", "finished_at",
+                                        "next_retry_at", "config_version", "contract_hash", "error", "report_path",
+                                        "report_error")} for t in tasks]}
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+        return 0
+    print(f"관리자: {state}")
+    if last:
+        print(f"  run_id {last['run_id']} pid {last['pid']} 시작 {last['started_at']} 현재 작업 {last['current_task'] or '-'}"
+              + (f" · 마지막 오류 {last['last_error']}" if last["last_error"] else ""))
+    s = st.summary()
+    print("설정: " + (f"v{s['active_version']} 사용 중" if st.can_monitor else "정상 설정 없음")
+          + (f" · 신규 진입 차단 — {st.block_reason}" if st.entry_blocked else "")
+          + "  (마지막 반영 기준 — 관리자가 매 순회 다시 반영)")
+    print(f"오늘 호출 {usage}회 · 다음 예정 {out['next_due'] or '-'} · 운영 시작일 {since}")
+    print("\n| 작업 | 거래일 | 상태 | 시도/실패 | 끝 | 다음 시도 | 설정 | 오류 |")
+    print("|---|---|---|---|---|---|---|---|")
+    for t in tasks:
+        print(f"| {t['kind']} | {t['trading_day']} | {t['status']} | {t['attempts']}/{t['failures']} | "
+              f"{t['finished_at'] or '-'} | {t['next_retry_at'] or '-'} | v{t['config_version'] or '-'} | "
+              f"{(t['error'] or (('보고서 실패: ' + t['report_error']) if t['report_error'] else '-'))[:70]} |")
+    return 0
+
+
+def cmd_doctor(args, *, runner=None) -> int:
+    """Windows 작업 스케줄러에서 이 레포의 매일 실행과 겹칠 수 있는 항목을 찾아 안내(읽기만)."""
+    p = paths_of(args)
+    print(f"관리자: {'실행 중' if p.daemon_db.exists() and running(p.daemon_db) else '실행 안 함'}")
+    if runner is None:
+        if sys.platform != "win32":
+            print("작업 스케줄러 확인은 Windows에서만 — 이 환경에서는 건너뜀")
+            return 0
+        runner = lambda: subprocess.run(["schtasks", "/Query", "/FO", "CSV", "/V"], capture_output=True,  # noqa: E731
+                                        text=True, encoding="cp949", errors="replace", timeout=60).stdout
+    try:
+        text = runner()
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[확인 못 함] schtasks 실행 실패 {type(exc).__name__}: {exc}")
+        return 2
+    rows = list(csv.DictReader(io.StringIO(text)))
+    hits = []
+    for r in rows:
+        run = next((v for k, v in r.items() if k and ("Task To Run" in k or "실행할 작업" in k)), "") or ""
+        name = next((v for k, v in r.items() if k and ("TaskName" in k or "작업 이름" in k)), "") or ""
+        if any(h in run for h in SCHEDULER_HINTS) and (name, run) not in hits:
+            hits.append((name, run))
+    if not hits:
+        print("겹칠 만한 작업 스케줄러 항목 없음")
+        return 0
+    print("| 작업 이름 | 실행 명령 | 안내 |")
+    print("|---|---|---|")
+    for name, run in hits:
+        why = ("관리자와 같은 일(지정 종목 준비)을 함 — 관리자를 쓰면 중지 권장" if "watchlist.py" in run else
+               "전체 시장 수집·스캔·개장 확인 — 관리자와 대상이 달라 함께 써도 됨(같은 연구 DB에 써서 그 시간엔 느려질 수 있음)"
+               if "research_collect" in run else
+               "관리자를 이 항목으로 띄우는 중이면 run --until-idle 또는 한 번만 시작되게 확인" if "watch_daemon" in run
+               else "확인 필요")
+        print(f"| {name} | {run} | {why} |")
+    print("\n이 명령은 작업 스케줄러를 바꾸지 않습니다. 정리는 작업 스케줄러에서 직접 하세요.")
+    return 1
+
+
+def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar: TradingCalendar | None = None,
+         sleep=time.sleep, log=print) -> int:
+    args = build_parser().parse_args(argv)
+    calendar = calendar or TradingCalendar.load()
+    if os.environ.get("WATCH_TEST_NOW"):                   # 시험용 고정 시계(별도 프로세스 시험) — 운영에서는 쓰지 않음
+        fixed = datetime.fromisoformat(os.environ["WATCH_TEST_NOW"])
+        now = lambda: fixed  # noqa: E731
+    if args.cmd == "status":
+        return cmd_status(args, now=now, calendar=calendar)
+    if args.cmd == "doctor":
+        return cmd_doctor(args)
+    p = paths_of(args)
+    if args.cmd == "stop":
+        if not p.daemon_db.exists() or not running(p.daemon_db):
+            print("실행 중인 관리자가 없음")
+            return 0
+        with DaemonStore(p.daemon_db) as ds:
+            ok = ds.request_stop()
+        print("중지 요청을 남김 — 다음 순회(작업 중이면 대상 사이)에서 멈춥니다" if ok else "실행 기록을 찾지 못함")
+        return 0 if ok else 2
+    if args.cmd == "report":
+        with DaemonStore(p.daemon_db) as ds:
+            try:
+                path = write_daily_report(ds, p, date.fromisoformat(args.day).isoformat())
+            except OSError as exc:
+                print(f"[실패] 보고서 {type(exc).__name__}: {exc}")
+                return 1
+            for t in ds.tasks(args.day):
+                if t["report_error"]:
+                    ds.set_report(t["task_key"], path, None)
+        print(f"보고서: {path}")
+        return 0
+    # run
+    try:
+        settings = _settings(args)
+    except ResearchSettingsError as exc:
+        print(f"[설정 오류] {exc}")
+        return 2
+    try:
+        with daemon_lock(p.daemon_db):
+            if client is None:
+                client = _LazyClient(lambda: make_client(args))
+            d = WatchDaemon(p, calendar, client, settings=settings, now=now, sleep=sleep, log=log)
+            d.start()
+            state, err = "STOPPED", ""
+            try:
+                if args.until_idle:
+                    state = "IDLE"
+                    while True:
+                        r = d.tick()
+                        if not r.get("ran") or r.get("stop"):
+                            break
+                    d.retry_reports()
+                else:
+                    state = d.run_forever(max_ticks=args.max_ticks)
+            except ResearchConfigError as exc:
+                state, err = "FAILED", f"API 설정 오류: {exc}"
+                print(f"[중단] {err}")
+            except BaseException as exc:
+                state, err = "FAILED", f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                try:
+                    d.stop(state, err)
+                except Exception as exc:                     # noqa: BLE001 — 상태 저장 실패를 정상으로 보이지 않게
+                    print(f"[경고] 관리자 종료 상태 저장 실패 {type(exc).__name__}: {exc}")
+                    return 1
+            return 0 if state in ("STOPPED", "IDLE", "MAX_TICKS", "INTERRUPTED") else 1
+    except ConfigLockTimeout:
+        print("[중단] 이미 실행 중인 관리자가 있음 — `status`로 확인, 끝내려면 `stop`")
+        return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+    try:
+        sys.exit(main())
+    except (ResearchConfigError, ResearchApiError) as exc:
+        print(f"[중단] {type(exc).__name__}: {exc}")
+        sys.exit(2)

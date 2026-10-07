@@ -358,8 +358,11 @@ def entry_gate(state: WatchState, sym: WatchSymbol, ready: dict | None, risk: di
 def prepare_data(wstore: WatchStore, rstore: ResearchStore, collector, calendar: TradingCalendar,
                  state: WatchState, listing: dict[str, Listing] | None, *, now: Callable[[], datetime],
                  codes: list[str] | None = None, after_close: timedelta = BAR_COMPLETE_AFTER_CLOSE,
-                 log: Callable[[str], None] = lambda m: None) -> dict:
-    """등록 종목(+지수)만 갱신하고 준비 상태를 저장. codes가 있으면 그 종목(+지수)만 조회 — 상태 판정은 전체 등록 종목."""
+                 log: Callable[[str], None] = lambda m: None,
+                 should_stop: Callable[[], str | None] | None = None) -> dict:
+    """등록 종목(+지수)만 갱신하고 준비 상태를 저장. codes가 있으면 그 종목(+지수)만 조회 — 상태 판정은 전체 등록 종목.
+    should_stop(): 대상마다 조회 전에 부름 — 사유를 돌려주면 남은 대상은 조회하지 않고 YIELDED로 끝냄(W2 — 더 급한 작업·
+    중지 요청·호출 예산에 양보). 받은 만큼은 저장돼 있고 다음 실행이 이어서 받음(update_series는 같은 날 다시 불러도 안전)."""
     if not state.can_monitor:
         raise WatchNotReady(state.block_reason)
     cfg, version = state.config, state.active_version
@@ -374,9 +377,14 @@ def prepare_data(wstore: WatchStore, rstore: ResearchStore, collector, calendar:
     run_id = wstore.begin_prepare(version, now(), [t[0] for t in targets])
     fetch: dict[str, dict] = {}
     tally: dict[str, int] = {}
-    status = "COMPLETE"
+    status, yielded = "COMPLETE", ""
     try:
         for sid, kind, code, sym in targets:
+            if should_stop is not None:
+                yielded = should_stop() or ""
+                if yielded:
+                    log(f"[준비] 양보 — {yielded}: 남은 대상 {len(targets) - len(fetch)}개는 다음 실행에서")
+                    break
             lrow = None if listing is None else listing.get(code)
             if kind == "STOCK" and lrow is None:
                 res = {"action": "SKIPPED", "reason": "NOT_IN_LIST"}
@@ -403,9 +411,12 @@ def prepare_data(wstore: WatchStore, rstore: ResearchStore, collector, calendar:
     for r in rows:
         k = f"{r['status']}/{r['analysis_status']}"
         ready[k] = ready.get(k, 0) + 1
-    if tally.get("ERROR"):
+    if yielded:
+        status = "YIELDED"
+    elif tally.get("ERROR"):
         status = "PARTIAL"
-    counts = {"fetch": tally, "readiness": ready, "changed": changed}
-    wstore.finish_prepare(run_id, now(), status, counts)
+    counts = {"fetch": tally, "readiness": ready, "changed": changed,
+              "not_fetched": len(targets) - len(fetch)}
+    wstore.finish_prepare(run_id, now(), status, counts, yielded)
     return {"run_id": run_id, "config_version": version, "status": status, "counts": counts,
-            "calls": getattr(collector.client, "calls", None), "rows": rows}
+            "calls": getattr(collector.client, "calls", None), "rows": rows, "yield_reason": yielded}
