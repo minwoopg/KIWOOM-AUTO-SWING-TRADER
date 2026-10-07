@@ -72,6 +72,18 @@ symbols:
 - **재시작 복구**(모든 설정 반영 전에, 잠금 안): 남은 저널이 있으면 — 파일이 새 내용이고 사용 중 설정 원문과 같으면 확정됨
   (저널만 삭제), 새 내용인데 DB가 다르면 확정 전 중단(원래 파일 복원), 원래 내용이면 교체 전 중단, 둘 다 아니면 그 뒤
   사용자가 고친 것(저널 삭제 — 일반 적용 규칙·보유 보호로 검사).
+- **복구 결과 분류**(W2 검토 R5): 저널은 먼저 형식 검사 — JSON 객체, 필수 키(origin·started_at·pid·old_sha·new_sha·old_b64·
+  expect_version)의 타입, 해시 형식, 시각 형식, base64, **원래 내용과 old_sha 일치**. 하나라도 틀리면 근거로 쓰지 않음.
+
+| 분류 | 복구 결과 | 이후 |
+|---|---|---|
+| 해결됨 | COMMITTED(저널 삭제만 실패해도 — 파일·DB 일치), ROLLED_BACK, NOT_REPLACED, FILE_CHANGED | 일반 적용 계속 |
+| 사람이 해결해야 함 | JOURNAL_UNREADABLE(읽기·JSON 실패), JOURNAL_INVALID(형식·해시 불일치), RESTORE_FAILED(원래 파일 복원 실패 — 결과 불확정) | **일반 적용·편집 안 함**: 이전 정상 설정으로 감시 유지, 신규 진입 차단(`JOURNAL_UNRESOLVED`), REJECTED는 같은 내용이면 한 번만 기록(기록이 DB 잠김으로 실패해도 그 반영 결과는 차단). status·관리자 순회가 저절로 승인하지 않음 |
+
+- 해결 명령(사람이 고름 — 저널은 지우지 않고 `<저널>.<시각>.quarantined`로 격리해 보존):
+  * `python tools/watchlist.py restore [--version N]` — 마지막 정상(또는 N) 버전 원문으로 파일을 되돌려 적용.
+  * `python tools/watchlist.py resolve-journal --keep-file` — 지금 파일을 확인했을 때, 그 파일을 일반 규칙(검증·보유 보호)으로 적용.
+  * 그 밖의 편집 명령(set·add·holding-close 등)은 미해결 저널이 있으면 바꾸지 않고 종료 코드 2.
 
 | 실패·중단 시점 | 결과 |
 |---|---|
@@ -81,6 +93,7 @@ symbols:
 | 확정 뒤 강제 종료 | 다음 실행이 확정 확인(COMMITTED), 저널만 삭제 |
 | 원래 파일 복원 실패 | REJECTED("복원 실패")·신규 진입 차단·저널 유지 → 다음 실행이 다시 복원 |
 | 복원 실패 + 그 기록도 실패 | "결과 불확정" 보고(종료 코드 2)·저널 유지 → 다음 실행이 복구 |
+| 다음 실행의 복구도 복원 실패·저널 손상 | 일반 적용 중단·차단 유지 → `restore` 또는 `resolve-journal --keep-file` |
 
 ## 데이터 준비 (`prepare`, `add`)
 - 대상 = **등록 종목(관심 켜짐 또는 보유 있음) + KOSPI·KOSDAQ 지수**. 비활성 항목·목록의 다른 종목은 조회하지 않음.

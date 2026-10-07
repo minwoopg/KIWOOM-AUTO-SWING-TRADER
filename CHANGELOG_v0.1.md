@@ -1483,4 +1483,70 @@ CLI는 YAML만 되돌리고 DB에는 보유가 지워진 새 설정이 사용 �
 
 ### 전달 파일
 - 패치 0003 (feat: W2 관리자), 0004 (docs) — 배치 A 패치 0001·0002 뒤
+
+## 2026-10-07 — W2 검토 R1~R5: 진입 게이트·미해결 저널·양보 대기·요청 경계 상한·계약별 작업 키 (GPT 검토 `1a7e8f0`)
+
+### 배경
+GPT가 `1a7e8f0`(배치 B 관리자)에서 다섯 문제를 재현: 설정 거부·이력 부족으로 진입이 막힌 상태의 PASS가 다음 날 개장 후보로 쓰임(R1),
+호출 예산 양보 뒤 같은 작업을 쉬지 않고 반복(R2), 호출 상한을 대상 사이에서만 검사해 상한을 넘김(R3), 계산 계약이 바뀌어도 작업이
+끝난 것으로 봄(R4), 미해결 적용 저널의 REJECTED를 다음 반영이 APPLIED로 덮음(R5). 주문 연결 없음.
+
+### 변경 내용
+| 항목 | 수정 전 | 수정 후 |
+|---|---|---|
+| R1 후보 경로 | `entry_blocked`를 detail에 적기만, 개장 확인은 계산 PASS를 그대로 후보로 | **계산 PASS(관찰 DB, final 규칙 그대로)와 운영 진입 자격(관리자 DB `candidate_gate`)을 분리 저장**. SCAN 근거(관찰 직후, 개장 전 설정 변경 때 재판정 `REGATE`) ∧ 개장 확인 때 현재 상태 통과만 후보. 제외 사유·설정 버전·최근 시도 상태·목록 스냅숏·준비/위험 근거 보존. 근거 없으면 `NO_GATE_EVIDENCE`, 게이트 없이 확정된 이전 목록은 `LEGACY_NO_EVIDENCE`(조회 안 함) |
+| R2 양보 뒤 | YIELDED `next_retry_at=지금` → 즉시 반복 | 사유별 다시 시도 시각: CALL_BUDGET → 다음 날 00:00, TIME_BUDGET → poll 뒤, PRIORITY·STOP → 지금. 예산이 이미 소진이면 **시작하지 않고 미룸**(시도 수 그대로, 같은 미룸 한 번만 기록). PRIORITY는 지금 실행 가능한 OPEN_CHECK가 있을 때만. `run --until-idle`은 지금 할 일이 없으면 끝(안전 상한 200) |
+| R3 요청 경계 | 대상 사이에서만, 작업 끝에 사용량 저장 | 클라이언트 `guard`가 **실제 요청 직전마다**(토큰·연속조회 페이지·429/401 재시도) 중지·예산·시간·우선 작업 검사 → `RequestStopped`(보내지 않음). 통과하면 보내기 전에 **요청일** 사용량 +1 저장(강제 종료·자정 분할). 마감 준비는 `cap − open_check_reserve(100)`, 개장 확인도 cap 이하 |
+| R4 작업 키 | 대상 코드 해시만 | `scope:v2:` = 대상 코드 + S1 계산 계약 해시(달력·after_close·설정 해시 등) + analysis_basis + history_sessions. 가격대·수동 보유 값 변경은 재실행 안 함. 이전 COMPLETE 행 보존, wd1 DB는 열 때 wd2로(행 보존) |
+| R5 적용 저널 | 손상·복원 실패여도 바로 일반 적용 → APPLIED로 덮음 | 저널 형식 검증(키·타입·해시·시각·base64·원래 내용 해시). 해결됨(COMMITTED·ROLLED_BACK·NOT_REPLACED·FILE_CHANGED) / 미해결(JOURNAL_UNREADABLE·JOURNAL_INVALID·RESTORE_FAILED) 분류 — 미해결이면 일반 적용·편집 중단, 이전 정상 설정 유지, `JOURNAL_UNRESOLVED` 차단(기록이 DB 잠김으로 실패해도). `restore`(저널 격리 후 정상 버전) / `resolve-journal --keep-file`(격리 후 지금 파일을 일반 규칙으로) |
+
+| 파일 | 내용 |
+|---|---|
+| `infra/watch/apply.py` | R5 분류·형식 검증·`quarantine_journal`·`resolve_journal_keep_file`, `sync_file`·`commit_config_text` 미해결 처리 |
+| `infra/watch/manager.py` | `WatchState.journal_block`(차단 사유 JOURNAL_UNRESOLVED), `prepare_data`가 `RequestStopped`를 양보로 |
+| `tools/watchlist.py` | `restore`가 저널 격리, `resolve-journal --keep-file` 추가 |
+| `infra/research/kiwoom_readonly.py` | `guard`·`RequestStopped`(guard 없으면 이전과 같음), 토큰 발급 로그에 expires_dt 필드 유무·타입·길이만 |
+| `infra/research/open_check.py` | `OpenChecker(gate=)` 후보 확정 직전 훅(없으면 연구 경로 그대로) |
+| `infra/watch/daemon.py` | R1~R4, wd2(`candidate_gate`·daemon_run 진척/중지 요청 시각), CALENDAR_UNAVAILABLE, SUPERSEDED, 진척 heartbeat, 실제로 쓴 설정 버전 기록, 다시 시도 5·15·30분(총 4회) |
+| `tools/watch_daemon.py` | `--open-check-reserve`, guard 연결, `run_until_idle`, status에 달력 상태·진척·중지 응답 시간 |
+| `tools/research_collect.py` | `make_client(**kw)` 전달 |
+
+### 테스트 및 검증
+- GPT 재현을 같은 순서로(가짜 키움·가짜 시계, `scratchpad` 재현 스크립트 — 레포 밖):
+
+| 재현 | `1a7e8f0` | 수정 후 |
+|---|---|---|
+| R1-A 설정 거부 중 PASS | 다음 날 후보 OK/1, 가격 조회 ka10001·10003·10004 | NO_CANDIDATES/0, 조회 0 |
+| R1-B history_sessions 300 | 후보 OK/1, 조회 3 | NO_CANDIDATES/0, 조회 0 |
+| R2 예산 소진 뒤 run_forever 5 | 시계 0초, 시도 1→6, 사건 14 | 시계 300초(잠듦), 시도 1→1, next_retry 10/8 00:00, 사건 4 |
+| R3 cap=1 | 사용 2 | 사용 1 |
+| R3 3000 소진 뒤 개장 확인 | 3003, 추가 요청 3 | 3000, 추가 요청 0 |
+| R4 after_close 170 | ran=None, 작업 1 | 새 키 실행, 작업 2(이전 COMPLETE 보존) |
+| R5 손상 저널 | APPLIED·차단 해제, 이력 APPLIED/REJECTED 반복 | REJECTED·차단 유지, 이력 REJECTED 1회 |
+
+- 새 시험 — 관리자 9-1~9-28(+5-2 확장, 4-2 상한 정확히 4), 지정 종목 10-1~10-8. 이전 코드(`1a7e8f0`)에서 check 단위로 돌리면
+  관리자 새 시험 28건 중 26건·5-2 실패, 지정 종목 8건 중 7건 실패. 이전에도 통과한 것은 보호 시험: 9-24(의미 없는 변경 재실행 없음),
+  9-25(개장 전 대상 추가), 10-8(확정 뒤 저널 삭제 실패). 일부는 이전 코드에 없는 API 때문에 예외로 실패(9-10 `run_until_idle`, 9-11
+  `--open-check-reserve`, 10-7 `resolve-journal`) — 동작 차이는 위 재현 표로 확인.
+- 실제 별도 프로세스: 요청 중 강제 종료 뒤 사용량 보존(9-21), 파일 교체 뒤 강제 종료 + 복원 실패(10-3), 확정 뒤 강제 종료 + 저널
+  삭제 실패(10-8), 기존 강제 종료·중복 기동·잠금 경쟁 시험 유지.
+- 변이 7종: 게이트 훅 끔·보내기 전 사용량 저장 제거·예산 다음 창 → 지금·계약을 범위에서 뺌(달력 변경 9-23이 잡음)·미해결 저널 무시·
+  개장 전 재판정 끔·PRIORITY 실행 가능 판정 제거 — 모두 잡힘.
+- 회귀 33개 파일 통과(`--skip test_broker_order_status.py` — 레포에 없는 실측 fixture 필요, 통과로 세지 않음), 수집 120(실측 원문
+  JSONL 사용), 스캔 56, A5 45, S1 49, 지정 종목 60, 관리자 62, 단타 동등성 18/18.
+- **미실측**: 실제 API 운영 로그 없음. 아래 실행 안내대로 사용자 PC에서 수집 필요.
+
+### 변경하지 않은 것
+- S1 계산·`final` 규칙·연구 계약 해시(`170bd3f6d10b`), 연구 CLI의 A5 후보 규칙, 감시 DB 스키마(wa2), 관찰 DB·개장 확인 DB 형식,
+  주문·계좌 경로, 사용자 PC 작업 스케줄러.
+- 보류: S1·개장 확인 하위 보고서 자동 재생성(실패는 detail에 남음 — 일일 보고서만 자동 재생성).
+
+### 다음 작업
+- 실제 모의 도메인 조회 전용 운영 — 마감 준비 → 다음 개장 확인 최소 2쌍, 제어된 중지/재시작·중복 기동 1회, 24시간 이상 인증 갱신,
+  160분 완성 기준 대조(`docs/watch_daemon.md` 실행 안내·번들).
+- 그 뒤 W3 장중 가격 감시·알림.
+
+### 전달 파일
+- 패치 0001 (fix: R5 적용 저널), 0002 (fix: R1~R4 관리자), 0003 (docs) — 기준 `1a7e8f0`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

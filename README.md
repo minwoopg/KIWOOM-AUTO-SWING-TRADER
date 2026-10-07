@@ -264,6 +264,9 @@ python tools/probe_market_data.py --env-file ..\KIWOOM-AUTO-TRADER\.env --skip-d
 - 상시 실행 관리자(W2, 조회 전용): `python tools/watch_daemon.py run | status | stop | report --day D | doctor` — 거래일 달력에 맞춰
   마감 뒤 지정 종목·지수 일봉 준비와 지정 종목 S1 관찰(별도 계약·별도 DB), 다음 거래일 개장 + 5분 가격 기록. 중복 기동·설정 적용 잠금,
   재시작 이어하기, 호출 예산·양보. 명세·Windows 명령·장애별 복구: `docs/watch_daemon.md`.
+  계산 PASS와 운영 진입 자격(설정 정상·관심·위험·준비 기준 게이트)을 따로 저장 — 게이트에서 빠진 신호는 개장 후보가 아님.
+  호출 상한은 실제 요청마다(토큰·연속조회·재시도 포함) 검사, 예산 소진 시 다음 날 00:00까지 미룸. 미해결 적용 저널이면
+  `watchlist.py restore` 또는 `resolve-journal --keep-file`로 사람이 해결할 때까지 신규 진입 차단.
 
 ## 원본과의 관계 (`provenance.json`)
 
