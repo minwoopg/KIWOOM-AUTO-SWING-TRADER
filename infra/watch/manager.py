@@ -7,19 +7,27 @@ from __future__ import annotations
 - 정상 설정이 한 번도 없으면 감시를 시작하지 않음(can_monitor=False).
 - 정상 설정이 있는데 새 내용이 틀리면 마지막 정상 설정으로 감시 유지 + 오류·사용 중 버전 표시, **신규 매수 차단**
   (entry_blocked — 이후 주문 단계가 반드시 확인).
-- 파일이 없어져도 같은 규칙(REJECTED "파일 없음").
+- 파일이 없어지거나 읽을 수 없어도(인코딩·권한 오류 — W1-R4) 같은 규칙(REJECTED).
+- 보유 보호(W1-R1): 마지막 정상 설정에 있던 수동 보유가 새 설정에서 사라지면, `holding-close` 청산 기록(같은 보유 값)이
+  있을 때만 적용. 없으면 REJECTED — 파일을 직접 고쳐도 보유 감시가 조용히 사라지지 않음.
+- 위험 자격(W1-R2): 설정을 읽을 때마다 **최신 종목 목록**으로 종목별 위험 자격(symbol_risk)을 갱신·기록 — 준비(prepare)를
+  기다리지 않음. 진입 관찰은 이 기록으로 판단(준비 기록의 옛 위험 값을 쓰지 않음).
 
 데이터 준비 (`prepare_data`) — 등록 종목(관심 켜짐 또는 보유 있음)과 국내 지수 2개만 갱신
 - 연구 수집기(ResearchCollector.update_series)를 그대로 씀: 없는 시계열은 처음부터 전체 수집(등록 즉시 이력 확보),
   있는 시계열은 새 완성 봉만 추가. 전체 시장 갱신은 하지 않음(그건 tools/research_collect.py update).
 - 종목 목록에 없는 종목·열린 백필 작업에 걸린 시계열은 조회하지 않고 UNKNOWN.
-- 준비 상태(readiness): 최근 완성 거래일까지 확보·검증된 완성 일봉이 history_sessions개 이상이면 READY,
-  아니면 UNKNOWN(사유). 그 시각에 확보 시각이 입증된 봉만 셈(연구 저장소 as_of 조회). READY 전에는 매매 가능 상태가 아님.
+- 준비 상태는 둘로 나눔 (W1-R3):
+  * 가격 데이터(status): 최근 완성 거래일까지 확보 시각이 입증된 일봉이 있고 정합성 정상이면 READY, 아니면 UNKNOWN.
+    보유 가격 감시는 이것만 봄 — 분석이 보류돼도 보유 감시는 유지.
+  * S1 분석(analysis_status): S1 계산과 같은 `SeriesView.window(history_sessions)` 계약 — 기준일 봉 없음·거래 없음
+    (NO_TRADES_AT_T), 창 안 거래 없는 봉(NO_TRADES)·누락(DATA_GAP)·이력 부족(INSUFFICIENT_HISTORY)·달력 부족이면 HOLD.
+    READY 전에는 진입 관찰(이후 매수) 대상이 아님.
 - 모든 기록에 적용 중인 설정 버전을 남김.
 """
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -27,6 +35,7 @@ from typing import Callable
 from domain.watchlist.config import (
     Issue, Listing, WatchConfig, WatchSymbol, config_from_dict, parse_text, validate,
 )
+from domain.research.series import SeriesView
 from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE, INDEX_TARGETS, CollectError, stock_series_id
 from infra.research.kiwoom_readonly import ResearchApiError, ResearchConfigError
 from infra.research.kiwoom_rows import RowError
@@ -35,7 +44,8 @@ from infra.research.store import PENDING, ERROR, IntegrityError, ResearchStore
 from infra.watch.store import APPLIED, REJECTED, WatchStore
 from utils.trading_calendar import TradingCalendar
 
-READY, UNKNOWN = "READY", "UNKNOWN"
+READY, UNKNOWN, HOLD = "READY", "UNKNOWN", "HOLD"
+RISK_OK, RISK_FLAGGED, RISK_NOT_IN_LIST, RISK_NO_LIST = "OK", "RISK", "NOT_IN_LIST", "NO_LIST"
 INDEX_NAMES = {"INDEX:KOSPI:001": "KOSPI", "INDEX:KOSDAQ:101": "KOSDAQ"}
 
 
@@ -108,9 +118,25 @@ def _issues(xs: list[Issue]) -> list[dict]:
     return [{"code": i.code, "field": i.field, "message": i.message} for i in xs]
 
 
-def check_text(raw_text: str | None, listing: dict[str, Listing] | None, *, check_list: bool = True):
-    """원문 → ValidationResult (파일 없음·YAML 오류도 오류 결과로)."""
+def read_config_text(path: str | Path) -> tuple[str | None, str | None]:
+    """(원문, 읽기 오류). 없으면 (None, None). 인코딩·권한 등 읽기 실패는 예외 대신 오류 문자열 (W1-R4)."""
+    p = Path(path)
+    try:
+        if not p.exists():
+            return None, None
+        return p.read_text(encoding="utf-8"), None
+    except UnicodeError as exc:
+        return None, f"UTF-8로 읽을 수 없음({type(exc).__name__}) — 파일을 UTF-8로 저장하세요"
+    except OSError as exc:
+        return None, f"파일을 읽을 수 없음({type(exc).__name__}: {exc.strerror or exc})"
+
+
+def check_text(raw_text: str | None, listing: dict[str, Listing] | None, *, check_list: bool = True,
+               read_error: str | None = None):
+    """원문 → ValidationResult (파일 없음·읽기 실패·YAML 오류도 오류 결과로)."""
     from domain.watchlist.config import ValidationResult
+    if read_error:
+        return ValidationResult(None, [Issue("-", "file", read_error)])
     if raw_text is None:
         return ValidationResult(None, [Issue("-", "file", "설정 파일 없음")])
     raw, perr = parse_text(raw_text)
@@ -119,21 +145,83 @@ def check_text(raw_text: str | None, listing: dict[str, Listing] | None, *, chec
     return validate(raw, listing, check_list=check_list)
 
 
+def holding_guard(wstore: WatchStore, active: WatchConfig | None, active_version: int | None,
+                  new: WatchConfig) -> tuple[list[Issue], dict[str, int], list[str]]:
+    """마지막 정상 설정의 수동 보유가 새 설정에서 사라졌는지 (W1-R1).
+    반환 (오류, 쓸 청산 기록 {코드: close_id}, 무효로 할 청산 기록 코드 — 보유가 그대로 남은 종목)."""
+    errors, used, void = [], {}, []
+    if active is None:
+        return errors, used, void
+    for old in active.symbols:
+        if old.holding is None:
+            continue
+        cur = new.symbol(old.code)
+        if cur is not None and cur.holding is not None:
+            if wstore.open_close(old.code) is not None:
+                void.append(old.code)
+            continue
+        close = wstore.open_close(old.code)
+        if close is not None and close["holding"] == asdict(old.holding):
+            used[old.code] = close["close_id"]
+            continue
+        h = old.holding
+        errors.append(Issue(old.code, "holding",
+                            f"마지막 정상 v{active_version}의 수동 보유({h.quantity:,}주 @ {h.avg_price:,})가 새 설정에 없음 — "
+                            f"청산이면 `python tools/watchlist.py holding-close {old.code}`로 기록하세요"
+                            "(그 전까지 보유 감시 유지)"))
+    return errors, used, void
+
+
+def refresh_risk(wstore: WatchStore, state: WatchState, listing: dict[str, Listing] | None, snapshot_id: int | None,
+                 *, now: datetime) -> int:
+    """사용 중 설정의 종목별 위험 자격을 최신 목록으로 갱신 (W1-R2). 반환: 바뀐 수."""
+    if state.config is None:
+        return 0
+    rows = []
+    for sym in state.config.symbols:
+        lr = None if listing is None else listing.get(sym.code)
+        if listing is None:
+            st, flags = RISK_NO_LIST, []
+        elif lr is None:
+            st, flags = RISK_NOT_IN_LIST, []
+        else:
+            st, flags = (RISK_FLAGGED if lr.risk_flags else RISK_OK), list(lr.risk_flags)
+        rows.append({"code": sym.code, "status": st, "flags": flags})
+    return wstore.set_risk(rows, snapshot_id=snapshot_id, version=state.active_version, at=now)
+
+
 def sync_config(wstore: WatchStore, path: str | Path, listing: dict[str, Listing] | None,
                 snapshot_id: int | None, *, now: datetime, origin: str = "FILE") -> tuple[WatchState, dict]:
-    """설정 파일을 읽어 검증·기록. 반환 (상태, 이번 시도 {version, status, new, errors, warnings})."""
+    """설정 파일을 읽어 검증·기록하고 위험 자격을 갱신. 반환 (상태, 이번 시도 {version, status, new, errors, warnings})."""
+    from domain.watchlist.config import ValidationResult
     p = Path(path)
-    raw_text = p.read_text(encoding="utf-8") if p.exists() else None
-    raw_sha = "MISSING" if raw_text is None else hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16]
-    res = check_text(raw_text, listing)
+    raw_text, read_error = read_config_text(p)
+    if read_error:
+        try:
+            raw_sha = "UNREADABLE:" + hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        except OSError:
+            raw_sha = "UNREADABLE"
+    else:
+        raw_sha = "MISSING" if raw_text is None else hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16]
+    res = check_text(raw_text, listing, read_error=read_error)
+    before = load_state(wstore)
+    used, void = {}, []
+    if res.ok:
+        guard, used, void = holding_guard(wstore, before.config, before.active_version, res.config)
+        if guard:
+            res = ValidationResult(None, guard, res.warnings)
     status = APPLIED if res.ok else REJECTED
     version, new = wstore.record_attempt(
         at=now, origin=origin, source_path=str(p), raw_sha=raw_sha, status=status,
         config_hash=res.config.norm_hash() if res.ok else None, errors=_issues(res.errors),
         warnings=_issues(res.warnings), raw_text=raw_text, config=res.config.to_dict() if res.ok else None,
         list_snapshot_id=snapshot_id)
-    return load_state(wstore), {"version": version, "status": status, "new": new, "errors": _issues(res.errors),
-                                "warnings": _issues(res.warnings)}
+    if res.ok and (used or void):
+        wstore.settle_closes(used, void, version)
+    state = load_state(wstore)
+    refresh_risk(wstore, state, listing, snapshot_id, now=now)
+    return state, {"version": version, "status": status, "new": new, "errors": _issues(res.errors),
+                   "warnings": _issues(res.warnings)}
 
 
 # ── 데이터 준비 상태 ─────────────────────────────────────────
@@ -149,60 +237,75 @@ def _targets(cfg: WatchConfig, codes: list[str] | None = None) -> list[tuple[str
 def evaluate_readiness(rstore: ResearchStore, calendar: TradingCalendar, cfg: WatchConfig,
                        listing: dict[str, Listing] | None, *, now: datetime,
                        after_close: timedelta = BAR_COMPLETE_AFTER_CLOSE, fetch: dict | None = None) -> list[dict]:
-    """감시 대상(지수 2 + 등록 종목) 각각 READY / UNKNOWN(사유). 저장하지 않음."""
+    """감시 대상(지수 2 + 등록 종목)마다 가격 데이터 준비(READY/UNKNOWN)와 S1 분석 준비(READY/HOLD). 저장하지 않음.
+    사유는 범주만(날짜·봉 수는 detail) — 매일 숫자가 바뀌어도 상태 이력이 늘지 않게."""
     need = cfg.monitor.history_sessions
     fetch = fetch or {}
     try:
         t = expected_session(calendar, now, after_close)
         sessions = calendar.trading_days_in_range(date(min(calendar.covered_years), 1, 1), t)
-        cal_err = "" if len(sessions) >= need else f"CALENDAR_SHORT:{len(sessions)}/{need}"
+        cal_err = ""
     except ScanError as exc:
         t, sessions, cal_err = None, [], f"CALENDAR:{exc}"[:200]
-    window = sessions[-need:]
+    start = sessions[-need:][0] if sessions else None
     rows = []
     for sid, kind, code, sym in _targets(cfg):
         lrow = None if listing is None or kind != "STOCK" else listing.get(code)
         detail = {"need": need, "expected_last": None if t is None else t.isoformat(),
                   "modes": list(sym.modes) if sym else ["MARKET"], "fetch": fetch.get(sid)}
         if lrow is not None:
-            detail["risk_flags"] = list(lrow.risk_flags)
             detail["security_type"] = lrow.security_type
-        reason = ""
+        reason, a_status, a_reason = "", HOLD, ""
         if cal_err:
-            reason = cal_err
+            reason = a_reason = cal_err.split(":")[0]
+            detail["calendar"] = cal_err
         elif kind == "STOCK" and lrow is None:
-            reason = "NOT_IN_LIST"
+            reason = a_reason = "NOT_IN_LIST"
         else:
             try:
-                rs = rstore.research_series(sid, as_of=now, start=window[0])
+                rs = rstore.research_series(sid, as_of=now, start=start)
             except KeyError:
                 rs = None
             st = data_status(rs, t)
-            have = 0 if rs is None else len({b.date for b in rs.bars if b.date >= window[0]})
-            detail.update(have=have, last=None if rs is None or not rs.bars else rs.bars[-1].date.isoformat())
-            detail["data_status"] = st
+            detail.update(data_status=st, have=0 if rs is None else len(rs.bars),
+                          last=None if rs is None or not rs.bars else rs.bars[-1].date.isoformat())
             if st != OK:
-                # 사유는 범주만(날짜·개수는 detail) — 매일 숫자가 바뀌어도 상태 이력이 늘지 않게
                 reason = st if st.startswith("INTEGRITY") else st.split(":")[0]
-            elif have < need:
-                first = rs.bars[0].date if rs.bars else None
-                reason = "INSUFFICIENT_HISTORY" if first is None or first > window[0] else "MISSING_SESSIONS"
+                a_reason = "DATA_" + UNKNOWN
+            else:
+                # S1 계산과 같은 계약: 기준일 봉·거래, 창 안 거래 없는 봉·누락·이력·달력 (W1-R3)
+                bars, why = SeriesView(rs.bars, sessions, t, source_id=sid).window(need)
+                detail["window"] = why or "OK"
+                if bars is not None:
+                    a_status = READY
+                else:
+                    a_reason = why.split(":")[0]
         rows.append({"target": sid, "kind": kind, "code": code, "status": UNKNOWN if reason else READY,
-                     "reason": reason, "detail": detail})
+                     "reason": reason, "analysis_status": a_status, "analysis_reason": a_reason, "detail": detail})
     return rows
 
 
-def entry_gate(state: WatchState, sym: WatchSymbol, ready: dict | None) -> tuple[bool, list[str]]:
-    """신규 진입 관찰(이후 매수) 가능 여부와 막는 이유 — 데이터 UNKNOWN·위험 표시·설정 오류·관심 꺼짐이면 불가."""
+def entry_gate(state: WatchState, sym: WatchSymbol, ready: dict | None, risk: dict | None, *,
+               snapshot_id: int | None = None) -> tuple[bool, list[str]]:
+    """신규 진입 관찰(이후 매수) 가능 여부와 막는 이유. 설정 오류·관심 꺼짐·위험 자격(최신 목록 기준 symbol_risk,
+    snapshot_id를 주면 그 목록으로 다시 확인된 기록만)·가격 데이터·S1 분석 준비 중 하나라도 아니면 불가."""
     why = []
     if state.entry_blocked:
         why.append(state.block_reason.split("(")[0])
     if not sym.interest_active:
         why.append("INTEREST_OFF")
+    if risk is None:
+        why.append("RISK_UNVERIFIED")
+    elif snapshot_id is not None and risk["list_snapshot_id"] != snapshot_id:
+        why.append("RISK_STALE")
+    elif risk["status"] == RISK_FLAGGED:
+        why.append("RISK_FLAGS")
+    elif risk["status"] != RISK_OK:
+        why.append(f"RISK:{risk['status']}")
     if ready is None or ready["status"] != READY:
         why.append(f"DATA_{UNKNOWN}" + ("" if ready is None else f":{ready['reason']}"))
-    elif ready["detail"].get("risk_flags"):
-        why.append("RISK_FLAGS")
+    elif ready.get("analysis_status") != READY:
+        why.append(f"ANALYSIS_{HOLD}:{ready.get('analysis_reason') or 'NOT_EVALUATED'}")
     return not why, why
 
 
@@ -251,9 +354,10 @@ def prepare_data(wstore: WatchStore, rstore: ResearchStore, collector, calendar:
         raise
     rows = evaluate_readiness(rstore, calendar, cfg, listing, now=now(), after_close=after_close, fetch=fetch)
     changed = wstore.set_readiness(rows, version=version, run_id=run_id, at=now())
-    ready = {r["status"]: 0 for r in rows}
+    ready: dict[str, int] = {}
     for r in rows:
-        ready[r["status"]] += 1
+        k = f"{r['status']}/{r['analysis_status']}"
+        ready[k] = ready.get(k, 0) + 1
     if tally.get("ERROR"):
         status = "PARTIAL"
     counts = {"fetch": tally, "readiness": ready, "changed": changed}

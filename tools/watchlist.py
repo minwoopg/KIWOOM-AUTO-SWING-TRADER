@@ -32,6 +32,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from dataclasses import asdict  # noqa: E402
+
 from domain.watchlist.config import (  # noqa: E402
     Interest, PriceBand, dump_document, empty_document, find_item, parse_text,
 )
@@ -39,7 +41,8 @@ from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE, CollectError, Res
 from infra.research.kiwoom_readonly import ResearchApiError, ResearchConfigError  # noqa: E402
 from infra.research.store import ResearchStore  # noqa: E402
 from infra.watch.manager import (  # noqa: E402
-    READY, WatchNotReady, check_text, entry_gate, listing_from_store, load_state, prepare_data, sync_config,
+    READY, WatchNotReady, check_text, entry_gate, listing_from_store, load_state, prepare_data, read_config_text,
+    sync_config,
 )
 from infra.watch.store import WatchStore  # noqa: E402
 from tools.research_collect import _LazyClient, make_client  # noqa: E402
@@ -221,7 +224,7 @@ def _atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def _status_table(state, wstore: WatchStore, listing) -> None:
+def _status_table(state, wstore: WatchStore, listing, snap_id=None) -> None:
     s = state.summary()
     if not state.can_monitor:
         print(f"설정: {state.block_reason}")
@@ -233,14 +236,16 @@ def _status_table(state, wstore: WatchStore, listing) -> None:
         _print_issues(state.config_error, [])
     if state.config is None:
         return
-    ready = wstore.readiness()
-    print("\n| 대상 | 이름 | 관심 | S1 | 관심 가격대 | 수동 보유(증권사 잔고 아님) | 데이터 | 위험 표시 | 신규 진입 관찰 |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    ready, risks = wstore.readiness(), wstore.risk()
+    print(f"\n종목 목록 스냅숏 {snap_id} 기준 위험 자격 · 가격 데이터 = 보유 가격 감시용, S1 분석 = 진입 관찰용")
+    print("| 대상 | 이름 | 관심 | S1 | 관심 가격대 | 수동 보유(증권사 잔고 아님) | 가격 데이터 | S1 분석 | 위험 자격 | 신규 진입 관찰 |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for sid in ("INDEX:KOSPI:001", "INDEX:KOSDAQ:101"):
         r = ready.get(sid)
-        print(f"| {sid} | - | - | - | - | - | {_ready_cell(r)} | - | - |")
+        print(f"| {sid} | - | - | - | - | - | {_ready_cell(r)} | {_analysis_cell(r)} | - | - |")
     for sym in state.config.symbols:
         r = ready.get(f"STOCK:{sym.code}")
+        rk = risks.get(sym.code)
         lr = None if listing is None else listing.get(sym.code)
         it = sym.interest or Interest(False)
         bands = ", ".join(f"{b.low:,}~{b.high:,}{'(' + b.label + ')' if b.label else ''}" for b in it.price_bands)
@@ -250,23 +255,27 @@ def _status_table(state, wstore: WatchStore, listing) -> None:
         if not sym.active:
             gate = "감시 안 함(비활성)"
         else:
-            ok, why = entry_gate(state, sym, r)
+            ok, why = entry_gate(state, sym, r, rk, snapshot_id=snap_id)
             gate = "가능" if ok else "제외 " + ",".join(why)
-        risk = "-" if lr is None else (",".join(lr.risk_flags) or "없음")
+        risk = "미확인" if rk is None else (",".join(rk["flags"]) or ("없음" if rk["status"] == "OK" else rk["status"]))
         print(f"| {sym.code} | {lr.name if lr else (sym.name or '?')} | {'켜짐' if sym.interest_active else '꺼짐'} | "
               f"{'예' if it.s1_analysis else '-'} | {bands or '-'} | {hold} | "
-              f"{_ready_cell(r) if sym.active else '-'} | {risk} | {gate} |")
+              f"{_ready_cell(r) if sym.active else '-'} | {_analysis_cell(r) if sym.active else '-'} | {risk} | {gate} |")
 
 
 def _ready_cell(r) -> str:
     if r is None:
         return "UNKNOWN(준비 안 함 — prepare)"
-    if r["status"] == READY:
+    return READY if r["status"] == READY else f"UNKNOWN({r['reason']})"
+
+
+def _analysis_cell(r) -> str:
+    if r is None or r.get("analysis_status") is None:
+        return "HOLD(준비 안 함 — prepare)"
+    if r["analysis_status"] == READY:
         return READY
-    d = r.get("detail") or {}
-    extra = f" {d['have']}/{d['need']}봉" if "have" in d and r["reason"] in ("INSUFFICIENT_HISTORY", "MISSING_SESSIONS") \
-        else ""
-    return f"UNKNOWN({r['reason']}{extra})"
+    w = (r.get("detail") or {}).get("window", "")
+    return f"HOLD({w if ':' in w else r['analysis_reason']})"          # 날짜가 있으면 그대로(NO_TRADES:2026-09-15)
 
 
 def _n(v) -> str:
@@ -288,11 +297,13 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
 
     calendar = calendar or TradingCalendar.load()
     with ResearchStore(args.db) as rstore, WatchStore(args.watch_db) as wstore:
+        if wstore.backup_path:
+            print(f"[감시 저장소 스키마 변경] 바꾸기 전 백업: {wstore.backup_path}")
         listing, snap_id = listing_from_store(rstore)
 
         if args.cmd == "validate":
-            text = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else None
-            res = check_text(text, listing, check_list=not args.no_list)
+            text, rerr = read_config_text(cfg_path)
+            res = check_text(text, listing, check_list=not args.no_list, read_error=rerr)
             print(f"{cfg_path}: {'정상' if res.ok else '오류'}" + ("" if snap_id is None or args.no_list
                                                                  else f" (종목 목록 스냅숏 {snap_id} 대조)"))
             _print_issues([vars(e) for e in res.errors], [vars(w) for w in res.warnings])
@@ -308,7 +319,7 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                     print_json({**state.summary(), "readiness": wstore.readiness(),
                                 "prepare_runs": wstore.prepare_runs(5)})
                 else:
-                    _status_table(state, wstore, listing)
+                    _status_table(state, wstore, listing, snap_id)
                 if args.cmd == "apply":
                     return 0 if att["status"] == "APPLIED" else 2
                 return 0 if state.can_monitor else 2
@@ -322,8 +333,12 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
         collector = ResearchCollector(client, rstore, calendar, after_close=after_close, log=print)
 
         if args.cmd in ("add", "set", "enable", "disable", "holding-close", "remove"):
-            if cfg_path.exists():
-                raw, perr = parse_text(cfg_path.read_text(encoding="utf-8"))
+            text0, rerr = read_config_text(cfg_path)
+            if rerr:
+                print(f"[중단] 지금 파일을 읽을 수 없음 — 고친 뒤 apply: {rerr}")
+                return 2
+            if text0 is not None:
+                raw, perr = parse_text(text0)
                 if perr:
                     print(f"[중단] 지금 파일을 읽을 수 없음 — 직접 고친 뒤 apply: {perr}")
                     return 2
@@ -341,6 +356,13 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                 print("[거부] 바꾼 결과가 검증을 통과하지 못해 파일을 바꾸지 않았습니다:")
                 _print_issues([vars(e) for e in res.errors], [vars(w) for w in res.warnings])
                 return 2
+            if args.cmd == "holding-close":
+                # 명시적 청산 기록 — 이게 있어야 마지막 정상 설정의 보유를 지운 설정이 적용됨 (W1-R1)
+                before = load_state(wstore)
+                old = None if before.config is None else before.config.symbol(_code(args.code))
+                if old is not None and old.holding is not None:
+                    wstore.record_close(_code(args.code), asdict(old.holding), at=now(),
+                                        from_version=before.active_version, origin=f"CLI:{what}")
             _atomic_write(cfg_path, text)
             state, att = sync_config(wstore, cfg_path, listing, snap_id, now=now(), origin=f"CLI:{what}")
             print(f"{what} → v{att['version']} {att['status']}")
@@ -375,7 +397,7 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                 print(f"[시작 안 함] {exc}")
                 return 2
             print_json({k: v for k, v in res.items() if k != "rows"})
-            _status_table(state, wstore, listing)
+            _status_table(state, wstore, listing, snap_id)
             return 0 if res["status"] == "COMPLETE" else 1
     return 2
 

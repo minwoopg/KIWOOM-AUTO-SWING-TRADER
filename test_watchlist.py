@@ -91,21 +91,28 @@ class FakeKiwoom:
         self.start: dict[str, date] = {}
         self.calls: list[tuple[str, str]] = []
         self.fail: set[str] = set()
+        self.no_trades: dict[str, set[date]] = {}     # 거래량 0 봉(OHLC = 전일 종가)
+        self.gaps: dict[str, set[date]] = {}          # 원천에 행이 없는 날
         self.list_rows = {"0": [], "10": []}
 
     def _rows(self, code, base_dt: date):
         out, d, i = [], self.start[code], 0
         last = min(base_dt, self.clock().date())
         index = code in ("001", "101")
+        prev = None
         while d <= last:
-            if is_session(d):
+            if is_session(d) and d not in self.gaps.get(code, ()):
                 c = 10_000 + (i % 37) * 10 + i
-                o, h, lo = c - 5, c + 20, c - 20
+                o, h, lo, v = c - 5, c + 20, c - 20, 100_000 + i
+                if d in self.no_trades.get(code, ()):
+                    o = h = lo = c = prev
+                    v = 0
                 if index:
                     o, h, lo, c = o * 100, h * 100, lo * 100, c * 100
                 out.append({"dt": d.strftime("%Y%m%d"), "open_pric": f"+{o}", "high_pric": f"+{h}",
-                            "low_pric": f"-{lo}", "cur_prc": f"-{c}", "trde_qty": str(100_000 + i),
-                            "trde_prica": str(max(1, c * (100_000 + i) // 1_000_000))})
+                            "low_pric": f"-{lo}", "cur_prc": f"-{c}", "trde_qty": str(v),
+                            "trde_prica": str(0 if v == 0 else max(1, c * v // 1_000_000))})
+                prev = c if not index else prev
                 i += 1
             d += timedelta(days=1)
         return list(reversed(out))
@@ -357,13 +364,22 @@ check("4-1) [GPT] prepare는 등록 종목(관심 켜짐·보유) + 국내 지�
       c_p == 0 and set(codes_p) == {"001", "101", "005930", "000660", "011110", "123450"}
       and "035420" not in codes_p and "247540" not in codes_p and "LIST0" not in codes_p
       and all(a in ("ka10081", "ka20006") for a, _ in E4["fake"].calls))
-g = {c: M.entry_gate(st_p, st_p.config.symbol(c), rd.get(f"STOCK:{c}")) for c in ("005930", "000660", "011110", "123450")}
-check("4-2) [GPT] 준비 상태: 160봉(S1 최소 이력) 확보·검증 → READY, 2026-03 상장(이력 부족) → UNKNOWN(INSUFFICIENT_HISTORY)이며 신규 진입 "
+def gate(env, code, snapshot_id=None):
+    with WatchStore(env["wdb"]) as w:
+        st = M.load_state(w)
+        return M.entry_gate(st, st.config.symbol(code), w.readiness().get(f"STOCK:{code}"), w.risk().get(code),
+                            snapshot_id=snapshot_id)
+
+
+g = {c: gate(E4, c) for c in ("005930", "000660", "011110", "123450")}
+check("4-2) [GPT] 준비 상태: 160봉(S1 최소 이력) 확보·검증 → 가격·분석 READY, 2026-03 상장 → 가격 READY·S1 분석 HOLD(INSUFFICIENT_HISTORY)이며 신규 진입 "
       "관찰 제외. 위험 표시 종목은 데이터 READY여도 진입 관찰 제외(감시는 유지). 보유만 있는 종목은 진입 관찰 대상 아님",
       rd["STOCK:005930"]["status"] == "READY" and rd["INDEX:KOSPI:001"]["status"] == "READY"
-      and rd["STOCK:123450"]["status"] == "UNKNOWN" and rd["STOCK:123450"]["reason"] == "INSUFFICIENT_HISTORY" and rd["STOCK:123450"]["detail"]["have"] < 160
+      and rd["STOCK:123450"]["status"] == "READY" and rd["STOCK:123450"]["analysis_status"] == "HOLD"
+      and rd["STOCK:123450"]["analysis_reason"] == "INSUFFICIENT_HISTORY" and rd["STOCK:123450"]["detail"]["have"] < 160
+      and rd["STOCK:005930"]["analysis_status"] == "READY"
       and rd["STOCK:011110"]["status"] == "READY" and g["005930"] == (True, [])
-      and g["123450"][0] is False and g["123450"][1] == ["DATA_UNKNOWN:INSUFFICIENT_HISTORY"]
+      and g["123450"] == (False, ["ANALYSIS_HOLD:INSUFFICIENT_HISTORY"])
       and g["011110"] == (False, ["RISK_FLAGS"]) and g["000660"] == (False, ["INTEREST_OFF"])
       and "STOCK:035420" not in rd)
 check("4-3) [GPT] 준비 상태·준비 실행에 적용 설정 버전 연결(readiness.config_version·run_id, prepare_run.config_version)",
@@ -380,7 +396,7 @@ with WatchStore(E4["wdb"]) as w4:
 check("4-4) [GPT] 운영 중 설정 오류: 마지막 정상 버전으로 준비 계속(새 봉만 추가 — 다시 받지 않음), 결과는 그 버전에 연결, "
       "모든 종목 신규 진입 차단(CONFIG_ERROR). 상태·사유가 그대로인 대상은 이력 행을 늘리지 않음(봉 수는 detail)",
       c_p2 == 0 and "[설정 오류]" in o_p2 and st_e.entry_blocked
-      and M.entry_gate(st_e, st_e.config.symbol("005930"), rd2["STOCK:005930"]) == (False, ["CONFIG_ERROR"])
+      and gate(E4, "005930") == (False, ["CONFIG_ERROR"])
       and all(r["config_version"] == st_e.active_version for r in rd2.values())
       and len(E4["fake"].calls) == 6 and log_n == 6)
 # 한 종목 조회 실패 — 다른 종목 영향 없음
@@ -430,6 +446,175 @@ c_p5, _ = cli(E4, "prepare", clock_t=datetime(2026, 10, 13, 19, 0))
 check("4-9) 그날 첫 prepare는 종목 목록(ka10099 2회)만 새로 받아 설정을 다시 대조 — 일봉은 등록 종목·지수만",
       c_p5 == 0 and [c for a, c in E4["fake"].calls if a == "ka10099"] == ["LIST0", "LIST10"]
       and {c for a, c in E4["fake"].calls if a != "ka10099"} == {"001", "101", "000660", "011110", "123450", "247540"})
+
+# ── 6. GPT 재검토 0fcfa15 W1-R1~R4 ──────────────────────────
+E6 = setup("w1r")
+HOLD10 = {"code": "000660", "holding": {"quantity": 10, "avg_price": 180000, "stop_price": 165000}}
+E6["cfg"].write_text(dump_document(doc({"code": "005930", "interest": {"enabled": True, "s1_analysis": True}}, HOLD10)),
+                     encoding="utf-8")
+cli(E6, "apply")
+# R1: 파일을 직접 고쳐 보유를 없앰(관심만 꺼진 항목으로) / 항목째 삭제
+E6["cfg"].write_text(dump_document(doc({"code": "005930", "interest": {"enabled": True, "s1_analysis": True}},
+                                       {"code": "000660", "interest": {"enabled": False}})), encoding="utf-8")
+c61, o61 = cli(E6, "apply")
+E6["cfg"].write_text(dump_document(doc({"code": "005930", "interest": {"enabled": True, "s1_analysis": True}})),
+                     encoding="utf-8")
+c61b, o61b = cli(E6, "apply")
+E6["fake"].calls.clear()
+cli(E6, "prepare", "--no-list-refresh")
+with WatchStore(E6["wdb"]) as w6:
+    st61 = M.load_state(w6)
+check("6-1) [W1-R1 재현] 보유 10주 적용 뒤 YAML에서 보유를 지우거나(관심 꺼짐) 항목째 지우면 REJECTED — 마지막 정상 설정의 "
+      "보유 감시 유지(감시 대상·일봉 갱신 계속), 신규 매수 차단, holding-close 안내",
+      (c61, c61b) == (2, 2) and "REJECTED" in o61 and "holding-close 000660" in o61 and "REJECTED" in o61b
+      and st61.config.symbol("000660").holding.quantity == 10 and st61.entry_blocked
+      and "000660" in {c for _, c in E6["fake"].calls})
+# 청산 기록 없이 보유가 남은 설정으로 돌아오면 정상, holding-close는 기록 후 적용
+E6["cfg"].write_text(dump_document(doc({"code": "005930", "interest": {"enabled": True, "s1_analysis": True}}, HOLD10)),
+                     encoding="utf-8")
+cli(E6, "apply")
+c62, o62 = cli(E6, "holding-close", "000660")
+with WatchStore(E6["wdb"]) as w6:
+    st62 = M.load_state(w6)
+    closes = w6.closes()
+check("6-2) [W1-R1] holding-close는 마지막 정상 보유 값으로 청산 기록(OPEN)을 남긴 뒤 적용 → 기록 USED·적용 버전 연결, "
+      "보유 감시 종료(관심 꺼진 항목으로 남음)",
+      c62 == 0 and "APPLIED" in o62 and st62.config.symbol("000660").holding is None and not st62.entry_blocked
+      and len(closes) == 1 and closes[0]["state"] == "USED" and closes[0]["used_version"] == st62.active_version
+      and '"quantity": 10' in closes[0]["holding_json"])
+# 청산 기록이 있어도 보유가 남은 설정이 적용되면 그 기록은 무효(VOID) — 나중의 실수 삭제에 쓰이지 않음
+cli(E6, "set", "000660", "--qty", "3", "--avg", "200000", "--stop", "180000")
+with WatchStore(E6["wdb"]) as w6:
+    w6.record_close("000660", {"quantity": 3, "avg_price": 200000, "stop_price": 180000, "target_price": None,
+                               "source": "MANUAL"}, at=NOW, from_version=None, origin="TEST")
+E6["cfg"].write_text(E6["cfg"].read_text(encoding="utf-8").replace("memo: ''", "memo: x") + "\n", encoding="utf-8")
+cli(E6, "apply")
+E6["cfg"].write_text(dump_document(doc({"code": "005930", "interest": {"enabled": True, "s1_analysis": True}})),
+                     encoding="utf-8")
+c63, _ = cli(E6, "apply")
+with WatchStore(E6["wdb"]) as w6:
+    closes3 = w6.closes()
+check("6-3) [W1-R1] 청산 기록 뒤에도 보유가 그대로인 설정이 적용되면 그 기록은 VOID — 이후 보유 삭제는 다시 거부",
+      closes3[-1]["state"] == "VOID" and c63 == 2)
+
+# R2: 정상 → 투자경고(새 목록) — prepare 없이 status만
+E7 = setup("w1r2")
+E7["cfg"].write_text(dump_document(doc({"code": "005930", "interest": {"enabled": True, "s1_analysis": True}})),
+                     encoding="utf-8")
+cli(E7, "prepare", "--no-list-refresh")
+ok_before = gate(E7, "005930")
+for r in E7["fake"].list_rows["0"]:
+    if r["code"] == "005930":
+        r["state"] = "증거금100%|투자경고"
+with ResearchStore(E7["db"]) as r7:
+    ResearchCollector(E7["client"], r7, CAL).snapshot_universe()
+    _, snap7 = M.listing_from_store(r7)
+c64, o64 = cli(E7, "status")
+with WatchStore(E7["wdb"]) as w7:
+    rlog = w7.risk_log("005930")
+    checks7 = w7.config_checks()
+    hist7 = w7.history()
+row64 = [ln for ln in o64.splitlines() if ln.startswith("| 005930")]
+check("6-4) [W1-R2 재현] READY 종목이 새 목록에서 투자경고 → prepare 전 status만으로 진입 관찰 차단(RISK_FLAGS). 위험 자격 "
+      "이력에 새 목록 스냅숏·위험 표시, 설정 재검증 기록(config_check)·경고가 바뀐 새 적용 기록 남김",
+      ok_before == (True, []) and gate(E7, "005930") == (False, ["RISK_FLAGS"])
+      and [x["status"] for x in rlog] == ["OK", "RISK"] and rlog[-1]["list_snapshot_id"] == snap7
+      and "투자경고" in rlog[-1]["flags_json"] and checks7[-1]["list_snapshot_id"] == snap7
+      and any("투자경고" in w_["message"] for w_ in hist7[0]["warnings"]) and hist7[0]["status"] == "APPLIED"
+      and row64 and "STATE:투자경고" in row64[0] and "RISK_FLAGS" in row64[0])
+check("6-5) [W1-R2] 위험 자격은 확인한 목록과 함께 판단 — 다른(더 새) 목록 스냅숏 기준이면 RISK_STALE로 차단",
+      gate(E7, "005930", snapshot_id=snap7 + 1)[1][0] == "RISK_STALE"
+      and gate(E7, "005930", snapshot_id=snap7)[1] == ["RISK_FLAGS"])
+
+# R3: 기준일 거래 없음 / 창 안 거래 없는 봉 / 창 안 누락 — S1 계산 계약과 같게 보류, 보유 가격 감시는 유지
+E8 = setup("w1r3")
+E8["fake"].no_trades["005930"] = {date(2026, 10, 7)}
+E8["fake"].no_trades["000660"] = {date(2026, 9, 15)}
+E8["fake"].gaps["035420"] = {date(2026, 8, 20)}
+E8["cfg"].write_text(dump_document(doc(
+    {"code": "005930", "interest": {"enabled": True, "s1_analysis": True}},
+    {"code": "000660", "interest": {"enabled": True}, "holding": {"quantity": 5, "avg_price": 180000, "stop_price": 1}},
+    {"code": "035420", "interest": {"enabled": True}})), encoding="utf-8")
+c66, o66 = cli(E8, "prepare", "--no-list-refresh")
+with WatchStore(E8["wdb"]) as w8:
+    rd8 = w8.readiness()
+from domain.research.series import SeriesView  # noqa: E402
+with ResearchStore(E8["db"]) as r8:
+    rs8 = r8.research_series("STOCK:005930", as_of=NOW)
+    sess8 = CAL.trading_days_in_range(date(2026, 1, 1), date(2026, 10, 7))
+    s1_why = SeriesView(rs8.bars, sess8, date(2026, 10, 7)).window(160)[1]
+a = {c: (rd8[f"STOCK:{c}"]["status"], rd8[f"STOCK:{c}"]["analysis_status"], rd8[f"STOCK:{c}"]["analysis_reason"])
+     for c in ("005930", "000660", "035420")}
+check("6-6) [W1-R3 재현] 기준일 봉 거래량 0 → 가격 데이터 READY·S1 분석 HOLD(NO_TRADES_AT_T — S1 SeriesView.window와 같은 "
+      "사유), 창 안 거래 없는 봉 → HOLD(NO_TRADES), 창 안 누락 → HOLD(DATA_GAP). 셋 다 진입 관찰 제외, 보유 종목은 가격 데이터 "
+      "READY로 보유 감시 유지",
+      c66 == 0 and a["005930"] == ("READY", "HOLD", "NO_TRADES_AT_T") and s1_why == "NO_TRADES_AT_T"
+      and a["000660"] == ("READY", "HOLD", "NO_TRADES") and a["035420"] == ("READY", "HOLD", "DATA_GAP")
+      and rd8["STOCK:000660"]["detail"]["window"] == "NO_TRADES:2026-09-15"
+      and gate(E8, "005930")[1] == ["ANALYSIS_HOLD:NO_TRADES_AT_T"]
+      and gate(E8, "035420")[1] == ["ANALYSIS_HOLD:DATA_GAP"] and "HOLD(NO_TRADES:2026-09-15)" in o66
+      and "HOLD(NO_TRADES_AT_T)" in o66)
+
+# R4: 인코딩·읽기 오류
+E9 = setup("w1r4")
+E9["cfg"].write_bytes("schema: w1\nsymbols: []\n# 한글 주석".encode("cp949"))
+c67a, o67a = cli(E9, "prepare", "--no-list-refresh")
+c67v, o67v = cli(E9, "validate")
+E9["cfg"].write_text(dump_document(doc(HOLD10)), encoding="utf-8")
+cli(E9, "apply")
+E9["cfg"].write_bytes(E9["cfg"].read_text(encoding="utf-8").replace("schema", "# 한글\nschema").encode("cp949", errors="replace"))
+c67b, o67b = cli(E9, "status")
+c67e, o67e = cli(E9, "set", "000660", "--qty", "3")
+E9["cfg"].unlink()
+E9["cfg"].mkdir()                                       # 읽기 OSError(IsADirectoryError) 흉내 — 권한 오류와 같은 경로
+c67c, o67c = cli(E9, "status")
+with WatchStore(E9["wdb"]) as w9:
+    st9 = M.load_state(w9)
+    h9 = w9.history()
+check("6-7) [W1-R4 재현] 최초 설정이 UTF-8이 아니면 예외 없이 REJECTED·시작 안 함(종료 코드 2·조회 0), validate도 오류로. "
+      "운영 중 인코딩 오류·읽기 OSError는 REJECTED로 기록하고 마지막 정상 설정·보유 감시 유지, 신규 매수 차단, 편집 명령은 거부",
+      c67a == 2 and "UTF-8" in o67a and "시작 안 함" in o67a and c67v == 2 and "UTF-8" in o67v
+      and E9["fake"].calls == [] and c67b == 0 and "UTF-8" in o67b and "CONFIG_ERROR" in o67b
+      and c67e == 2 and "읽을 수 없음" in o67e and c67c == 0 and "IsADirectoryError" in o67c
+      and st9.config.symbol("000660").holding.quantity == 10 and st9.entry_blocked
+      and [h["status"] for h in h9][:3] == ["REJECTED", "REJECTED", "APPLIED"]
+      and h9[1]["raw_sha"].startswith("UNREADABLE:") and h9[0]["raw_sha"] == "UNREADABLE")
+
+# 감시 저장소 wa1 → wa2 (fe04b30 정의)
+WA1 = """
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE config_version(
+  version INTEGER PRIMARY KEY AUTOINCREMENT, attempted_at TEXT NOT NULL, origin TEXT NOT NULL,
+  source_path TEXT NOT NULL, raw_sha TEXT NOT NULL, status TEXT NOT NULL, config_hash TEXT,
+  errors_json TEXT NOT NULL, warnings_json TEXT NOT NULL, raw_text TEXT, config_json TEXT,
+  list_snapshot_id INTEGER);
+CREATE TABLE readiness(
+  target TEXT PRIMARY KEY, kind TEXT NOT NULL, code TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL,
+  detail_json TEXT NOT NULL, config_version INTEGER NOT NULL, run_id TEXT, checked_at TEXT NOT NULL);
+CREATE TABLE readiness_log(
+  log_id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL, status TEXT NOT NULL, reason TEXT NOT NULL,
+  config_version INTEGER NOT NULL, run_id TEXT, checked_at TEXT NOT NULL);
+CREATE TABLE prepare_run(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT UNIQUE, config_version INTEGER NOT NULL,
+  started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, targets_json TEXT NOT NULL DEFAULT '[]',
+  counts_json TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '');
+INSERT INTO meta VALUES('watch_schema', 'wa1');
+INSERT INTO readiness VALUES('STOCK:005930','STOCK','005930','READY','','{}',1,'prep_20261007_1','2026-10-07T19:00:00');
+"""
+wa1 = TMP / "wa1.sqlite3"
+con = sqlite3.connect(wa1)
+con.executescript(WA1)
+con.close()
+with WatchStore(wa1) as wm:
+    bk = wm.backup_path
+    r_old = wm.readiness()["STOCK:005930"]
+    tabs = {r[0] for r in wm.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+with WatchStore(wa1) as wm:
+    bk2 = wm.backup_path
+check("6-8) 감시 저장소 wa1(fe04b30) → wa2: 백업 후 분석 준비 열·청산·위험·재검증 표 추가, 기존 준비 기록 그대로"
+      "(분석 준비는 비어 있어 진입 관찰 HOLD), 다시 열면 이전 없음",
+      bk is not None and "bak-wa1-" in bk and r_old["status"] == "READY" and r_old["analysis_status"] is None
+      and {"holding_close", "symbol_risk", "symbol_risk_log", "config_check"} <= tabs and bk2 is None)
 
 # ── 5. 경계 ────────────────────────────────────────────────
 FORBIDDEN = ("infra.broker", "infra.storage", "infra.notify", "domain.strategy", "domain.service", "commands",
