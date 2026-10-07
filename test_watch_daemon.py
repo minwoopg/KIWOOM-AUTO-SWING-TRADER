@@ -1405,6 +1405,50 @@ check("10-10) I1 이전 wd2 행 이전: 열을 더하고 이전 행의 저장 �
       and oldM == [None] and price_calls(EM, nM) == ["ka10001", "ka10003", "ka10004"])
 dM3.stop()
 
+# R7: 이전(wd2) DB에서 이미 확정한 미완료 후보를 개장 뒤 최신 스키마로 올려 재개
+def to_wd2(e):
+    """관리자 DB를 이전 판(wd2) 모양으로: candidate_gate에 committed_at 열 없음(이전 DDL 그대로), 스키마 메타 wd2."""
+    with sqlite3.connect(e["paths"].daemon_db) as cx:
+        cols = [r[1] for r in cx.execute("PRAGMA table_info(candidate_gate)") if r[1] != "committed_at"]
+        cx.execute("ALTER TABLE candidate_gate RENAME TO cg_new")
+        cx.execute("""CREATE TABLE candidate_gate(
+          gate_id INTEGER PRIMARY KEY AUTOINCREMENT, stage TEXT NOT NULL, signal_date TEXT NOT NULL, open_at TEXT,
+          contract_hash TEXT NOT NULL, symbol TEXT NOT NULL, scan_run_id TEXT, eligible INTEGER NOT NULL,
+          reasons_json TEXT NOT NULL, config_version INTEGER, latest_version INTEGER, latest_status TEXT,
+          list_snapshot_id INTEGER, evidence_json TEXT NOT NULL, evaluated_at TEXT NOT NULL, task_key TEXT)""")
+        cx.execute(f"INSERT INTO candidate_gate({', '.join(cols)}) SELECT {', '.join(cols)} FROM cg_new")
+        cx.execute("DROP TABLE cg_new")
+        cx.execute("UPDATE meta SET value='wd2' WHERE key='daemon_schema'")
+
+
+r7a = resume_case("r7_one", to_wd2)
+check("10-11) R7 이전 DB에서 후보 확정 → 첫 가격 요청 전 양보 → 개장 뒤 최신 스키마로 이전(SCAN committed_at NULL) → 재개: 현재 자격은 "
+      "정상이어도 개장 전 저장 완료 근거가 없어 NO_GATE_EVIDENCE·가격 요청 0회, 확정 목록 보존(source.gate가 있다고 통과시키지 않음)",
+      r7a["set1"]["count"] == 1 and "gate" in r7a["set1"]["source"] and r7a["chk1"] == []
+      and r7a["calls2"] == [] and r7a["chk2"] == [] and r7a["set2"]["count"] == 1
+      and [g["reasons"] for g in r7a["resume"]] == [["NO_GATE_EVIDENCE"]]
+      and r7a["task"]["detail"]["current_gate"]["excluded"] == {"005930": ["NO_GATE_EVIDENCE"]})
+r7b = resume_case("r7_two", to_wd2, symbols=(S_5930, S_35420), nth=2, prep=two_pass)
+check("10-12) R7 후보 2건 중 1건은 이전 DB에서 가격이 이미 저장됨 → 개장 뒤 이전·재개: 저장된 결과는 그대로, 미확인·근거 없는 후보만 "
+      "제외(요청 0회)",
+      [c["symbol"] for c in r7b["chk1"]] == ["005930"] and r7b["calls2"] == []
+      and [(c["symbol"], c["observed_price"]) for c in r7b["chk2"]] == [(c["symbol"], c["observed_price"]) for c in r7b["chk1"]]
+      and [(g["symbol"], g["reasons"]) for g in r7b["resume"]] == [("035420", ["NO_GATE_EVIDENCE"])])
+ev_n = rn["resume"][0]["evidence"]
+check("10-13) R7 정상(최신 스키마) 재개는 원래 후보의 개장 전 SCAN 근거(판정·저장 완료 모두 개장 전)를 확인하고 조회 — 근거 ID·저장 완료 "
+      "시각을 RESUME 근거에 남김. 개장 전 이전·재판정 경로(10-10)는 그대로 통과",
+      rn["resume"][0]["eligible"] == 1 and ev_n["scan_gate_id"] is not None
+      and ev_n["scan_committed_at"] < "2026-10-08T09:00:00" and len(rn["calls2"]) == 3)
+
+with D.DaemonStore(r7a["e"]["paths"].daemon_db) as ds:
+    bak7 = ds.meta("upgrade_backup")
+with sqlite3.connect(bak7) as cx:
+    bak7_schema = cx.execute("SELECT value FROM meta WHERE key='daemon_schema'").fetchone()[0]
+    bak7_cols = [r[1] for r in cx.execute("PRAGMA table_info(candidate_gate)")]
+check("10-14) 이전 판 DB를 올리기 전에 복구용 사본을 SQLite 백업 API로 남김(`<DB>.bak-wd2-<시각>`, 원래 스키마·열 그대로) — 열 추가 뒤 "
+      "원본을 이전 코드로 되돌려 쓰는 데 의존하지 않음",
+      bak7 and Path(bak7).exists() and ".bak-wd2-" in bak7 and bak7_schema == "wd2" and "committed_at" not in bak7_cols)
+
 # ── 8. 상태·로그·경계 ─────────────────────────────────────
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
@@ -1445,6 +1489,22 @@ check("8-5) doctor: Windows 작업 스케줄러 목록에서 이 레포의 매�
       "바꾸지 않음(읽기만), 겹칠 항목이 없으면 0",
       rc_doc == 1 and "swing_update" in doc_out and "watch_prepare" in doc_out and "notepad" not in doc_out
       and "중지 권장" in doc_out and "바꾸지 않습니다" in doc_out and rc_doc0 == 0)
+exp_dir = TMP / "export_db"
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc_exp = WD.main(["--daemon-db", str(E1["paths"].daemon_db), "--watch-scan-db", str(E1["paths"].watch_scan_db),
+                      "--watch-open-db", str(E1["paths"].watch_open_db), "--watch-db", str(E1["paths"].watch_db),
+                      "export-db", "--out", str(exp_dir)], calendar=CAL)
+with D.DaemonStore(E1["paths"].daemon_db) as ds_a:
+    n_a = len(ds_a.tasks())
+with sqlite3.connect(exp_dir / "daemon.sqlite3") as cx:
+    n_b = cx.execute("SELECT COUNT(*) FROM task").fetchone()[0]
+exp_meta = __import__("json").loads((exp_dir / "export_db.json").read_text(encoding="utf-8"))
+check("8-6) export-db: 관리자·관찰·개장 확인 DB를 SQLite 백업 API로 복사(내용 같음)·파일별 복사 시각 기록, 수동 보유 원문이 든 감시 "
+      "DB는 넣지 않음",
+      rc_exp == 0 and n_a == n_b > 0 and sorted(r["file"] for r in exp_meta["files"]) ==
+      ["daemon.sqlite3", "watch_open.sqlite3", "watch_s1.sqlite3"] and all(r["status"] == "OK" for r in exp_meta["files"])
+      and not (exp_dir / "watch.sqlite3").exists())
 check("8-4) 테스트 산출물은 임시 폴더에만 — 레포에 data/·commands/·reports/·logs/ 변화 없음",
       {p: _fs(p) for p in ("data", "commands", "reports", "logs")} == FS_BEFORE)
 

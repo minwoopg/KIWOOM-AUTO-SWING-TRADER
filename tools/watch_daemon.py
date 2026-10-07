@@ -7,6 +7,7 @@
     python tools/watch_daemon.py stop                # 실행 중인 관리자에 중지 요청(다음 순회·대상 사이에서 멈춤)
     python tools/watch_daemon.py report --day 2026-10-08   # 그날 일일 보고서 다시 만들기(재실행 없음)
     python tools/watch_daemon.py doctor              # 기존 Windows 작업 스케줄러 항목과 겹치는지 확인(읽기만 — 바꾸지 않음)
+    python tools/watch_daemon.py export-db --out exports\\watch_20261008\\db   # 관리자·관찰·개장 확인 DB 일관된 사본(공유용)
 
 - 대상: 지정 종목(관심 켜짐·수동 보유) + KOSPI·KOSDAQ. 전체 시장 수집·S1 스캔은 tools/research_collect.py(별도).
 - 저장: data/watch/daemon.sqlite3(작업 상태), watch_s1.sqlite3(지정 종목 S1 관찰), watch_open.sqlite3(개장 확인),
@@ -19,6 +20,7 @@ import csv
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -78,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     rp = sub.add_parser("report")
     rp.add_argument("--day", required=True)
     sub.add_parser("doctor")
+    ex = sub.add_parser("export-db", help="관리자·지정 종목 관찰·개장 확인 DB의 일관된 사본(SQLite 백업 API, 읽기만)")
+    ex.add_argument("--out", required=True, help="사본을 둘 폴더(예: exports\\watch_20261008\\db)")
     return p
 
 
@@ -176,6 +180,39 @@ def cmd_status(args, *, now, calendar) -> int:
     return 0
 
 
+def cmd_export_db(args, *, now) -> int:
+    """daemon·watch_s1·watch_open DB를 SQLite 백업 API로 복사(실행 중이어도 각 파일은 일관된 사본). 파일마다 복사 시작·끝 시각을
+    남김 — 세 사본이 같은 시점이라는 보장은 없음(같은 시점이 필요하면 관리자를 stop한 뒤 실행). 감시 설정 DB(watch.sqlite3 —
+    수동 보유 원문)와 연구 DB는 넣지 않음."""
+    p = paths_of(args)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    rows, rc = [], 0
+    for path in (p.daemon_db, p.watch_scan_db, p.watch_open_db):
+        if not path.exists():
+            rows.append({"file": path.name, "status": "MISSING"})
+            continue
+        t0 = now().isoformat(timespec="seconds")
+        try:
+            src = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+            dst = sqlite3.connect(out / path.name)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+                src.close()
+            rows.append({"file": path.name, "status": "OK", "started_at": t0,
+                         "finished_at": now().isoformat(timespec="seconds")})
+        except sqlite3.Error as exc:
+            rc = 1
+            rows.append({"file": path.name, "status": f"FAILED {type(exc).__name__}: {exc}", "started_at": t0})
+    (out / "export_db.json").write_text(json.dumps({"files": rows, "note": "파일별 일관된 사본 — 파일 사이 같은 시점은 보장 안 함"},
+                                                   ensure_ascii=False, indent=2), encoding="utf-8")
+    for r in rows:
+        print(f"{r['file']}: {r['status']}" + (f" ({r['started_at']}~{r.get('finished_at', '-')})" if "started_at" in r else ""))
+    return rc
+
+
 def cmd_doctor(args, *, runner=None) -> int:
     """Windows 작업 스케줄러에서 이 레포의 매일 실행과 겹칠 수 있는 항목을 찾아 안내(읽기만)."""
     p = paths_of(args)
@@ -223,6 +260,8 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
         now = lambda: fixed  # noqa: E731
     if args.cmd == "status":
         return cmd_status(args, now=now, calendar=calendar)
+    if args.cmd == "export-db":
+        return cmd_export_db(args, now=now)
     if args.cmd == "doctor":
         return cmd_doctor(args)
     p = paths_of(args)

@@ -55,7 +55,7 @@ from infra.research.kiwoom_readonly import ReadOnlyResearchClient, RequestStoppe
 from infra.research.s1_scanner import S1Scanner, ScanError, build_contract, calendar_version
 from infra.research.scan_report import write_report as write_scan_report
 from infra.research.scan_store import ScanStore
-from infra.research.store import ResearchStore
+from infra.research.store import ResearchStore, sqlite_backup
 from infra.watch.apply import file_lock, sync_file, test_point
 from infra.watch.manager import WatchNotReady, analysis_basis, entry_gate, listing_from_store, prepare_data
 from infra.watch.store import WatchStore
@@ -128,6 +128,9 @@ class DaemonStore:
             cur = self.conn.execute("SELECT value FROM meta WHERE key='daemon_schema'").fetchone()
         if cur is not None and cur[0] != DAEMON_SCHEMA and cur[0] not in _UPGRADABLE:
             raise RuntimeError(f"관리자 저장소 스키마 {cur[0]} ≠ {DAEMON_SCHEMA}: {self.path}")
+        self.upgrade_backup: str | None = None
+        if cur is not None and cur[0] != DAEMON_SCHEMA:     # 올리기 전 복구용 사본(SQLite 백업 API) — 열 추가 뒤 원본으로 못 돌아감
+            self.upgrade_backup = sqlite_backup(self.conn, self.path, cur[0])
         self.conn.executescript(_SCHEMA)                    # CREATE IF NOT EXISTS — 기존 표·행은 그대로
         with self.tx():
             for table, cols in _ADD_COLS.items():
@@ -138,6 +141,7 @@ class DaemonStore:
             self.conn.execute("INSERT OR REPLACE INTO meta VALUES('daemon_schema', ?)", (DAEMON_SCHEMA,))
             if cur is not None and cur[0] != DAEMON_SCHEMA:
                 self.conn.execute("INSERT OR REPLACE INTO meta VALUES('upgraded_from', ?)", (cur[0],))
+                self.conn.execute("INSERT OR REPLACE INTO meta VALUES('upgrade_backup', ?)", (self.upgrade_backup,))
 
     def close(self) -> None:
         self.conn.close()
@@ -696,9 +700,12 @@ class WatchDaemon:
 
     def _resume_admit(self, cset: dict, pending: list[dict], a5_run_id: str, fresh: bool, wstore, state, snap_id,
                       task_key: str) -> dict[str, list[str]]:
-        """매 개장 확인 실행에서 가격 조회 전 (W2 재검토 R6): 확정 목록 중 아직 가격이 없는 후보의 지금 운영 자격을 다시
-        판정해 RESUME 근거로 저장. 지금 부적격이면 조회하지 않음. 한 번 제외한 후보는 그날 다시 넣지 않음(개장 뒤 회복 없음).
-        이번 실행에서 막 확정한 목록이면 확정 직전 OPEN 판정과 같은 상태라 다시 기록하지 않음."""
+        """매 개장 확인 실행에서 가격 조회 전 (W2 재검토 R6·R7): 확정 목록 중 아직 가격이 없는 후보마다
+        ① 원래 후보(신호일·확정 계약·종목·대상 개장)의 개장 전 SCAN 근거 — 판정·저장 완료 모두 개장 전(I1, latest_gate) — 가
+        통과했고 ② 지금 운영 자격도 통과해야 조회. 근거가 없으면(이전 형식 wd2 행을 개장 뒤 이전해 committed_at NULL 등)
+        NO_GATE_EVIDENCE — 저장 완료 시각을 추정하거나 source.gate가 있다고 통과시키지 않음. 판정은 RESUME 근거로 저장하고,
+        한 번 제외한 후보는 그날 다시 넣지 않음(개장 뒤 회복 없음). 이번 실행에서 막 확정한 목록이면 확정 직전 OPEN 판정
+        (같은 두 검사)과 같은 상태라 다시 기록하지 않음."""
         if fresh:
             return {}
         sig, contract, open_at = cset["signal_date"], cset["contract_hash"], cset["open_at"]
@@ -708,9 +715,14 @@ class WatchDaemon:
         rows, skip = [], {}
         for c in pending:
             ok, why, ev = cur[c["symbol"]]
-            reasons = [f"CURRENT:{r}" for r in why] + (["EXCLUDED_EARLIER"] if c["symbol"] in earlier else [])
+            g = self.dstore.latest_gate(sig, contract, c["symbol"], before=open_at)
+            proof = (["NO_GATE_EVIDENCE"] if g is None else [] if g["eligible"] else [f"SCAN:{r}" for r in g["reasons"]])
+            reasons = (proof + [f"CURRENT:{r}" for r in why]
+                       + (["EXCLUDED_EARLIER"] if c["symbol"] in earlier else []))
             rows.append(self._gate_row("RESUME", sig, open_at, contract, c["symbol"], c["run_id"], state, snap_id,
-                                       not reasons, reasons, {**ev, "a5_run_id": a5_run_id, "set_id": cset["set_id"]},
+                                       not reasons, reasons, {**ev, "a5_run_id": a5_run_id, "set_id": cset["set_id"],
+                                                              "scan_gate_id": g and g["gate_id"],
+                                                              "scan_committed_at": g and g["committed_at"]},
                                        task_key))
             if reasons:
                 skip[c["symbol"]] = reasons
