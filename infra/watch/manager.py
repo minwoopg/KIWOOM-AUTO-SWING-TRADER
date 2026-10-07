@@ -10,6 +10,8 @@ from __future__ import annotations
 - 파일이 없어지거나 읽을 수 없어도(인코딩·권한 오류 — W1-R4) 같은 규칙(REJECTED).
 - 보유 보호(W1-R1): 마지막 정상 설정에 있던 수동 보유가 새 설정에서 사라지면, `holding-close` 청산 기록(같은 보유 값)이
   있을 때만 적용. 없으면 REJECTED — 파일을 직접 고쳐도 보유 감시가 조용히 사라지지 않음.
+  청산 기록은 **그 기록을 만든 명령의 적용에서만** 씀(close_id를 넘겨받음 — W1c-R1). 적용이 끝나면 쓰이지 않은 OPEN 기록은
+  모두 VOID — 명령이 실패·강제 종료돼 남은 기록이 나중의 apply에서 보유 보호를 통과시키지 않음.
 - 위험 자격(W1-R2): 설정을 읽을 때마다 **최신 종목 목록**으로 종목별 위험 자격(symbol_risk)을 갱신·기록 — 준비(prepare)를
   기다리지 않음. 진입 관찰은 이 기록으로 판단(준비 기록의 옛 위험 값을 쓰지 않음).
 
@@ -148,12 +150,12 @@ def check_text(raw_text: str | None, listing: dict[str, Listing] | None, *, chec
 
 
 def holding_guard(wstore: WatchStore, active: WatchConfig | None, active_version: int | None,
-                  new: WatchConfig, *, pending: dict[str, dict] | None = None
-                  ) -> tuple[list[Issue], dict[str, int], list[str]]:
+                  new: WatchConfig, *, pending: dict[str, dict] | None = None,
+                  closes: dict[str, int] | None = None) -> tuple[list[Issue], dict[str, int], list[str]]:
     """마지막 정상 설정의 수동 보유가 새 설정에서 사라졌는지 (W1-R1).
     pending = 이번 명령이 남길 청산 기록 {코드: 보유 값} (CLI가 파일을 바꾸기 전에 검사할 때 — W1b-R2).
     반환 (오류, 쓸 청산 기록 {코드: close_id}, 무효로 할 청산 기록 코드 — 보유가 그대로 남은 종목)."""
-    pending = pending or {}
+    pending, closes = pending or {}, closes or {}
     errors, used, void = [], {}, []
     if active is None:
         return errors, used, void
@@ -167,8 +169,9 @@ def holding_guard(wstore: WatchStore, active: WatchConfig | None, active_version
             continue
         if pending.get(old.code) == asdict(old.holding):
             continue
-        close = wstore.open_close(old.code)
-        if close is not None and close["holding"] == asdict(old.holding):
+        # 이번 명령이 넘긴 청산 기록만 — 저장소에 남아 있는 다른 OPEN 기록은 근거가 아님 (W1c-R1)
+        close = wstore.get_close(closes[old.code]) if old.code in closes else None
+        if close is not None and close["state"] == "OPEN" and close["holding"] == asdict(old.holding):
             used[old.code] = close["close_id"]
             continue
         h = old.holding
@@ -198,8 +201,9 @@ def refresh_risk(wstore: WatchStore, state: WatchState, listing: dict[str, Listi
 
 
 def sync_config(wstore: WatchStore, path: str | Path, listing: dict[str, Listing] | None,
-                snapshot_id: int | None, *, now: datetime, origin: str = "FILE") -> tuple[WatchState, dict]:
-    """설정 파일을 읽어 검증·기록하고 위험 자격을 갱신. 반환 (상태, 이번 시도 {version, status, new, errors, warnings})."""
+                snapshot_id: int | None, *, now: datetime, origin: str = "FILE",
+                closes: dict[str, int] | None = None) -> tuple[WatchState, dict]:
+    """설정 파일을 읽어 검증·기록하고 위험 자격을 갱신. closes = 이 적용에서 쓸 청산 기록 {코드: close_id}(holding-close만). 반환 (상태, 이번 시도 {version, status, new, errors, warnings})."""
     from domain.watchlist.config import ValidationResult
     p = Path(path)
     raw_text, read_error = read_config_text(p)
@@ -214,7 +218,7 @@ def sync_config(wstore: WatchStore, path: str | Path, listing: dict[str, Listing
     before = load_state(wstore)
     used, void = {}, []
     if res.ok:
-        guard, used, void = holding_guard(wstore, before.config, before.active_version, res.config)
+        guard, used, void = holding_guard(wstore, before.config, before.active_version, res.config, closes=closes)
         if guard:
             res = ValidationResult(None, guard, res.warnings)
     status = APPLIED if res.ok else REJECTED
@@ -225,6 +229,7 @@ def sync_config(wstore: WatchStore, path: str | Path, listing: dict[str, Listing
         list_snapshot_id=snapshot_id)
     if res.ok and (used or void):
         wstore.settle_closes(used, void, version)
+    wstore.void_open_closes(keep=set())          # 이번에 쓰지 않은 OPEN 청산 기록은 남기지 않음 (W1c-R1)
     state = load_state(wstore)
     refresh_risk(wstore, state, listing, snapshot_id, now=now)
     return state, {"version": version, "status": status, "new": new, "errors": _issues(res.errors),

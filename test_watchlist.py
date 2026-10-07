@@ -712,6 +712,120 @@ check("7-6) [W1b-R2] 파일을 쓴 뒤 최종 적용이 거부되면 원래 파�
       and E12["cfg"].read_bytes() == bytes12 and st12.config.symbol("000660").holding.quantity == 10
       and [c["state"] for c in cl12] == ["VOID"])
 
+# ── 8. GPT 재검토 a60c7df W1c-R1 ────────────────────────────
+def held(env):
+    env["cfg"].write_text(dump_document(doc(HOLD10)), encoding="utf-8")
+    cli(env, "apply")
+    return env["cfg"].read_bytes()
+
+
+def drop_holding(env):
+    env["cfg"].write_text(dump_document(doc({"code": "000660", "interest": {"enabled": False}})), encoding="utf-8")
+
+
+def deny_write(path, text):
+    raise PermissionError(13, "Permission denied", str(path))
+
+
+E13 = setup("w1c-r1")
+b13 = held(E13)
+real_write = W._atomic_write
+W._atomic_write = deny_write
+try:
+    c81, o81 = cli(E13, "holding-close", "000660")
+finally:
+    W._atomic_write = real_write
+with WatchStore(E13["wdb"]) as w13:
+    cl81 = [c["state"] for c in w13.closes()]
+    q81 = M.load_state(w13).config.symbol("000660").holding.quantity
+drop_holding(E13)                                   # 재시작 뒤 YAML에서 보유 누락
+c81b, o81b = cli(E13, "apply")
+with WatchStore(E13["wdb"]) as w13:
+    st81 = M.load_state(w13)
+check("8-1) [W1c-R1 재현] holding-close 파일 교체 PermissionError → 종료 코드 2, 그 명령의 청산 기록 VOID, 파일·보유 10주 그대로. "
+      "재시작 뒤 YAML에서 보유를 빼고 apply해도 옛 청산 기록으로 통과하지 못함(REJECTED·보유 감시 유지)",
+      c81 == 2 and "PermissionError" in o81 and cl81 == ["VOID"] and q81 == 10 and c81b == 2 and "REJECTED" in o81b
+      and st81.config.symbol("000660").holding_active and st81.entry_blocked)
+
+# 강제 종료처럼 정리 코드가 돌지 못해 OPEN이 남은 경우 — 다른 명령의 기록은 근거가 아님
+E14 = setup("w1c-kill")
+held(E14)
+with WatchStore(E14["wdb"]) as w14:
+    w14.record_close("000660", {"quantity": 10, "avg_price": 180000, "stop_price": 165000, "target_price": None,
+                                "source": "MANUAL"}, at=NOW, from_version=1, origin="CLI:holding-close 000660")
+drop_holding(E14)
+c82, o82 = cli(E14, "apply")
+with WatchStore(E14["wdb"]) as w14:
+    st82 = M.load_state(w14)
+    cl82 = [c["state"] for c in w14.closes()]
+check("8-2) [W1c-R1] 프로세스가 강제 종료돼 OPEN 청산 기록이 남아도, 청산 기록은 그것을 만든 명령의 적용에서만 쓰임 — 이후 apply는 "
+      "REJECTED·보유 유지, 남은 기록은 그 적용 뒤 VOID",
+      c82 == 2 and "holding-close 000660" in o82 and st82.config.symbol("000660").holding.quantity == 10
+      and cl82 == ["VOID"])
+
+# 교체 뒤 적용 중 예외 → 원래 파일 복원
+E15 = setup("w1c-sync")
+b15 = held(E15)
+real_sync = W.sync_config
+
+
+def boom_sync(*a, **k):
+    raise sqlite3.OperationalError("database is locked")
+
+
+W.sync_config = boom_sync
+try:
+    c83, o83 = cli(E15, "holding-close", "000660")
+    c83b, _ = cli(E15, "add", "005930", "--interest", "--no-fetch")
+finally:
+    W.sync_config = real_sync
+with WatchStore(E15["wdb"]) as w15:
+    cl83 = [c["state"] for c in w15.closes()]
+    st83 = M.load_state(w15)
+check("8-3) [W1c-R1] 파일 교체 뒤 적용 중 예외(DB 잠김) → 원래 파일 복원·종료 코드 2·청산 기록 VOID, 사용 중 설정 그대로",
+      (c83, c83b) == (2, 2) and "원래 파일로 되돌림" in o83 and E15["cfg"].read_bytes() == b15 and cl83 == ["VOID"]
+      and st83.config.symbol("000660").holding.quantity == 10 and st83.active_version == 1)
+
+# 복원까지 실패 → 기록하고 성공으로 반환하지 않음
+real_restore = W._restore_file
+W.sync_config = boom_sync
+W._restore_file = lambda path, old: "PermissionError: [Errno 13] Permission denied"
+try:
+    c84, o84 = cli(E15, "holding-close", "000660")
+finally:
+    W.sync_config, W._restore_file = real_sync, real_restore
+with WatchStore(E15["wdb"]) as w15:
+    st84 = M.load_state(w15)
+    h84 = w15.history()[0]
+check("8-4) [W1c-R1] 원래 파일 복원까지 실패 → 종료 코드 2, REJECTED 시도로 '복원 실패'를 기록해 신규 매수 차단, 사용 중 설정·"
+      "보유 그대로(파일 확인 후 apply·restore 안내)",
+      c84 == 2 and "되돌리지 못함" in o84 and h84["status"] == "REJECTED" and "복원 실패" in h84["origin"]
+      and "되돌리지 못함" in h84["errors"][0]["message"] and st84.entry_blocked
+      and st84.config.symbol("000660").holding.quantity == 10)
+
+# 중단(Ctrl+C)도 같은 정리 뒤 다시 올림
+E16 = setup("w1c-int")
+b16 = held(E16)
+
+
+def interrupt_sync(*a, **k):
+    raise KeyboardInterrupt
+
+
+W.sync_config = interrupt_sync
+try:
+    try:
+        cli(E16, "holding-close", "000660")
+        raised = False
+    except KeyboardInterrupt:
+        raised = True
+finally:
+    W.sync_config = real_sync
+with WatchStore(E16["wdb"]) as w16:
+    cl85 = [c["state"] for c in w16.closes()]
+check("8-5) [W1c-R1] 적용 중 중단(Ctrl+C) → 청산 기록 VOID·원래 파일 복원 뒤 중단을 그대로 올림",
+      raised and cl85 == ["VOID"] and E16["cfg"].read_bytes() == b16)
+
 # ── 5. 경계 ────────────────────────────────────────────────
 FORBIDDEN = ("infra.broker", "infra.storage", "infra.notify", "domain.strategy", "domain.service", "commands",
              "domain.position", "infra.market_data")

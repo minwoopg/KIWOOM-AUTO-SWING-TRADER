@@ -227,7 +227,9 @@ def edit_document(doc: dict, args) -> str:
 def commit_text(wstore: WatchStore, cfg_path: Path, text: str, listing, snap_id, *, now, origin: str,
                 pending: dict[str, dict] | None = None):
     """바꾼 원문을 검증(형식·목록·보유 보호) → 청산 기록 → 파일 교체 → 적용. 반환 (종료 코드, 상태, 시도).
-    파일을 쓰기 전에 거부되면 파일 그대로 2. 쓴 뒤 적용이 거부되면 원래 파일로 되돌리고 2 (W1b-R2)."""
+    파일을 쓰기 전에 거부되면 파일 그대로 2. 쓴 뒤 적용이 거부되면 원래 파일로 되돌리고 2 (W1b-R2).
+    읽기·교체·적용 중 예외(권한 등)도 2 — 이 명령의 청산 기록은 VOID, 교체했으면 원래 파일 복원, 복원까지 실패하면
+    REJECTED 시도로 기록해 신규 매수 차단 상태로 남김 (W1c-R1). 중단(Ctrl+C)은 같은 정리 뒤 다시 올림."""
     pending = pending or {}
     res = check_text(text, listing)
     if not res.ok:
@@ -240,24 +242,68 @@ def commit_text(wstore: WatchStore, cfg_path: Path, text: str, listing, snap_id,
         print("[거부] 보유 보호 — 파일을 바꾸지 않았습니다:")
         _print_issues([vars(e) for e in guard], [])
         return 2, None, None
-    for code, h in pending.items():
-        wstore.record_close(code, h, at=now(), from_version=before.active_version, origin=origin)
-    old_bytes = cfg_path.read_bytes() if cfg_path.is_file() else None
-    _atomic_write(cfg_path, text)
-    state, att = sync_config(wstore, cfg_path, listing, snap_id, now=now(), origin=origin)
+    close_ids: dict[str, int] = {}
+    old_bytes, replaced = None, False
+    try:
+        for code, h in pending.items():
+            close_ids[code] = wstore.record_close(code, h, at=now(), from_version=before.active_version, origin=origin)
+        old_bytes = cfg_path.read_bytes() if cfg_path.is_file() else None
+        _atomic_write(cfg_path, text)
+        replaced = True
+        state, att = sync_config(wstore, cfg_path, listing, snap_id, now=now(), origin=origin, closes=close_ids)
+    except BaseException as exc:
+        for cid in close_ids.values():
+            _quiet(lambda: wstore.void_close(cid))
+        restore_err = _restore_file(cfg_path, old_bytes) if replaced else None
+        where = "적용 중" if replaced else "파일 교체 전·교체 중"
+        print(f"[실패] {where} {type(exc).__name__}: {exc} — 이 명령의 청산 기록은 무효"
+              + ("" if not replaced else (", 원래 파일로 되돌림" if restore_err is None else "")))
+        if restore_err is not None:
+            _record_restore_failure(wstore, cfg_path, origin, now, f"{type(exc).__name__}: {exc}", restore_err)
+        if not isinstance(exc, Exception):
+            raise
+        return 2, None, None
     if att["status"] != "APPLIED":
+        restore_err = _restore_file(cfg_path, old_bytes)
+        if restore_err is None:
+            print(f"[거부] v{att['version']} 적용 실패 — 파일을 원래대로 되돌렸습니다:")
+        else:
+            _record_restore_failure(wstore, cfg_path, origin, now, f"v{att['version']} REJECTED", restore_err)
+        _print_issues(att["errors"], [])
+        return 2, state, att
+    return 0, state, att
+
+
+def _quiet(fn) -> None:
+    try:
+        fn()
+    except Exception:
+        pass
+
+
+def _restore_file(cfg_path: Path, old_bytes: bytes | None) -> str | None:
+    """원래 파일로 되돌림. 반환: 실패 사유(성공이면 None)."""
+    try:
         if old_bytes is None:
             cfg_path.unlink(missing_ok=True)
         else:
             tmp = cfg_path.with_name(cfg_path.name + ".tmp")
             tmp.write_bytes(old_bytes)
             os.replace(tmp, cfg_path)
-        if pending:
-            wstore.settle_closes({}, list(pending), att["version"])      # 쓰이지 않은 청산 기록은 무효
-        print(f"[거부] v{att['version']} 적용 실패 — 파일을 원래대로 되돌렸습니다:")
-        _print_issues(att["errors"], [])
-        return 2, state, att
-    return 0, state, att
+        return None
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _record_restore_failure(wstore: WatchStore, cfg_path: Path, origin: str, now, cause: str, restore_err: str) -> None:
+    """파일 복원까지 실패 — 파일과 사용 중 설정이 다를 수 있음. REJECTED 시도로 남겨 신규 매수 차단 (W1c-R1)."""
+    msg = (f"설정 파일을 원래대로 되돌리지 못함({restore_err}) — 원인 {cause}. 파일과 사용 중 설정이 다를 수 있음: "
+           "파일을 확인한 뒤 apply 또는 restore")
+    print(f"[실패] {msg}")
+    _quiet(lambda: wstore.record_attempt(
+        at=now(), origin=f"{origin} (복원 실패)", source_path=str(cfg_path), raw_sha="COMMIT_RESTORE_FAILED",
+        status="REJECTED", config_hash=None, errors=[{"code": "-", "field": "file", "message": msg}], warnings=[],
+        raw_text=None, config=None, list_snapshot_id=None))
 
 
 def _atomic_write(path: Path, text: str) -> None:

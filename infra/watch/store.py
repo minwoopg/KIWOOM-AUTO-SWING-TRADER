@@ -163,6 +163,23 @@ class WatchStore:
                 " VALUES(?,?,?,?,?,?)", (code, _ts(at), json.dumps(holding, sort_keys=True), from_version, origin,
                                          CLOSE_OPEN)).lastrowid
 
+    def get_close(self, close_id: int) -> dict | None:
+        r = self.conn.execute("SELECT * FROM holding_close WHERE close_id=?", (close_id,)).fetchone()
+        return None if r is None else {**dict(r), "holding": json.loads(r["holding_json"])}
+
+    def void_close(self, close_id: int) -> None:
+        self.conn.execute("UPDATE holding_close SET state=? WHERE close_id=? AND state=?",
+                          (CLOSE_VOID, close_id, CLOSE_OPEN))
+
+    def void_open_closes(self, keep: set[int] = frozenset()) -> int:
+        """OPEN인 청산 기록 중 이번 적용이 쓰지 않은 것을 모두 VOID — 명령이 실패·중단돼 남은 기록 정리 (W1c-R1)."""
+        with self.tx():
+            ids = [r[0] for r in self.conn.execute("SELECT close_id FROM holding_close WHERE state=?", (CLOSE_OPEN,))
+                   if r[0] not in keep]
+            for cid in ids:
+                self.conn.execute("UPDATE holding_close SET state=? WHERE close_id=?", (CLOSE_VOID, cid))
+        return len(ids)
+
     def open_close(self, code: str) -> dict | None:
         r = self.conn.execute("SELECT * FROM holding_close WHERE code=? AND state=? ORDER BY close_id DESC LIMIT 1",
                               (code, CLOSE_OPEN)).fetchone()
