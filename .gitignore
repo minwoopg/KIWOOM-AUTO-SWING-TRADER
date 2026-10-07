@@ -19,6 +19,10 @@ logs/
 # 데이터
 data/
 
+# 사용자 지정 종목 설정(수동 보유 정보 포함 — 개인 기록). 예시는 config/watchlist.example.yaml
+config/watchlist.yaml
+config/watchlist.yaml.tmp
+
 # 복구 명령·복구 목록 — 실행 산출물 (8-G)
 commands/
 
