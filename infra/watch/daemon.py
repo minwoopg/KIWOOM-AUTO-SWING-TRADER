@@ -52,7 +52,7 @@ from typing import Callable
 from infra.research import open_check as A5
 from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE, ResearchCollector
 from infra.research.kiwoom_readonly import ReadOnlyResearchClient, RequestStopped, ResearchApiError, ResearchConfigError
-from infra.research.s1_scanner import S1Scanner, ScanError, build_contract
+from infra.research.s1_scanner import S1Scanner, ScanError, build_contract, calendar_version
 from infra.research.scan_report import write_report as write_scan_report
 from infra.research.scan_store import ScanStore
 from infra.research.store import ResearchStore
@@ -61,8 +61,10 @@ from infra.watch.manager import WatchNotReady, analysis_basis, entry_gate, listi
 from infra.watch.store import WatchStore
 from utils.trading_calendar import CalendarCoverageError, TradingCalendar
 
-DAEMON_SCHEMA = "wd2"
-_UPGRADABLE = ("wd1",)            # wd1 → wd2: candidate_gate 표·daemon_run 진척/중지 요청 시각 열 추가(기존 행 보존)
+DAEMON_SCHEMA = "wd3"
+# wd1 → wd2: candidate_gate 표·daemon_run 진척/중지 요청 시각 열 추가. wd2 → wd3: candidate_gate.committed_at(저장 완료 시각,
+# W2 재검토 I1) 추가 — 이전 행은 NULL(추정해 채우지 않음 = 저장 완료 증거 없음). 기존 행은 모두 보존.
+_UPGRADABLE = ("wd1", "wd2")
 CLOSE_PREP, OPEN_CHECK = "CLOSE_PREP", "OPEN_CHECK"
 PENDING, RUNNING, COMPLETE, PARTIAL, YIELDED, FAILED, ABORTED, MISSED, SUPERSEDED = (
     "PENDING", "RUNNING", "COMPLETE", "PARTIAL", "YIELDED", "FAILED", "ABORTED", "MISSED", "SUPERSEDED")
@@ -96,10 +98,11 @@ CREATE TABLE IF NOT EXISTS candidate_gate(
   gate_id INTEGER PRIMARY KEY AUTOINCREMENT, stage TEXT NOT NULL, signal_date TEXT NOT NULL, open_at TEXT,
   contract_hash TEXT NOT NULL, symbol TEXT NOT NULL, scan_run_id TEXT, eligible INTEGER NOT NULL,
   reasons_json TEXT NOT NULL, config_version INTEGER, latest_version INTEGER, latest_status TEXT,
-  list_snapshot_id INTEGER, evidence_json TEXT NOT NULL, evaluated_at TEXT NOT NULL, task_key TEXT);
+  list_snapshot_id INTEGER, evidence_json TEXT NOT NULL, evaluated_at TEXT NOT NULL, task_key TEXT, committed_at TEXT);
 CREATE INDEX IF NOT EXISTS ix_gate ON candidate_gate(signal_date, contract_hash, symbol, stage);
 """
-_RUN_COLS = (("progress", "TEXT"), ("stop_requested_at", "TEXT"))
+_ADD_COLS = {"daemon_run": (("progress", "TEXT"), ("stop_requested_at", "TEXT")),
+             "candidate_gate": (("committed_at", "TEXT"),)}
 
 
 def _ts(dt: datetime | None) -> str | None:
@@ -127,10 +130,11 @@ class DaemonStore:
             raise RuntimeError(f"관리자 저장소 스키마 {cur[0]} ≠ {DAEMON_SCHEMA}: {self.path}")
         self.conn.executescript(_SCHEMA)                    # CREATE IF NOT EXISTS — 기존 표·행은 그대로
         with self.tx():
-            have = {r[1] for r in self.conn.execute("PRAGMA table_info(daemon_run)")}
-            for col, typ in _RUN_COLS:
-                if col not in have:
-                    self.conn.execute(f"ALTER TABLE daemon_run ADD COLUMN {col} {typ}")
+            for table, cols in _ADD_COLS.items():
+                have = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+                for col, typ in cols:
+                    if col not in have:
+                        self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
             self.conn.execute("INSERT OR REPLACE INTO meta VALUES('daemon_schema', ?)", (DAEMON_SCHEMA,))
             if cur is not None and cur[0] != DAEMON_SCHEMA:
                 self.conn.execute("INSERT OR REPLACE INTO meta VALUES('upgraded_from', ?)", (cur[0],))
@@ -299,16 +303,27 @@ class DaemonStore:
         return 0 if r is None else r[0]
 
     # 운영 진입 게이트 근거 (W2 검토 R1) — S1 계산 PASS(관찰 DB)와 따로 저장
-    def add_gates(self, rows: list[dict]) -> None:
+    def add_gates(self, rows: list[dict]) -> list[int]:
+        """한 트랜잭션으로 저장하고 gate_id 목록을 돌려줌. committed_at은 여기서 쓰지 않음 — 커밋 뒤 잰 시각을
+        mark_gates_committed로 따로 기록(그 사이 강제 종료면 NULL = 저장 완료 증거 없음, I1)."""
+        ids = []
         with self.tx():
-            self.conn.executemany(
-                "INSERT INTO candidate_gate(stage, signal_date, open_at, contract_hash, symbol, scan_run_id, eligible,"
-                " reasons_json, config_version, latest_version, latest_status, list_snapshot_id, evidence_json,"
-                " evaluated_at, task_key) VALUES(:stage,:signal_date,:open_at,:contract_hash,:symbol,:scan_run_id,"
-                ":eligible,:reasons_json,:config_version,:latest_version,:latest_status,:list_snapshot_id,"
-                ":evidence_json,:evaluated_at,:task_key)",
-                [{**r, "eligible": int(bool(r["eligible"])), "reasons_json": json.dumps(r["reasons"], ensure_ascii=False),
-                  "evidence_json": json.dumps(r["evidence"], ensure_ascii=False, default=str)} for r in rows])
+            for r in rows:
+                ids.append(self.conn.execute(
+                    "INSERT INTO candidate_gate(stage, signal_date, open_at, contract_hash, symbol, scan_run_id, eligible,"
+                    " reasons_json, config_version, latest_version, latest_status, list_snapshot_id, evidence_json,"
+                    " evaluated_at, task_key) VALUES(:stage,:signal_date,:open_at,:contract_hash,:symbol,:scan_run_id,"
+                    ":eligible,:reasons_json,:config_version,:latest_version,:latest_status,:list_snapshot_id,"
+                    ":evidence_json,:evaluated_at,:task_key)",
+                    {**r, "eligible": int(bool(r["eligible"])),
+                     "reasons_json": json.dumps(r["reasons"], ensure_ascii=False),
+                     "evidence_json": json.dumps(r["evidence"], ensure_ascii=False, default=str)}).lastrowid)
+        return ids
+
+    def mark_gates_committed(self, ids: list[int], at: str) -> None:
+        if ids:
+            self.conn.execute(f"UPDATE candidate_gate SET committed_at=? WHERE gate_id IN ({','.join('?' * len(ids))})"
+                              " AND committed_at IS NULL", (at, *ids))
 
     @staticmethod
     def _gate(r) -> dict:
@@ -327,9 +342,13 @@ class DaemonStore:
 
     def latest_gate(self, signal_date: str, contract_hash: str, symbol: str, *, stage: str = "SCAN",
                     before: str | None = None) -> dict | None:
+        """before가 있으면 판정(evaluated_at)과 저장 완료(committed_at, 커밋 뒤 잰 시각·초 올림) 모두 before 전인 행 중 마지막
+        (I1 — 저장 완료 증거가 없거나 개장 이후면 그 행으로 자격을 회복시키지 않음)."""
         q = ("SELECT * FROM candidate_gate WHERE signal_date=? AND contract_hash=? AND symbol=? AND stage=?"
-             + (" AND evaluated_at<?" if before else "") + " ORDER BY evaluated_at DESC, gate_id DESC LIMIT 1")
-        r = self.conn.execute(q, (signal_date, contract_hash, symbol, stage, *((before,) if before else ()))).fetchone()
+             + (" AND evaluated_at<? AND committed_at IS NOT NULL AND committed_at<?" if before else "")
+             + " ORDER BY evaluated_at DESC, gate_id DESC LIMIT 1")
+        r = self.conn.execute(q, (signal_date, contract_hash, symbol, stage,
+                                  *((before, before) if before else ()))).fetchone()
         return None if r is None else self._gate(r)
 
     def pending_gate_sets(self, now: datetime) -> list[tuple[str, str, str]]:
@@ -412,6 +431,7 @@ class WatchDaemon:
         self._task_used = 0
         self._last_hb: datetime | None = None
         self._last_notice: list[str] = []
+        self._last_resume: dict | None = None
         if isinstance(client, ReadOnlyResearchClient) and (
                 client.guard is None or isinstance(getattr(client.guard, "__self__", None), WatchDaemon)):
             client.guard = self.request_guard               # 모든 실제 요청 직전 검사(R3) — CLI는 make_client(guard=)로
@@ -440,7 +460,10 @@ class WatchDaemon:
         if up:
             self.log(f"[관리자] 관리자 DB {up} → {DAEMON_SCHEMA} (기존 작업 보존 — 이전 형식 CLOSE_PREP 키는 새 범위 키로 "
                      "한 번 다시 실행될 수 있음, 게이트 근거 없는 이전 후보는 유효로 보지 않음)")
-        self.log(f"[관리자] 시작 {self.run_id} (since {self.dstore.meta('since')})")
+        self.log(f"[관리자] 시작 {self.run_id} (since {self.dstore.meta('since')}) — 설정 poll {self.s.poll_sec:.0f}초·"
+                 f"하루 상한 {self.s.daily_call_cap}·개장 확인 예약 {self.s.open_check_reserve}·작업 시간 상한 "
+                 f"{self.s.max_task_sec:.0f}초·완성 지연 {int(self.s.after_close.total_seconds() // 60)}분·개장 +"
+                 f"{self.s.open_offset_min}분·달력 {calendar_version(self.cal)}·스키마 {DAEMON_SCHEMA}")
         self.hook("daemon_started")
         return self.run_id
 
@@ -661,12 +684,48 @@ class WatchDaemon:
                 "latest_status": None if latest is None else latest["status"], "list_snapshot_id": snap_id,
                 "evidence": ev, "evaluated_at": _ts(self.now()), "task_key": task_key}
 
+    def _store_gates(self, rows: list[dict]) -> list[int]:
+        """저장(커밋) → 커밋 뒤 시각을 재서 초 올림으로 committed_at 기록 (S1 committed_at과 같은 방식, I1)."""
+        ids = self.dstore.add_gates(rows)
+        self.hook("gate_committed")
+        t = self.now()
+        if t.microsecond:
+            t = t.replace(microsecond=0) + timedelta(seconds=1)
+        self.dstore.mark_gates_committed(ids, _ts(t))
+        return ids
+
+    def _resume_admit(self, cset: dict, pending: list[dict], a5_run_id: str, fresh: bool, wstore, state, snap_id,
+                      task_key: str) -> dict[str, list[str]]:
+        """매 개장 확인 실행에서 가격 조회 전 (W2 재검토 R6): 확정 목록 중 아직 가격이 없는 후보의 지금 운영 자격을 다시
+        판정해 RESUME 근거로 저장. 지금 부적격이면 조회하지 않음. 한 번 제외한 후보는 그날 다시 넣지 않음(개장 뒤 회복 없음).
+        이번 실행에서 막 확정한 목록이면 확정 직전 OPEN 판정과 같은 상태라 다시 기록하지 않음."""
+        if fresh:
+            return {}
+        sig, contract, open_at = cset["signal_date"], cset["contract_hash"], cset["open_at"]
+        cur = self._gate_eval(state, wstore, [c["symbol"] for c in pending], snap_id)
+        earlier = {g["symbol"] for g in self.dstore.gates(sig, stage="RESUME")
+                   if g["contract_hash"] == contract and g["open_at"] == open_at and not g["eligible"]}
+        rows, skip = [], {}
+        for c in pending:
+            ok, why, ev = cur[c["symbol"]]
+            reasons = [f"CURRENT:{r}" for r in why] + (["EXCLUDED_EARLIER"] if c["symbol"] in earlier else [])
+            rows.append(self._gate_row("RESUME", sig, open_at, contract, c["symbol"], c["run_id"], state, snap_id,
+                                       not reasons, reasons, {**ev, "a5_run_id": a5_run_id, "set_id": cset["set_id"]},
+                                       task_key))
+            if reasons:
+                skip[c["symbol"]] = reasons
+        self._store_gates(rows)
+        self._last_resume = {"evaluated_at": _ts(self.now()), "a5_run_id": a5_run_id,
+                             "config_version": state.active_version, "checked": [c["symbol"] for c in pending],
+                             "excluded": skip}
+        return skip
+
     def _record_scan_gates(self, run: dict, contract: str, codes: list[str], wstore, state, snap_id,
                            task_key: str) -> dict:
         ctx = run["context"]
         ev = self._gate_eval(state, wstore, codes, snap_id)
-        self.dstore.add_gates([self._gate_row("SCAN", ctx["signal_date"], ctx.get("next_open"), contract, c,
-                                              run["run_id"], state, snap_id, *ev[c], task_key) for c in codes])
+        self._store_gates([self._gate_row("SCAN", ctx["signal_date"], ctx.get("next_open"), contract, c,
+                                          run["run_id"], state, snap_id, *ev[c], task_key) for c in codes])
         return {"eligible": [c for c in codes if ev[c][0]], "blocked": {c: ev[c][1] for c in codes if not ev[c][0]},
                 "config_version": state.active_version}
 
@@ -684,11 +743,13 @@ class WatchDaemon:
             rows = []
             for code, g in latest.items():
                 ok, why, e = ev[code]
-                if (ok, why, state.active_version) != (bool(g["eligible"]), g["reasons"], g["config_version"]):
+                if ((ok, why, state.active_version) != (bool(g["eligible"]), g["reasons"], g["config_version"])
+                        or g.get("committed_at") is None):          # 저장 완료 증거 없는 행(이전 형식·기록 전 중단)도 다시
+
                     rows.append(self._gate_row("SCAN", sig, g["open_at"], contract, code, g["scan_run_id"], state,
                                                snap_id, ok, why, {**e, "regate_of": g["gate_id"]}, "REGATE"))
             if rows:
-                self.dstore.add_gates(rows)
+                self._store_gates(rows)
                 n += len(rows)
                 self.log(f"[관리자] 개장 전 게이트 재판정 {sig}/{contract}: " + ", ".join(
                     f"{r['symbol']}={'통과' if r['eligible'] else ','.join(r['reasons'])}" for r in rows))
@@ -717,7 +778,7 @@ class WatchDaemon:
             else:
                 kept.append(c)
         if rows:
-            self.dstore.add_gates(rows)
+            self._store_gates(rows)
         return kept, {"rule": GATE_RULE, "evaluated_at": _ts(self.now()), "config_version": state.active_version,
                       "calc_pass": len(cands), "kept": [c["symbol"] for c in kept], "excluded": excl}
 
@@ -912,13 +973,18 @@ class WatchDaemon:
                                      offset_min=self.s.open_offset_min,
                                      on_time_tolerance_sec=self.s.on_time_tolerance_sec, log=self.log,
                                      gate=lambda draft, cands: self._open_gate(draft, cands, wstore, state, snap_id,
-                                                                               t["task_key"]))
+                                                                               t["task_key"]),
+                                     admit=lambda cset, pending, rid, fresh: self._resume_admit(
+                                         cset, pending, rid, fresh, wstore, state, snap_id, t["task_key"]))
+            self._last_resume = None
             res = checker.run(d, client=self.client, now=self.now)
             g = res["set"]["source"].get("gate") or {}
             detail.update({"contract_hash": res["set"]["contract_hash"],
                            "candidate_status": res["set"]["status"], "candidate_reason": res["set"]["reason"],
                            "gate": {"calc_pass": g.get("calc_pass"), "kept": g.get("kept"),
                                     "excluded": g.get("excluded")},
+                           "current_gate": self._last_resume or {"basis": "후보 확정 때 판정(이번 실행)",
+                                                                 "a5_run_id": res["run_id"]},
                            "counts": res["counts"], "note": res["note"], "a5_run_id": res["run_id"]})
             try:
                 detail["report"] = A5.write_report(res, self.p.report_dir / "open")
@@ -982,6 +1048,16 @@ class WatchDaemon:
         return "IDLE_CAP"
 
 
+def _current_gate_text(cg) -> str:
+    if not cg:
+        return "기록 없음"
+    if "excluded" not in cg:
+        return f"{cg.get('basis')} (실행 {cg.get('a5_run_id')})"
+    ex = cg["excluded"]
+    return (f"{cg['evaluated_at']} 실행 {cg['a5_run_id']} 설정 v{cg['config_version']} 미확인 {cg['checked']} → "
+            + ("모두 통과" if not ex else "제외(가격 미조회) " + json.dumps(ex, ensure_ascii=False)))
+
+
 def write_daily_report(dstore: DaemonStore, p: DaemonPaths, day: str) -> str:
     """그날 작업·설정 버전·준비 상태·S1 관찰·개장 확인 요약(관찰 기록 — 체결 아님)."""
     tasks = dstore.tasks(day)
@@ -1009,10 +1085,11 @@ def write_daily_report(dstore: DaemonStore, p: DaemonPaths, day: str) -> str:
         if t["kind"] == OPEN_CHECK and d:
             lines += ["", "## 개장 확인",
                       f"- 신호일 {d.get('signal_date')} 후보 {d.get('candidate_status')} — {d.get('candidate_reason')}",
-                      "- 진입 게이트: " + (d["gate"] if isinstance(d.get("gate"), str) else
+                      "- 진입 게이트(후보 확정 때): " + (d["gate"] if isinstance(d.get("gate"), str) else
                                        f"계산 PASS {(d.get('gate') or {}).get('calc_pass')} · 운영 후보 "
                                        f"{(d.get('gate') or {}).get('kept')} · 제외 "
                                        f"{json.dumps((d.get('gate') or {}).get('excluded'), ensure_ascii=False)}"),
+                      "- 마지막 실행 시점 자격: " + _current_gate_text(d.get("current_gate")),
                       f"- 시각·조회·판정 {json.dumps(d.get('counts'), ensure_ascii=False)} {d.get('note') or ''}"]
     out = Path(p.report_dir) / "daily"
     out.mkdir(parents=True, exist_ok=True)

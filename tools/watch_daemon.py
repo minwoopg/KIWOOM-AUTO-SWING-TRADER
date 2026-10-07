@@ -35,6 +35,7 @@ from infra.research.research_config import (  # noqa: E402
 from infra.watch.apply import ConfigLockTimeout, file_lock  # noqa: E402
 from infra.watch.daemon import (  # noqa: E402
     DaemonPaths, DaemonSettings, DaemonStore, WatchDaemon, daemon_lock, write_daily_report)
+from infra.research.s1_scanner import calendar_version  # noqa: E402
 from infra.watch.manager import load_state  # noqa: E402
 from infra.watch.store import WatchStore  # noqa: E402
 from tools.research_collect import _LazyClient, make_client  # noqa: E402
@@ -142,7 +143,8 @@ def cmd_status(args, *, now, calendar) -> int:
         stop_resp = (datetime.fromisoformat(last["stopped_at"])
                      - datetime.fromisoformat(last["stop_requested_at"])).total_seconds()
     out = {"daemon": state, "run": last, "since": since, "config": st.summary(), "calls_today": usage,
-           "calendar": cal, "stop_response_sec": stop_resp,
+           "calendar": cal, "calendar_version": calendar_version(calendar), "stop_response_sec": stop_resp,
+           "kst_now": t_now.isoformat(timespec="seconds"),
            "next_due": nxt.isoformat() if nxt else None,
            "tasks": [{k: t[k] for k in ("kind", "trading_day", "status", "attempts", "failures", "finished_at",
                                         "next_retry_at", "config_version", "contract_hash", "error", "report_path",

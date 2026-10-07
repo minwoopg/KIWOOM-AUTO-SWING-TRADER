@@ -681,7 +681,7 @@ def fresh(name, start, symbols, **kw):
 
 def gate_rows(e, stage=None, symbol="005930"):
     with D.DaemonStore(e["paths"].daemon_db) as ds:
-        return [g for g in ds.gates(stage=stage) if g["symbol"] == symbol]
+        return [g for g in ds.gates(stage=stage) if symbol is None or g["symbol"] == symbol]
 
 
 def price_calls(e, n=0):
@@ -1105,9 +1105,9 @@ dX2 = daemon(EX)
 at(EX, datetime(2026, 10, 7, 19, 30))
 rX = dX2.tick()
 ctX = close_tasks(EX)
-check("9-26) R4 이전 키 이전: wd1 DB를 열면 wd2로 올리고(기존 행 보존, upgraded_from 기록) 이전 키 COMPLETE는 그대로, 새 범위 키로 "
+check("9-26) R4 이전 키 이전: wd1 DB를 열면 최신 스키마로 올리고(기존 행 보존, upgraded_from 기록) 이전 키 COMPLETE는 그대로, 새 범위 키로 "
       "한 번 다시 준비(받은 일봉은 다시 받지 않음) — 이번엔 게이트 근거가 생김",
-      dX2.dstore.meta("daemon_schema") == "wd2" and dX2.dstore.meta("upgraded_from") == "wd1"
+      dX2.dstore.meta("daemon_schema") == D.DAEMON_SCHEMA and dX2.dstore.meta("upgraded_from") == "wd1"
       and any(t["task_key"] == old_key and t["status"] == "COMPLETE" for t in ctX) and len(ctX) == 2
       and rX["ran"].startswith("CLOSE_PREP|2026-10-07|scope:v2:") and gate_rows(EX, "SCAN"))
 dX2.stop()
@@ -1131,6 +1131,279 @@ check("9-28) 다시 시도 정의: 실패 1·2·3번째 뒤 5·15·30분, 실패
       and "5·15·30분" in (ROOT / "docs/watch_daemon.md").read_text(encoding="utf-8")
       and "5·15·30·60분" not in (ROOT / "infra/watch/daemon.py").read_text(encoding="utf-8"))
 
+
+# ── 10. W2 재검토 R6·I1 — 재개 때 현재 자격, 게이트 저장 완료 시각 ─────────────────
+from infra.research.kiwoom_readonly import RequestStopped  # noqa: E402
+from infra.watch.apply import journal_path  # noqa: E402
+
+
+def inject_stop(e, d, api="ka10001", nth=1):
+    """n번째 api 요청 직전에 RequestStopped(TIME_BUDGET) — 후보 확정과 첫 요청 사이의 경계를 직접 만듦."""
+    real, seen = d.request_guard, {"n": 0}
+
+    def guard(api_id):
+        if api_id == api:
+            seen["n"] += 1
+            if seen["n"] == nth:
+                raise RequestStopped("TIME_BUDGET(시험 주입)")
+        return real(api_id)
+    e["client"].guard = guard
+
+
+def resume_case(name, change, *, symbols=(S_5930,), api="ka10001", nth=1, prep=None):
+    """10/7 정상 관찰 → 10/8 09:05 후보 확정·첫 요청 전 양보 → 관리자 재기동(같은 DB) → 상태 변경 → 09:07 재시도."""
+    e, d = fresh(name, datetime(2026, 10, 7, 19, 0), list(symbols))
+    if prep:
+        prep(e)
+    d.tick()
+    d.tick()
+    at(e, datetime(2026, 10, 8, 9, 5))
+    inject_stop(e, d, api, nth)
+    r1 = d.tick()
+    n1 = len(e["fake"].calls)
+    set1, chk1 = open_set(e, D108)
+    d.stop()
+    e["client"].guard = None
+    change(e)
+    d2 = daemon(e)
+    at(e, datetime(2026, 10, 8, 9, 7))                           # 양보 뒤 다시 시도 시각(poll 60초 뒤) 지남
+    n2 = len(e["fake"].calls)
+    r2 = d2.tick()
+    set2, chk2 = open_set(e, D108)
+    out = {"r1": r1, "r2": r2, "set1": set1, "chk1": chk1, "set2": set2, "chk2": chk2, "calls1": api_codes(e)[:n1],
+           "calls2": api_codes(e, n2), "resume": gate_rows(e, "RESUME", None), "task": tasks(e)[("OPEN_CHECK", "2026-10-08")],
+           "e": e}
+    d2.stop()
+    return out
+
+
+def no_change(e):
+    return None
+
+
+R6 = {
+    "interest": resume_case("r6_interest", lambda e: write_cfg(e, [{"code": "005930", "interest": {
+        "enabled": False, "s1_analysis": True}}])),
+    "rejected": resume_case("r6_rejected", lambda e: e["paths"].config.write_text("schema: w1\nsymbols: [\n",
+                                                                                  encoding="utf-8")),
+    "journal": resume_case("r6_journal", lambda e: journal_path(e["paths"].config).write_text("{bad json",
+                                                                                            encoding="utf-8")),
+    "basis": resume_case("r6_basis", lambda e: write_cfg(e, [S_5930], history_sessions=170)),
+    "none": resume_case("r6_none", no_change),
+}
+ri = R6["interest"]
+check("10-1) R6 후보 확정 뒤 첫 가격 요청 전 양보 → 재기동 → 관심 해제 → 09:07 재시도: 가격 요청 0회, 확정 목록·OPEN 통과 근거는 그대로(후보 1건 "
+      "유지), 현재 판정을 RESUME 근거(사유·설정 버전·판정 시각·A5 실행 ID)로 따로 저장, 작업 detail·A5 보고서에 '이번 실행 시점 자격 없음'",
+      ri["r1"]["status"] == "YIELDED" and ri["chk1"] == [] and ri["set1"]["count"] == 1
+      and not [a for a, _ in ri["calls1"] if a in ("ka10001", "ka10003", "ka10004")] and ri["r2"]["status"] == "COMPLETE"
+      and price_calls(ri["e"], 0) == [] and ri["set2"]["count"] == 1 and ri["chk2"] == []
+      and len(ri["resume"]) == 1 and ri["resume"][0]["eligible"] == 0
+      and ri["resume"][0]["reasons"][0] == "CURRENT:INTEREST_OFF" and ri["resume"][0]["evaluated_at"] == "2026-10-08T09:07:00"
+      and ri["resume"][0]["evidence"]["a5_run_id"] == ri["task"]["detail"]["a5_run_id"]
+      and ri["resume"][0]["config_version"] == 2 and ri["resume"][0]["committed_at"]
+      and ri["task"]["detail"]["current_gate"]["excluded"]["005930"][0] == "CURRENT:INTEREST_OFF"
+      and "이번 실행 시점 운영 자격 없음" in Path(ri["task"]["detail"]["report"]).read_text(encoding="utf-8")
+      and "마지막 실행 시점 자격" in Path(ri["task"]["report_path"]).read_text(encoding="utf-8")
+      and len(gate_rows(ri["e"], "OPEN")) == 1 and gate_rows(ri["e"], "OPEN")[0]["eligible"] == 1)
+exp = {"rejected": "CURRENT:CONFIG_ERROR", "journal": "CURRENT:JOURNAL_UNRESOLVED",
+       "basis": "CURRENT:ANALYSIS_HOLD:BASIS_CHANGED"}
+check("10-2) R6 같은 경로에서 YAML 오류(REJECTED)·미해결 적용 저널·분석 기준 변경 → 각각 가격 요청 0회, 사유 기록",
+      all(price_calls(R6[k]["e"], 0) == [] and R6[k]["resume"][0]["reasons"][0] == v and R6[k]["chk2"] == []
+          for k, v in exp.items()))
+rn = R6["none"]
+check("10-3) R6 상태 변경 없음: 재개해 미확인 후보를 정상 조회(3 TR 각 1회), RESUME 근거는 통과",
+      [a for a, _ in rn["calls2"]] == ["ka10001", "ka10003", "ka10004"] and rn["resume"][0]["eligible"] == 1
+      and [c["fetch_status"] for c in rn["chk2"]] == ["OK"] and rn["task"]["detail"]["current_gate"]["excluded"] == {})
+
+
+def two_pass(e):
+    e["fake"].series["035420"] = pass_series(PASS_DAY, base=30_000)
+
+
+S_35420 = {"code": "035420", "interest": {"enabled": True, "s1_analysis": True}}
+r2c = resume_case("r6_two", no_change, symbols=(S_5930, S_35420), nth=2, prep=two_pass)
+r2i = resume_case("r6_two_off", lambda e: write_cfg(e, [S_5930, {"code": "035420", "interest": {
+    "enabled": False, "s1_analysis": True}}]), symbols=(S_5930, S_35420), nth=2, prep=two_pass)
+check("10-4) R6 후보 2건 중 1건 확인 뒤 양보 → 재개: 이미 확인한 후보는 다시 조회하지 않고 미확인 후보만(변경 없음이면 조회, 그 후보 관심 "
+      "해제면 0회) — 이미 저장한 가격 결과는 그대로",
+      r2c["set1"]["count"] == 2 and [c["symbol"] for c in r2c["chk1"]] == ["005930"]
+      and r2c["calls2"] == [("ka10001", "035420"), ("ka10003", "035420"), ("ka10004", "035420")]
+      and [c["symbol"] for c in r2c["chk2"]] == ["005930", "035420"]
+      and r2i["calls2"] == [] and [c["symbol"] for c in r2i["chk2"]] == ["005930"]
+      and r2i["chk2"][0]["observed_price"] == r2i["chk1"][0]["observed_price"]
+      and [g["symbol"] for g in r2i["resume"]] == ["035420"])
+rx = resume_case("r6_extras", lambda e: write_cfg(e, [{"code": "005930", "interest": {
+    "enabled": False, "s1_analysis": True}}]), api="ka10003")
+check("10-5) R6 기본 가격 저장 뒤 보조 요청(ka10003) 전 중단 → 재개(관심 해제 상태여도): 이미 기본 가격이 있는 후보는 재판정 대상이 아니고 "
+      "기존 정책대로 보조 조회 INTERRUPTED, 다시 조회 안 함",
+      [c["fetch_status"] for c in rx["chk1"]] == ["OK"] and rx["calls2"] == [] and rx["resume"] == []
+      and rx["chk2"][0]["extra_json"] == A5.EXTRAS_INTERRUPTED
+      and rx["chk2"][0]["observed_price"] == rx["chk1"][0]["observed_price"])
+with ScanStore(ri["e"]["paths"].watch_scan_db) as ss:
+    obs_r6 = [o for o in ss.observations("2026-10-07") if o["symbol"] == "005930"]
+oc_free = A5.OpenChecker.__init__.__kwdefaults__
+check("10-6) R6 연구 경로·계산 기록 변화 없음: OpenChecker의 gate·admit 기본값 없음(연구 CLI A5 그대로), 관찰 DB의 계산 PASS·final 유지, "
+      "연구 계약 해시 그대로",
+      oc_free["gate"] is None and oc_free["admit"] is None and any(o["eligible_signal"] == "PASS" and o["final"] == 1 for o in obs_r6)
+      and __import__("infra.research.s1_scanner", fromlist=["x"]).build_contract(CAL)[1] == "170bd3f6d10b")
+
+CHILD = r'''
+import os, sys, shutil
+from datetime import datetime
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+os.chdir(sys.argv[1])
+src = Path("test_watch_daemon.py").read_text(encoding="utf-8").split("# ── 1. 일정")[0]
+g = {"__name__": "child", "__file__": str(Path(sys.argv[1]) / "test_watch_daemon.py")}
+exec(compile(src, "child", "exec"), g)
+shutil.rmtree(g["TMP"], ignore_errors=True)
+g["TMP"] = Path(sys.argv[2])
+mode = sys.argv[3]
+from infra.watch import daemon as D
+from infra.watch.apply import test_point
+e = g["env"]("child", datetime(2026, 10, 7, 19, 0), [g["S_5930"]])
+d = D.WatchDaemon(e["paths"], g["CAL"], e["client"], settings=D.DaemonSettings(), now=e["clock"],
+                  sleep=e["clock"].sleep, log=lambda m: None, hook=test_point)
+d.start()
+d.dstore.set_meta("since", "2026-10-07")
+d.dstore.conn.execute("DELETE FROM task")
+d.tick()
+d.tick()                                      # mode=gate: 이 마감 준비의 게이트 커밋 직후 강제 종료(WATCH_TEST_CRASH_AT)
+if mode == "first_price":
+    e["clock"].t = datetime(2026, 10, 8, 9, 5)
+    real = d.request_guard
+    def guard(api_id):
+        if api_id == "ka10001":
+            os._exit(97)                      # 후보 확정 뒤 첫 가격 요청 직전 강제 종료
+        return real(api_id)
+    e["client"].guard = guard
+    d.tick()
+print("NOT_KILLED")
+'''
+
+
+def child(mode, extra=None):
+    cdir = TMP / f"child_{mode}"
+    cdir.mkdir()
+    r = subprocess.run([sys.executable, "-c", CHILD, str(ROOT), str(cdir), mode], capture_output=True, text=True,
+                       encoding="utf-8", env={**SUBENV, **(extra or {})}, timeout=180)
+    return r.returncode, cdir / "child"
+
+
+def adopt(name, cdir):
+    """부모 쪽 가짜 키움·시계로 자식이 남긴 같은 DB·설정을 다시 엶(재기동)."""
+    e = env(name, datetime(2026, 10, 8, 9, 6), [S_5930])
+    e["paths"] = D.DaemonPaths(cdir / "watchlist.yaml", cdir / "watch.sqlite3", cdir / "research.sqlite3",
+                               cdir / "daemon.sqlite3", cdir / "watch_s1.sqlite3", cdir / "watch_open.sqlite3",
+                               cdir / "reports", cdir / "daemon.log")
+    return e
+
+
+rcK, cK = child("first_price")
+with A5.OpenCheckStore(cK / "watch_open.sqlite3") as o:
+    setK0 = o.get_set(D108)
+EK2 = adopt("r6_kill_parent", cK)
+write_cfg(EK2, [{"code": "005930", "interest": {"enabled": False, "s1_analysis": True}}])
+dK2 = daemon(EK2)
+at(EK2, datetime(2026, 10, 8, 9, 6))
+rK2 = dK2.tick()
+tK2 = tasks(EK2)[("OPEN_CHECK", "2026-10-08")]
+check("10-7) R6 실제 별도 프로세스를 후보 확정 뒤 첫 가격 요청 직전에 강제 종료 → 관심 해제 → 재기동: ABORTED 작업을 다시 실행하되 "
+      "미확인 후보는 현재 자격으로 제외(가격 요청 0회), 확정 목록 보존",
+      rcK == 97 and setK0 is not None and setK0["count"] == 1 and rK2["status"] == "COMPLETE" and tK2["attempts"] == 2
+      and EK2["fake"].calls == [] and gate_rows(EK2, "RESUME")[0]["reasons"][0] == "CURRENT:INTEREST_OFF")
+dK2.stop()
+
+# I1: 게이트 판정 시각과 저장 완료 시각
+def i1_case(name, commit_at):
+    """08:55 설정 거부(근거 부적격) → 08:59:59 복구·재판정 통과 → 그 근거의 커밋이 commit_at에 끝남(지연 주입) → 09:05 개장 확인."""
+    e = env(name, datetime(2026, 10, 7, 19, 0), [S_5930])
+    box = {}
+    d = D.WatchDaemon(e["paths"], CAL, e["client"], settings=D.DaemonSettings(), now=e["clock"], sleep=e["clock"].sleep,
+                      log=lambda m: None, hook=lambda p: (setattr(e["clock"], "t", box["delay"])
+                                                          if p == "gate_committed" and box.get("delay") else None))
+    d.start()
+    d.dstore.set_meta("since", "2026-10-07")
+    d.dstore.conn.execute("DELETE FROM task")
+    d.tick()
+    d.tick()
+    good = e["paths"].config.read_text(encoding="utf-8")
+    e["paths"].config.write_text("schema: w9\n", encoding="utf-8")
+    at(e, datetime(2026, 10, 8, 8, 55))
+    d.tick()
+    e["paths"].config.write_text(good, encoding="utf-8")
+    at(e, datetime(2026, 10, 8, 8, 59, 59))
+    box["delay"] = commit_at
+    d.tick()
+    box["delay"] = None
+    at(e, datetime(2026, 10, 8, 9, 5))
+    n = len(e["fake"].calls)
+    d.tick()
+    oc = tasks(e)[("OPEN_CHECK", "2026-10-08")]
+    rows = gate_rows(e, "SCAN")
+    d.stop()
+    return {"calls": price_calls(e, n), "oc": oc, "rows": rows}
+
+
+I1a = i1_case("i1_late", datetime(2026, 10, 8, 9, 0, 1))
+I1b = i1_case("i1_edge", datetime(2026, 10, 8, 9, 0, 0))
+I1c = i1_case("i1_ok", datetime(2026, 10, 8, 8, 59, 59))
+check("10-8) I1 판정은 개장 전(08:59:59)이지만 저장 완료가 개장 뒤(09:00:01)·개장 경계(09:00:00)면 그 근거로 자격을 회복시키지 않음 — "
+      "개장 전에 저장 완료된 마지막 근거(08:55 거부)로 제외, 가격 0회. 저장도 개장 전이면 통과·조회",
+      I1a["rows"][-1]["evaluated_at"] == "2026-10-08T08:59:59" and I1a["rows"][-1]["committed_at"] == "2026-10-08T09:00:01"
+      and I1a["calls"] == [] and I1a["oc"]["detail"]["gate"]["excluded"][0]["reasons"] == ["SCAN:CONFIG_ERROR"]
+      and I1b["calls"] == [] and I1b["rows"][-1]["committed_at"] == "2026-10-08T09:00:00"
+      and I1c["calls"] == ["ka10001", "ka10003", "ka10004"])
+rcG, cG = child("gate", {"WATCH_TEST_CRASH_AT": "gate_committed"})
+with D.DaemonStore(cG / "daemon.sqlite3") as ds:
+    nullG = [g["committed_at"] for g in ds.gates(stage="SCAN")]
+cG2 = TMP / "child_gate_copy"
+shutil.copytree(cG, cG2)
+EG2 = adopt("i1_null_open", cG)                               # 개장 전 재판정 없이 바로 09:06 개장 확인
+dG2 = daemon(EG2)
+at(EG2, datetime(2026, 10, 8, 9, 6))
+dG2.tick()
+ocG2 = tasks(EG2)[("OPEN_CHECK", "2026-10-08")]
+dG2.stop()
+EG3 = adopt("i1_null_regate", cG2)                            # 08:30에 켜면 근거 없는 행을 개장 전에 다시 판정
+dG3 = daemon(EG3)
+at(EG3, datetime(2026, 10, 8, 8, 30))
+dG3.tick()
+regG3 = [g for g in gate_rows(EG3, "SCAN") if g["task_key"] == "REGATE"]
+at(EG3, datetime(2026, 10, 8, 9, 6))
+nG3 = len(EG3["fake"].calls)
+dG3.tick()
+check("10-9) I1 게이트 커밋 뒤 저장 완료 시각을 적기 전 실제 프로세스 강제 종료 → committed_at NULL(추정해 채우지 않음): 그대로 개장 "
+      "확인이면 NO_GATE_EVIDENCE·조회 0, 개장 전에 다시 켜면 재판정 행(저장 완료 시각 있음)으로 정상 후보",
+      rcG == 97 and nullG == [None] and ocG2["detail"]["gate"]["excluded"][0]["reasons"] == ["NO_GATE_EVIDENCE"]
+      and price_calls(EG2, 0) == [] and len(regG3) == 1 and regG3[0]["committed_at"] == "2026-10-08T08:30:00"
+      and price_calls(EG3, nG3) == ["ka10001", "ka10003", "ka10004"])
+dG3.stop()
+EM, dM2 = normal_eve("i1_wd2")
+dM2.stop()
+with sqlite3.connect(EM["paths"].daemon_db) as cx:              # 이전 판(wd2) 모양: committed_at 열 없음
+    cols = [r[1] for r in cx.execute("PRAGMA table_info(candidate_gate)") if r[1] != "committed_at"]
+    cx.execute("ALTER TABLE candidate_gate RENAME TO cg_new")
+    cx.execute("""CREATE TABLE candidate_gate(
+      gate_id INTEGER PRIMARY KEY AUTOINCREMENT, stage TEXT NOT NULL, signal_date TEXT NOT NULL, open_at TEXT,
+      contract_hash TEXT NOT NULL, symbol TEXT NOT NULL, scan_run_id TEXT, eligible INTEGER NOT NULL,
+      reasons_json TEXT NOT NULL, config_version INTEGER, latest_version INTEGER, latest_status TEXT,
+      list_snapshot_id INTEGER, evidence_json TEXT NOT NULL, evaluated_at TEXT NOT NULL, task_key TEXT)""")  # wd2 DDL
+    cx.execute(f"INSERT INTO candidate_gate({', '.join(cols)}) SELECT {', '.join(cols)} FROM cg_new")
+    cx.execute("DROP TABLE cg_new")
+    cx.execute("UPDATE meta SET value='wd2' WHERE key='daemon_schema'")
+dM3 = daemon(EM)
+oldM = [g["committed_at"] for g in gate_rows(EM, "SCAN")]
+at(EM, datetime(2026, 10, 8, 8, 30))
+dM3.tick()
+at(EM, datetime(2026, 10, 8, 9, 6))
+nM = len(EM["fake"].calls)
+dM3.tick()
+check("10-10) I1 이전 wd2 행 이전: 열을 더하고 이전 행의 저장 완료 시각은 NULL로 둠(evaluated_at으로 추정 안 함, upgraded_from=wd2) — "
+      "개장 전에 관리자가 돌면 다시 판정해 근거를 채움",
+      dM3.dstore.meta("daemon_schema") == D.DAEMON_SCHEMA and dM3.dstore.meta("upgraded_from") == "wd2"
+      and oldM == [None] and price_calls(EM, nM) == ["ka10001", "ka10003", "ka10004"])
+dM3.stop()
 
 # ── 8. 상태·로그·경계 ─────────────────────────────────────
 buf = io.StringIO()

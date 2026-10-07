@@ -477,11 +477,14 @@ class OpenChecker:
     def __init__(self, ostore: OpenCheckStore, sstore: ScanStore, rstore: ResearchStore, cal: TradingCalendar, *,
                  contract_hash: str, offset_min: int = 5, on_time_tolerance_sec: int = 120,
                  log: Callable[[str], None] | None = None,
-                 gate: Callable[[dict, list[dict]], tuple[list[dict], dict]] | None = None) -> None:
+                 gate: Callable[[dict, list[dict]], tuple[list[dict], dict]] | None = None,
+                 admit: Callable[[dict, list[dict], str, bool], dict[str, list[str]]] | None = None) -> None:
         """gate(선택): 후보 확정 직전 (초안, 계산 PASS 후보) → (남길 후보, 근거). 근거는 source.gate에 저장.
-        상시 실행 관리자의 운영 진입 게이트(W2 검토 R1) — 연구 CLI는 없음(이전과 같은 후보)."""
+        admit(선택): 매 실행(재시도·재기동 포함) 가격 조회 전에 (확정 목록, 아직 가격이 없는 후보, 실행 ID, 이번 실행에서 막
+        확정했는지) → {제외할 종목: 사유}. 제외한 후보는 이번 실행에서 조회하지 않음 — 확정 목록·이미 저장한 가격은 그대로
+        (W2 재검토 R6). 둘 다 상시 실행 관리자의 운영 진입 게이트 — 연구 CLI는 없음(이전과 같은 후보·조회)."""
         self.ostore, self.sstore, self.rstore, self.cal = ostore, sstore, rstore, cal
-        self.gate = gate
+        self.gate, self.admit = gate, admit
         self.contract_hash = contract_hash
         self.offset = timedelta(minutes=offset_min)
         self.tolerance = timedelta(seconds=on_time_tolerance_sec)
@@ -509,6 +512,7 @@ class OpenChecker:
             self.log(f"[A5] 끝나지 않은 이전 실행 {rid} → ABORTED")
         try:
             cset = self.ostore.get_set(day)
+            fresh = cset is None
             if cset is None:
                 draft, cands = select_candidates(self.sstore, self.rstore, self.cal, day, self.contract_hash)
                 if self.gate is not None:
@@ -529,12 +533,25 @@ class OpenChecker:
                         f"{cset['contract_hash']}로 확정 — 확정된 목록을 그대로 씀(섞지 않음)")
                 self.log(f"[A5] {note}")
             close = self.close_at(day)
-            for c in self.ostore.candidates(cset["set_id"]):
+            cands = self.ostore.candidates(cset["set_id"])
+            skip: dict[str, list[str]] = {}
+            if self.admit is not None:
+                pending = [c for c in cands if self.ostore.get_check(cset["set_id"], c["symbol"], self.kind) is None]
+                if pending:
+                    skip = self.admit(cset, pending, run_id, fresh) or {}
+                if skip:
+                    msg = "CURRENT_GATE: 지금 운영 자격이 없어 조회하지 않음 — " + ", ".join(
+                        f"{k}({','.join(v)})" for k, v in sorted(skip.items()))
+                    note = f"{note} / {msg}" if note else msg
+                    self.log(f"[A5] {msg}")
+            for c in cands:
                 old = self.ostore.get_check(cset["set_id"], c["symbol"], self.kind)
                 if old is not None:
                     if old["extra_json"] == EXTRAS_PENDING:    # 이전 실행이 보조 조회 중 끊김 — 늦게 다시 조회하지 않음
                         self.ostore.update_extras(cset["set_id"], c["symbol"], self.kind,
                                                   {"extra_json": EXTRAS_INTERRUPTED})
+                    continue
+                if c["symbol"] in skip:
                     continue
                 row = self._check_one(cset, c, target, close, client, now, run_id)
                 self.ostore.record_check(row)                  # 기본 가격 먼저 저장(한 트랜잭션)
@@ -545,6 +562,8 @@ class OpenChecker:
             counts = {"candidates": cset["count"], "checked": len(checks),
                       "timing": _tally(checks, "timing"), "fetch": _tally(checks, "fetch_status"),
                       "outcome": _tally(checks, "outcome")}
+            if self.admit is not None:
+                counts["current_gate_excluded"] = skip
             self.ostore.finish_run(run_id, set_id=cset["set_id"], status="COMPLETE", counts=counts, note=note,
                                    now=now())
         except BaseException as exc:
@@ -673,6 +692,9 @@ def build_markdown(res: dict) -> str:
              f"- 시각: {c['timing']} · 조회: {c['fetch']} · 판정: {c['outcome']}"]
     if res["note"]:
         lines.append(f"- 주의: {res['note']}")
+    if c.get("current_gate_excluded"):
+        lines.append("- 이번 실행 시점 운영 자격 없음(가격 미조회 — 확정 목록에는 남음): " + ", ".join(
+            f"{k} {','.join(v)}" for k, v in sorted(c["current_gate_excluded"].items())))
     lines += ["", f"> {NOTE}", ""]
     cand = {x["symbol"]: x for x in res["candidates"]}
     rows = []
