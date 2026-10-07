@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import sqlite3
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -34,18 +34,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from dataclasses import asdict  # noqa: E402
-
 from domain.watchlist.config import (  # noqa: E402
-    Interest, PriceBand, dump_document, empty_document, find_item, parse_text,
+    Interest, dump_document, empty_document, find_item, parse_text,
 )
 from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE, CollectError, ResearchCollector  # noqa: E402
 from infra.research.kiwoom_readonly import ResearchApiError, ResearchConfigError  # noqa: E402
 from infra.research.store import ResearchStore  # noqa: E402
 from infra.watch.manager import (  # noqa: E402
-    READY, WatchNotReady, analysis_basis, check_text, entry_gate, holding_guard, listing_from_store, load_state,
+    READY, WatchNotReady, analysis_basis, check_text, entry_gate, listing_from_store, load_state,
     prepare_data, read_config_text,
-    sync_config,
+)
+from infra.watch.apply import (  # noqa: E402
+    DEFAULT_LOCK_TIMEOUT, CommitResult, ConfigLockTimeout, commit_config_text, config_lock, sync_file,
+    write_config_file,
 )
 from infra.watch.store import WatchStore  # noqa: E402
 from tools.research_collect import _LazyClient, make_client  # noqa: E402
@@ -69,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--env-file", default=str(ROOT / ".env"))
     p.add_argument("--base-url", default="https://mockapi.kiwoom.com")
     p.add_argument("--sleep", type=float, default=1.0)
+    p.add_argument("--lock-timeout", type=float, default=DEFAULT_LOCK_TIMEOUT,
+                   help="설정 적용 잠금 대기 상한(초) — 넘으면 아무것도 바꾸지 않고 종료 코드 2")
     p.add_argument("--after-close-min", type=int, default=int(BAR_COMPLETE_AFTER_CLOSE.total_seconds() // 60))
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init")
@@ -224,93 +227,87 @@ def edit_document(doc: dict, args) -> str:
     raise EditError(args.cmd)
 
 
-def commit_text(wstore: WatchStore, cfg_path: Path, text: str, listing, snap_id, *, now, origin: str,
-                pending: dict[str, dict] | None = None):
-    """바꾼 원문을 검증(형식·목록·보유 보호) → 청산 기록 → 파일 교체 → 적용. 반환 (종료 코드, 상태, 시도).
-    파일을 쓰기 전에 거부되면 파일 그대로 2. 쓴 뒤 적용이 거부되면 원래 파일로 되돌리고 2 (W1b-R2).
-    읽기·교체·적용 중 예외(권한 등)도 2 — 이 명령의 청산 기록은 VOID, 교체했으면 원래 파일 복원, 복원까지 실패하면
-    REJECTED 시도로 기록해 신규 매수 차단 상태로 남김 (W1c-R1). 중단(Ctrl+C)은 같은 정리 뒤 다시 올림."""
-    pending = pending or {}
-    res = check_text(text, listing)
-    if not res.ok:
-        print("[거부] 바꾼 결과가 검증을 통과하지 못해 파일을 바꾸지 않았습니다:")
-        _print_issues([vars(e) for e in res.errors], [vars(w) for w in res.warnings])
-        return 2, None, None
-    before = load_state(wstore)
-    guard, _, _ = holding_guard(wstore, before.config, before.active_version, res.config, pending=pending)
-    if guard:
-        print("[거부] 보유 보호 — 파일을 바꾸지 않았습니다:")
-        _print_issues([vars(e) for e in guard], [])
-        return 2, None, None
-    close_ids: dict[str, int] = {}
-    old_bytes, replaced = None, False
+def _print_recovered(rec: dict | None) -> None:
+    """남은 적용 저널을 복구했으면 그 결과를 그대로 보여줌."""
+    if not rec:
+        return
+    line = f"[이전 적용 저널 복구] {rec['action']}"
+    if rec.get("message"):
+        line += f" — {rec['message']}"
+    if rec.get("record_error"):
+        line += f" (기록 실패: {rec['record_error']} — 결과 불확정)"
+    if rec.get("remove_error"):
+        line += f" (저널 삭제 실패: {rec['remove_error']})"
+    print(line)
+
+
+def _report_commit(r: CommitResult) -> None:
+    _print_recovered(r.recovered)
+    if r.code == 0:
+        for m in r.messages:
+            print(f"[주의] {m}")
+        return
+    tag = {"REJECTED_PRECHECK": "[거부]", "CONFLICT": "[충돌]", "UNCERTAIN": "[불확정]"}.get(r.outcome, "[실패]")
+    for m in r.messages:
+        print(f"{tag} {m}")
+    _print_issues(r.errors or [], [])
+
+
+def _edit_command(args, cfg_path, wstore, listing, snap_id, now) -> tuple[int, object]:
+    """바꾸는 명령(add·set·enable·disable·holding-close·remove·restore) — 설정 적용 잠금 안에서 부름.
+    반환 (종료 코드, add 뒤 과거 일봉을 받을 상태 또는 None — 수집은 잠금을 푼 뒤)."""
+    if args.cmd == "restore":
+        hist = [h for h in wstore.history(10_000) if h["status"] == "APPLIED"]
+        pick = hist[0] if hist and args.version is None else next(
+            (h for h in hist if h["version"] == args.version), None)
+        if pick is None or pick["raw_text"] is None:
+            print(f"[거부] 되돌릴 정상(APPLIED) 설정이 없음{'' if args.version is None else f': v{args.version}'}")
+            return 2, None
+        r = commit_config_text(wstore, cfg_path, pick["raw_text"], listing, snap_id, now=now,
+                               origin=f"CLI:restore v{pick['version']}", lock_timeout=args.lock_timeout)
+        _report_commit(r)
+        if r.code:
+            return r.code, None
+        print(f"restore v{pick['version']} → v{r.att['version'] if r.att else '?'} APPLIED")
+        return 0, None
+
+
+    text0, rerr = read_config_text(cfg_path)
+    if rerr:
+        print(f"[중단] 지금 파일을 읽을 수 없음 — 고친 뒤 apply: {rerr}")
+        return 2, None
+    if text0 is not None:
+        raw, perr = parse_text(text0)
+        if perr:
+            print(f"[중단] 지금 파일을 읽을 수 없음 — 직접 고친 뒤 apply: {perr}")
+            return 2, None
+        doc = raw if isinstance(raw, dict) else empty_document()
+    else:
+        doc = empty_document()
+    close_codes = []
+    if args.cmd == "holding-close":
+        # 명시적 청산 — 사용 중 설정의 보유를 청산(YAML에서 이미 빠졌어도 — W1b-R2). 값은 적용 잠금 안에서 다시 읽음
+        before = load_state(wstore)
+        old = None if before.config is None else before.config.symbol(_code(args.code))
+        if old is not None and old.holding is not None:
+            close_codes.append(old.code)
+        args.active_holding = bool(close_codes)
     try:
-        for code, h in pending.items():
-            close_ids[code] = wstore.record_close(code, h, at=now(), from_version=before.active_version, origin=origin)
-        old_bytes = cfg_path.read_bytes() if cfg_path.is_file() else None
-        _atomic_write(cfg_path, text)
-        replaced = True
-        state, att = sync_config(wstore, cfg_path, listing, snap_id, now=now(), origin=origin, closes=close_ids)
-    except BaseException as exc:
-        for cid in close_ids.values():
-            _quiet(lambda: wstore.void_close(cid))
-        restore_err = _restore_file(cfg_path, old_bytes) if replaced else None
-        where = "적용 중" if replaced else "파일 교체 전·교체 중"
-        print(f"[실패] {where} {type(exc).__name__}: {exc} — 이 명령의 청산 기록은 무효"
-              + ("" if not replaced else (", 원래 파일로 되돌림" if restore_err is None else "")))
-        if restore_err is not None:
-            _record_restore_failure(wstore, cfg_path, origin, now, f"{type(exc).__name__}: {exc}", restore_err)
-        if not isinstance(exc, Exception):
-            raise
-        return 2, None, None
-    if att["status"] != "APPLIED":
-        restore_err = _restore_file(cfg_path, old_bytes)
-        if restore_err is None:
-            print(f"[거부] v{att['version']} 적용 실패 — 파일을 원래대로 되돌렸습니다:")
-        else:
-            _record_restore_failure(wstore, cfg_path, origin, now, f"v{att['version']} REJECTED", restore_err)
-        _print_issues(att["errors"], [])
-        return 2, state, att
-    return 0, state, att
-
-
-def _quiet(fn) -> None:
-    try:
-        fn()
-    except Exception:
-        pass
-
-
-def _restore_file(cfg_path: Path, old_bytes: bytes | None) -> str | None:
-    """원래 파일로 되돌림. 반환: 실패 사유(성공이면 None)."""
-    try:
-        if old_bytes is None:
-            cfg_path.unlink(missing_ok=True)
-        else:
-            tmp = cfg_path.with_name(cfg_path.name + ".tmp")
-            tmp.write_bytes(old_bytes)
-            os.replace(tmp, cfg_path)
-        return None
-    except OSError as exc:
-        return f"{type(exc).__name__}: {exc}"
-
-
-def _record_restore_failure(wstore: WatchStore, cfg_path: Path, origin: str, now, cause: str, restore_err: str) -> None:
-    """파일 복원까지 실패 — 파일과 사용 중 설정이 다를 수 있음. REJECTED 시도로 남겨 신규 매수 차단 (W1c-R1)."""
-    msg = (f"설정 파일을 원래대로 되돌리지 못함({restore_err}) — 원인 {cause}. 파일과 사용 중 설정이 다를 수 있음: "
-           "파일을 확인한 뒤 apply 또는 restore")
-    print(f"[실패] {msg}")
-    _quiet(lambda: wstore.record_attempt(
-        at=now(), origin=f"{origin} (복원 실패)", source_path=str(cfg_path), raw_sha="COMMIT_RESTORE_FAILED",
-        status="REJECTED", config_hash=None, errors=[{"code": "-", "field": "file", "message": msg}], warnings=[],
-        raw_text=None, config=None, list_snapshot_id=None))
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+        what = edit_document(doc, args)
+    except EditError as exc:
+        print(f"[거부] {exc}")
+        return 2, None
+    r = commit_config_text(wstore, cfg_path, dump_document(doc), listing, snap_id, now=now, origin=f"CLI:{what}",
+                           close_codes=close_codes, lock_timeout=args.lock_timeout)
+    _report_commit(r)
+    if r.code:
+        return r.code, None
+    att = r.att or {"version": "?", "status": "APPLIED", "warnings": []}
+    print(f"{what} → v{att['version']} {att['status']}")
+    _print_issues([], att.get("warnings", []))
+    state = r.state if r.state is not None else load_state(wstore)
+    fetch = args.cmd == "add" and not args.no_fetch and state.config.symbol(_code(args.code)).active
+    return 0, (state if fetch else None)
 
 
 def _status_table(state, wstore: WatchStore, listing, snap_id=None) -> None:
@@ -383,7 +380,7 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
         if cfg_path.exists():
             print(f"[중단] 이미 있음: {cfg_path}")
             return 2
-        _atomic_write(cfg_path, dump_document(empty_document()))
+        write_config_file(cfg_path, dump_document(empty_document()))
         print(f"만듦: {cfg_path} (종목 없음 — add로 추가)")
         return 0
 
@@ -403,7 +400,16 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
 
         if args.cmd in ("apply", "status", "history"):
             if args.cmd != "history":
-                state, att = sync_config(wstore, cfg_path, listing, snap_id, now=now())
+                try:
+                    state, att, rec = sync_file(wstore, cfg_path, listing, snap_id, now=now,
+                                                lock_timeout=args.lock_timeout)
+                except ConfigLockTimeout as exc:
+                    print(f"[잠금] {exc}")
+                    return 2
+                except (sqlite3.Error, OSError) as exc:
+                    print(f"[실패] 설정 반영 중 {type(exc).__name__}: {exc} — 확정 전이라 이전 사용 중 설정·보유 감시 유지")
+                    return 2
+                _print_recovered(rec)
                 if args.cmd == "apply":
                     print(f"v{att['version']} {att['status']}" + ("" if att["new"] else " (직전과 같음 — 새 기록 없음)"))
                     _print_issues(att["errors"], att["warnings"])
@@ -424,61 +430,24 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
             client = _LazyClient(lambda: make_client(args))
         collector = ResearchCollector(client, rstore, calendar, after_close=after_close, log=print)
 
-        if args.cmd in ("add", "set", "enable", "disable", "holding-close", "remove"):
-            text0, rerr = read_config_text(cfg_path)
-            if rerr:
-                print(f"[중단] 지금 파일을 읽을 수 없음 — 고친 뒤 apply: {rerr}")
-                return 2
-            if text0 is not None:
-                raw, perr = parse_text(text0)
-                if perr:
-                    print(f"[중단] 지금 파일을 읽을 수 없음 — 직접 고친 뒤 apply: {perr}")
-                    return 2
-                doc = raw if isinstance(raw, dict) else empty_document()
-            else:
-                doc = empty_document()
-            pending = {}
-            if args.cmd == "holding-close":
-                # 명시적 청산 — 마지막 정상 설정의 보유 값으로 기록 (YAML에서 이미 빠졌어도 — W1b-R2)
-                before = load_state(wstore)
-                old = None if before.config is None else before.config.symbol(_code(args.code))
-                if old is not None and old.holding is not None:
-                    pending[old.code] = asdict(old.holding)
-                args.active_holding = bool(pending)
+        if args.cmd in ("add", "set", "enable", "disable", "holding-close", "remove", "restore"):
+            # 파일 읽기~편집~적용을 한 잠금 안에서 — 그 사이 다른 명령·관리자가 파일을 바꾸지 못함 (C1)
             try:
-                what = edit_document(doc, args)
-            except EditError as exc:
-                print(f"[거부] {exc}")
+                with config_lock(wstore, timeout=args.lock_timeout):
+                    code_, fetch_state = _edit_command(args, cfg_path, wstore, listing, snap_id, now)
+            except ConfigLockTimeout as exc:
+                print(f"[잠금] {exc}")
                 return 2
-            code_, state, att = commit_text(wstore, cfg_path, dump_document(doc), listing, snap_id, now=now,
-                                            origin=f"CLI:{what}", pending=pending)
-            if code_:
+            if fetch_state is None:
                 return code_
-            print(f"{what} → v{att['version']} {att['status']}")
-            _print_issues([], att["warnings"])
-            if args.cmd == "add" and not args.no_fetch and state.config.symbol(_code(args.code)).active:
-                try:
-                    res2 = prepare_data(wstore, rstore, collector, calendar, state, listing, now=now,
-                                        codes=[_code(args.code)], after_close=after_close, log=print)
-                except (ResearchConfigError, ResearchApiError, CollectError) as exc:
-                    print(f"[과거 일봉 수집 못 함 — 설정은 적용됨, 나중에 prepare] {exc}")
-                    return 1
-                r = next(x for x in res2["rows"] if x["code"] == _code(args.code) and x["kind"] == "STOCK")
-                print(f"데이터: {_ready_cell(r)} (준비 실행 {res2['run_id']}, 조회 {res2['calls']}회)")
-            return 0
-
-        if args.cmd == "restore":
-            hist = [h for h in wstore.history(10_000) if h["status"] == "APPLIED"]
-            pick = hist[0] if hist and args.version is None else next(
-                (h for h in hist if h["version"] == args.version), None)
-            if pick is None or pick["raw_text"] is None:
-                print(f"[거부] 되돌릴 정상(APPLIED) 설정이 없음{'' if args.version is None else f': v{args.version}'}")
-                return 2
-            code_, state, att = commit_text(wstore, cfg_path, pick["raw_text"], listing, snap_id, now=now,
-                                            origin=f"CLI:restore v{pick['version']}")
-            if code_:
-                return code_
-            print(f"restore v{pick['version']} → v{att['version']} {att['status']}")
+            try:                                          # 과거 일봉 수집은 잠금 밖에서 (API 조회 중 설정 잠금을 잡지 않음)
+                res2 = prepare_data(wstore, rstore, collector, calendar, fetch_state, listing, now=now,
+                                    codes=[_code(args.code)], after_close=after_close, log=print)
+            except (ResearchConfigError, ResearchApiError, CollectError) as exc:
+                print(f"[과거 일봉 수집 못 함 — 설정은 적용됨, 나중에 prepare] {exc}")
+                return 1
+            r = next(x for x in res2["rows"] if x["code"] == _code(args.code) and x["kind"] == "STOCK")
+            print(f"데이터: {_ready_cell(r)} (준비 실행 {res2['run_id']}, 조회 {res2['calls']}회)")
             return 0
 
         if args.cmd == "prepare":
@@ -487,7 +456,15 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                 s = collector.snapshot_universe()            # 목록 조회(2회)만 — 전체 시장 일봉 수집은 하지 않음
                 print(f"종목 목록 스냅숏 {s['snapshot_id']} (오늘 첫 준비)")
                 listing, snap_id = listing_from_store(rstore)
-            state, att = sync_config(wstore, cfg_path, listing, snap_id, now=now())
+            try:
+                state, att, rec = sync_file(wstore, cfg_path, listing, snap_id, now=now, lock_timeout=args.lock_timeout)
+            except ConfigLockTimeout as exc:
+                print(f"[잠금] {exc}")
+                return 2
+            except (sqlite3.Error, OSError) as exc:
+                print(f"[실패] 설정 반영 중 {type(exc).__name__}: {exc} — 확정 전이라 이전 사용 중 설정·보유 감시 유지")
+                return 2
+            _print_recovered(rec)
             if att["errors"]:
                 print(f"[설정 오류] v{att['version']} 거부 — " + ("마지막 정상 설정으로 진행" if state.can_monitor
                                                             else "정상 설정이 없어 시작 안 함"))

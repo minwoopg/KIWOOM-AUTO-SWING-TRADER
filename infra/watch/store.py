@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""감시 저장소 `data/watch/watch.sqlite3` (스키마 wa1) — 설정 적용 이력·데이터 준비 상태·준비 실행 기록.
+"""감시 저장소 `data/watch/watch.sqlite3` (스키마 wa2) — 설정 적용 이력·데이터 준비 상태·준비 실행 기록.
 
 - config_version : 설정을 읽을 때마다(내용·판정이 바뀐 경우만) 한 행. 번호(version)는 시도 순서대로 늘고,
                    APPLIED(적용 성공) / REJECTED(오류 — 적용 안 함). 원문·정규화 설정·오류·경고·대조한 목록 스냅숏 보존.
@@ -10,8 +10,12 @@ from __future__ import annotations
 - prepare_run    : 데이터 준비(지정 종목·지수만 수집) 실행 — 설정 버전과 연결.
 - config_check   : 같은 버전을 다른 종목 목록 스냅숏으로 다시 검증한 기록(버전은 그대로, 목록·경고 변화 보존).
 - holding_close  : 수동 보유 청산 기록(holding-close) — 이 기록 없이 보유 정보가 사라진 설정은 적용하지 않음(W1-R1).
+                   W1d-R1부터는 그 청산을 적용하는 **같은 트랜잭션 안에서** USED로 만들어짐(OPEN 상태로 남는 기록 없음).
+                   예전 버전이 남긴 OPEN 기록은 다음 적용 때 VOID.
 - symbol_risk    : 종목별 위험 자격 — 최신 종목 목록으로 설정을 읽을 때마다 갱신(W1-R2). 바뀌면 symbol_risk_log.
 readiness는 가격 데이터 준비(status)와 S1 분석 준비(analysis_status)를 따로 둠(W1-R3).
+트랜잭션(`tx`)은 다시 들어갈 수 있음(W1d-R1) — 바깥 `with tx():` 안에서 부른 메서드는 같은 트랜잭션에 묶이고
+바깥 블록의 COMMIT 한 번으로 확정, 예외면 전부 ROLLBACK.
 wa1 → wa2: 열 때 백업 후 열·표 추가(기존 기록 그대로, 분석 준비는 다음 준비 때 채움).
 연구 수집 DB(research.sqlite3)와 별도 파일 — 시세·일봉은 연구 DB를 함께 씀(다시 받지 않음).
 """
@@ -72,6 +76,7 @@ class WatchStore:
         self.path = str(p)
         self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
         self.conn.row_factory = sqlite3.Row
+        self._depth = 0
         self.conn.executescript(_SCHEMA)
         self.backup_path: str | None = None
         cur = self.conn.execute("SELECT value FROM meta WHERE key='watch_schema'").fetchone()
@@ -105,13 +110,28 @@ class WatchStore:
 
     @contextmanager
     def tx(self):
+        """BEGIN IMMEDIATE … COMMIT. 이미 트랜잭션 안이면 새로 시작하지 않고 바깥 트랜잭션에 합류 (W1d-R1)."""
+        if self._depth:
+            self._depth += 1
+            try:
+                yield
+            finally:
+                self._depth -= 1
+            return
         self.conn.execute("BEGIN IMMEDIATE")
+        self._depth = 1
         try:
             yield
         except BaseException:
+            self._depth = 0
             self.conn.execute("ROLLBACK")
             raise
+        self._depth = 0
         self.conn.execute("COMMIT")
+
+    @property
+    def in_tx(self) -> bool:
+        return self._depth > 0
 
     # ── 설정 이력 ────────────────────────────────────────────
     @staticmethod
@@ -155,13 +175,14 @@ class WatchStore:
         return [dict(r) for r in self.conn.execute("SELECT * FROM config_check ORDER BY check_id")]
 
     # ── 수동 보유 청산 기록 (W1-R1) ──────────────────────────
-    def record_close(self, code: str, holding: dict, *, at: datetime, from_version: int | None, origin: str) -> int:
+    def record_close(self, code: str, holding: dict, *, at: datetime, from_version: int | None, origin: str,
+                     state: str = CLOSE_OPEN, used_version: int | None = None) -> int:
         with self.tx():
             self.conn.execute("UPDATE holding_close SET state=? WHERE code=? AND state=?", (CLOSE_VOID, code, CLOSE_OPEN))
             return self.conn.execute(
-                "INSERT INTO holding_close(code, closed_at, holding_json, from_version, origin, state)"
-                " VALUES(?,?,?,?,?,?)", (code, _ts(at), json.dumps(holding, sort_keys=True), from_version, origin,
-                                         CLOSE_OPEN)).lastrowid
+                "INSERT INTO holding_close(code, closed_at, holding_json, from_version, origin, state, used_version)"
+                " VALUES(?,?,?,?,?,?,?)", (code, _ts(at), json.dumps(holding, sort_keys=True), from_version, origin,
+                                           state, used_version)).lastrowid
 
     def get_close(self, close_id: int) -> dict | None:
         r = self.conn.execute("SELECT * FROM holding_close WHERE close_id=?", (close_id,)).fetchone()

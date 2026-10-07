@@ -692,25 +692,27 @@ check("7-5) [W1b-R2] YAML에서 이미 보유를 지운 뒤에도 holding-close 
       c75 == 0 and "APPLIED" in o75 and st11c.config.symbol("000660").holding is None
       and cl11[-1]["state"] == "USED" and '"quantity": 10' in cl11[-1]["holding_json"])
 # 파일을 쓴 뒤 적용이 거부되는 경로 — 적용 단계만 실패하게 흉내(목록 대조 실패)
+import infra.watch.apply as AP  # noqa: E402
+
 E12 = setup("w1b-r2b")
 E12["cfg"].write_text(dump_document(doc(HOLD10)), encoding="utf-8")
 cli(E12, "apply")
 bytes12 = E12["cfg"].read_bytes()
-real_sync = W.sync_config
-W.sync_config = lambda ws, path, listing, snap, **kw: real_sync(ws, path, None, snap, **kw)
+real_sync = AP.sync_config
+AP.sync_config = lambda ws, path, listing, snap, **kw: real_sync(ws, path, None, snap, **kw)
 try:
     c76, o76 = cli(E12, "holding-close", "000660")
     c76b, o76b = cli(E12, "add", "005930", "--interest", "--no-fetch")
 finally:
-    W.sync_config = real_sync
+    AP.sync_config = real_sync
 with WatchStore(E12["wdb"]) as w12:
     st12 = M.load_state(w12)
     cl12 = w12.closes()
-check("7-6) [W1b-R2] 파일을 쓴 뒤 최종 적용이 거부되면 원래 파일로 되돌리고 종료 코드 2(성공으로 알리지 않음), 그 명령의 청산 "
-      "기록은 VOID, 사용 중 설정·보유 그대로",
-      (c76, c76b) == (2, 2) and "되돌렸습니다" in o76 and "되돌렸습니다" in o76b
+check("7-6) [W1b-R2] 파일을 쓴 뒤 최종 적용이 거부되면 원래 파일로 되돌리고 종료 코드 2(성공으로 알리지 않음), 청산 기록은 "
+      "남지 않음(적용 트랜잭션과 함께 사라짐), 사용 중 설정·보유 그대로",
+      (c76, c76b) == (2, 2) and "원래 설정 파일로 되돌림" in o76 and "원래 설정 파일로 되돌림" in o76b
       and E12["cfg"].read_bytes() == bytes12 and st12.config.symbol("000660").holding.quantity == 10
-      and [c["state"] for c in cl12] == ["VOID"])
+      and cl12 == [] and not AP.journal_path(E12["cfg"]).exists())
 
 # ── 8. GPT 재검토 a60c7df W1c-R1 ────────────────────────────
 def held(env):
@@ -729,25 +731,26 @@ def deny_write(path, text):
 
 E13 = setup("w1c-r1")
 b13 = held(E13)
-real_write = W._atomic_write
-W._atomic_write = deny_write
+real_write = AP.write_config_file
+AP.write_config_file = deny_write
 try:
     c81, o81 = cli(E13, "holding-close", "000660")
 finally:
-    W._atomic_write = real_write
+    AP.write_config_file = real_write
 with WatchStore(E13["wdb"]) as w13:
-    cl81 = [c["state"] for c in w13.closes()]
+    cl81 = w13.closes()
     q81 = M.load_state(w13).config.symbol("000660").holding.quantity
+same81 = E13["cfg"].read_bytes() == b13
 drop_holding(E13)                                   # 재시작 뒤 YAML에서 보유 누락
 c81b, o81b = cli(E13, "apply")
 with WatchStore(E13["wdb"]) as w13:
     st81 = M.load_state(w13)
-check("8-1) [W1c-R1 재현] holding-close 파일 교체 PermissionError → 종료 코드 2, 그 명령의 청산 기록 VOID, 파일·보유 10주 그대로. "
-      "재시작 뒤 YAML에서 보유를 빼고 apply해도 옛 청산 기록으로 통과하지 못함(REJECTED·보유 감시 유지)",
-      c81 == 2 and "PermissionError" in o81 and cl81 == ["VOID"] and q81 == 10 and c81b == 2 and "REJECTED" in o81b
-      and st81.config.symbol("000660").holding_active and st81.entry_blocked)
+check("8-1) [W1c-R1 재현] holding-close 파일 교체 PermissionError → 종료 코드 2, 청산 기록 없음, 파일·보유 10주 그대로. "
+      "재시작 뒤 YAML에서 보유를 빼고 apply해도 통과하지 못함(REJECTED·보유 감시 유지)",
+      c81 == 2 and "PermissionError" in o81 and cl81 == [] and q81 == 10 and same81
+      and c81b == 2 and "REJECTED" in o81b and st81.config.symbol("000660").holding_active and st81.entry_blocked)
 
-# 강제 종료처럼 정리 코드가 돌지 못해 OPEN이 남은 경우 — 다른 명령의 기록은 근거가 아님
+# 예전 버전이 남긴 OPEN 청산 기록 — 근거가 아님
 E14 = setup("w1c-kill")
 held(E14)
 with WatchStore(E14["wdb"]) as w14:
@@ -758,50 +761,54 @@ c82, o82 = cli(E14, "apply")
 with WatchStore(E14["wdb"]) as w14:
     st82 = M.load_state(w14)
     cl82 = [c["state"] for c in w14.closes()]
-check("8-2) [W1c-R1] 프로세스가 강제 종료돼 OPEN 청산 기록이 남아도, 청산 기록은 그것을 만든 명령의 적용에서만 쓰임 — 이후 apply는 "
-      "REJECTED·보유 유지, 남은 기록은 그 적용 뒤 VOID",
+check("8-2) [W1c-R1] 예전 버전·강제 종료로 남은 OPEN 청산 기록은 근거가 아님 — apply는 REJECTED·보유 유지, 남은 기록은 VOID",
       c82 == 2 and "holding-close 000660" in o82 and st82.config.symbol("000660").holding.quantity == 10
       and cl82 == ["VOID"])
 
 # 교체 뒤 적용 중 예외 → 원래 파일 복원
 E15 = setup("w1c-sync")
 b15 = held(E15)
-real_sync = W.sync_config
 
 
 def boom_sync(*a, **k):
     raise sqlite3.OperationalError("database is locked")
 
 
-W.sync_config = boom_sync
+AP.sync_config = boom_sync
 try:
     c83, o83 = cli(E15, "holding-close", "000660")
     c83b, _ = cli(E15, "add", "005930", "--interest", "--no-fetch")
 finally:
-    W.sync_config = real_sync
+    AP.sync_config = real_sync
 with WatchStore(E15["wdb"]) as w15:
-    cl83 = [c["state"] for c in w15.closes()]
+    cl83 = w15.closes()
     st83 = M.load_state(w15)
-check("8-3) [W1c-R1] 파일 교체 뒤 적용 중 예외(DB 잠김) → 원래 파일 복원·종료 코드 2·청산 기록 VOID, 사용 중 설정 그대로",
-      (c83, c83b) == (2, 2) and "원래 파일로 되돌림" in o83 and E15["cfg"].read_bytes() == b15 and cl83 == ["VOID"]
-      and st83.config.symbol("000660").holding.quantity == 10 and st83.active_version == 1)
+check("8-3) [W1c-R1] 파일 교체 뒤 적용 중 예외(DB 잠김) → 원래 파일 복원·종료 코드 2·청산 기록 없음, 사용 중 설정 그대로",
+      (c83, c83b) == (2, 2) and "원래 설정 파일로 되돌림" in o83 and E15["cfg"].read_bytes() == b15 and cl83 == []
+      and st83.config.symbol("000660").holding.quantity == 10 and st83.active_version == 1
+      and not AP.journal_path(E15["cfg"]).exists())
 
-# 복원까지 실패 → 기록하고 성공으로 반환하지 않음
-real_restore = W._restore_file
-W.sync_config = boom_sync
-W._restore_file = lambda path, old: "PermissionError: [Errno 13] Permission denied"
+# 복원까지 실패 → 기록하고 성공으로 반환하지 않음, 저널로 다음 실행이 복구
+real_restore = AP._restore
+AP.sync_config = boom_sync
+AP._restore = lambda path, old: "PermissionError: [Errno 13] Permission denied"
 try:
     c84, o84 = cli(E15, "holding-close", "000660")
 finally:
-    W.sync_config, W._restore_file = real_sync, real_restore
+    AP.sync_config, AP._restore = real_sync, real_restore
 with WatchStore(E15["wdb"]) as w15:
     st84 = M.load_state(w15)
     h84 = w15.history()[0]
-check("8-4) [W1c-R1] 원래 파일 복원까지 실패 → 종료 코드 2, REJECTED 시도로 '복원 실패'를 기록해 신규 매수 차단, 사용 중 설정·"
-      "보유 그대로(파일 확인 후 apply·restore 안내)",
+jr84 = AP.journal_path(E15["cfg"]).exists()
+c84s, o84s = cli(E15, "status")
+with WatchStore(E15["wdb"]) as w15:
+    st84b = M.load_state(w15)
+check("8-4) [W1c-R1] 원래 파일 복원까지 실패 → 종료 코드 2, REJECTED '복원 실패' 기록·신규 매수 차단, 저널 유지. 다음 실행(status)이 "
+      "저널로 원래 파일 복원(ROLLED_BACK), 사용 중 설정·보유 10주 그대로",
       c84 == 2 and "되돌리지 못함" in o84 and h84["status"] == "REJECTED" and "복원 실패" in h84["origin"]
-      and "되돌리지 못함" in h84["errors"][0]["message"] and st84.entry_blocked
-      and st84.config.symbol("000660").holding.quantity == 10)
+      and st84.entry_blocked and st84.config.symbol("000660").holding.quantity == 10 and jr84
+      and c84s == 0 and "ROLLED_BACK" in o84s and E15["cfg"].read_bytes() == b15
+      and not AP.journal_path(E15["cfg"]).exists() and st84b.config.symbol("000660").holding.quantity == 10)
 
 # 중단(Ctrl+C)도 같은 정리 뒤 다시 올림
 E16 = setup("w1c-int")
@@ -812,7 +819,7 @@ def interrupt_sync(*a, **k):
     raise KeyboardInterrupt
 
 
-W.sync_config = interrupt_sync
+AP.sync_config = interrupt_sync
 try:
     try:
         cli(E16, "holding-close", "000660")
@@ -820,17 +827,218 @@ try:
     except KeyboardInterrupt:
         raised = True
 finally:
-    W.sync_config = real_sync
+    AP.sync_config = real_sync
 with WatchStore(E16["wdb"]) as w16:
-    cl85 = [c["state"] for c in w16.closes()]
-check("8-5) [W1c-R1] 적용 중 중단(Ctrl+C) → 청산 기록 VOID·원래 파일 복원 뒤 중단을 그대로 올림",
-      raised and cl85 == ["VOID"] and E16["cfg"].read_bytes() == b16)
+    cl85 = w16.closes()
+check("8-5) [W1c-R1] 적용 중 중단(Ctrl+C) → 원래 파일 복원·청산 기록 없음 뒤 중단을 그대로 올림",
+      raised and cl85 == [] and E16["cfg"].read_bytes() == b16 and not AP.journal_path(E16["cfg"]).exists())
+
+# ── 9. GPT 검토 90c3d55 W1d-R1 — 설정 적용의 DB/파일 실패 경계 ───────────
+import os  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+
+import infra.watch.store as STM  # noqa: E402
+
+
+def consistent(env, *, holding: bool):
+    """새 연결로(재시작처럼) 확인: YAML·DB 사용 중 설정의 보유가 기대와 같고, 저널·임시 파일·OPEN 청산 기록이 없음."""
+    y = yaml.safe_load(env["cfg"].read_text(encoding="utf-8"))
+    yh = any(x.get("holding") for x in y["symbols"])
+    with WatchStore(env["wdb"]) as w:
+        st = M.load_state(w)
+        dh = st.config.symbol("000660").holding is not None
+        opened = [c for c in w.closes() if c["state"] == "OPEN"]
+        risk_ok = all(r["config_version"] == st.active_version for r in w.risk().values())
+    tmps = list(env["cfg"].parent.glob("watchlist.yaml.*.tmp"))
+    return (yh == holding and dh == holding and not opened and risk_ok and not tmps
+            and not AP.journal_path(env["cfg"]).exists())
+
+
+orig_set_risk = STM.WatchStore.set_risk
+
+
+def partial_set_risk(self, rows, **kw):
+    orig_set_risk(self, rows[:1], **kw)
+    raise sqlite3.OperationalError("disk I/O error (일부 쓰기 뒤)")
+
+
+def boom_db(*a, **k):
+    raise sqlite3.OperationalError("database is locked")
+
+
+results91 = {}
+for label, tgt, name, fn in (("청산 기록(시도 기록 직후)", STM.WatchStore, "record_close", boom_db),
+                             ("남은 OPEN 정리", STM.WatchStore, "void_open_closes", boom_db),
+                             ("위험 자격 시작", M, "refresh_risk", boom_db),
+                             ("위험 자격 일부 쓰기 뒤", STM.WatchStore, "set_risk", partial_set_risk)):
+    E = setup(f"w1d-{name}")
+    b0 = held(E)
+    orig = getattr(tgt, name)
+    setattr(tgt, name, fn)
+    try:
+        c, o = cli(E, "holding-close", "000660")
+    finally:
+        setattr(tgt, name, orig)
+    with WatchStore(E["wdb"]) as w:
+        st = M.load_state(w)
+        results91[label] = (c, st.active_version, st.entry_blocked, w.closes(), E["cfg"].read_bytes() == b0,
+                            consistent(E, holding=True), "원래 설정 파일로 되돌림" in o)
+check("9-1) [W1d-R1 재현] APPLIED 시도 기록 뒤 청산 기록·OPEN 정리·위험 자격(시작·일부 쓰기 뒤) 실패 → 한 트랜잭션이라 전부 "
+      "되돌아감: 종료 코드 2, 새 연결로 봐도 사용 중 v1·보유 10주·청산 기록 없음·위험 자격도 v1, YAML 원래대로(파일·DB 일치), "
+      "저널·임시 파일 없음",
+      all(r[0] == 2 and r[1] == 1 and not r[2] and r[3] == [] and r[4] and r[5] and r[6] for r in results91.values())
+      and len(results91) == 4)
+
+# 같은 실패가 일반 apply(파일을 직접 고친 뒤)에서 나도 — DB는 이전 그대로, 종료 코드 2
+E17 = setup("w1d-apply")
+held(E17)
+E17["cfg"].write_text(dump_document(doc({**HOLD10, "holding": {**HOLD10["holding"], "quantity": 7}})), encoding="utf-8")
+M.refresh_risk, orig_rr = boom_db, M.refresh_risk
+try:
+    c92, o92 = cli(E17, "apply")
+finally:
+    M.refresh_risk = orig_rr
+with WatchStore(E17["wdb"]) as w17:
+    st92 = M.load_state(w17)
+    n92 = len(w17.history())
+check("9-2) [W1d-R1] 일반 apply 중 위험 자격 갱신 실패 → 종료 코드 2(예외로 죽지 않음), 시도 기록도 없이 사용 중 v1(10주) 그대로",
+      c92 == 2 and "확정 전이라 이전" in o92 and st92.active_version == 1 and n92 == 1
+      and st92.config.symbol("000660").holding.quantity == 10)
+
+# 프로세스 강제 종료(실제 별도 프로세스) → 재시작 복구
+SUBENV = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+
+def proc(env, *args, extra=None, wait=True):
+    cmd = [sys.executable, str(ROOT / "tools" / "watchlist.py"), "--config", str(env["cfg"]), "--watch-db",
+           str(env["wdb"]), "--db", str(env["db"]), *args]
+    e = {**SUBENV, **(extra or {})}
+    if not wait:
+        return subprocess.Popen(cmd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                encoding="utf-8")
+    r = subprocess.run(cmd, env=e, capture_output=True, text=True, encoding="utf-8", timeout=120)
+    return r.returncode, r.stdout + r.stderr
+
+
+crash = {}
+for point, expect_action, closed in (("after_journal", "NOT_REPLACED", False), ("after_replace", "ROLLED_BACK", False),
+                                     ("after_attempt", "ROLLED_BACK", False), ("after_close", "ROLLED_BACK", False),
+                                     ("after_void", "ROLLED_BACK", False), ("after_risk", "ROLLED_BACK", False),
+                                     ("after_commit", "COMMITTED", True)):
+    E = setup(f"crash-{point}")
+    b0 = held(E)
+    rc, out = proc(E, "holding-close", "000660", extra={"WATCH_TEST_CRASH_AT": point})
+    journal_left = AP.journal_path(E["cfg"]).exists()
+    rc2, out2 = proc(E, "status")                        # 재시작(새 프로세스)
+    with WatchStore(E["wdb"]) as w:
+        st = M.load_state(w)
+        cls = [c["state"] for c in w.closes()]
+    crash[point] = (rc == 97, journal_left, expect_action in out2, rc2 == 0, consistent(E, holding=not closed),
+                    (E["cfg"].read_bytes() == b0) != closed, cls == (["USED"] if closed else []),
+                    st.active_version == (2 if closed else 1), not st.entry_blocked)
+check("9-3) [W1d-R1] 실제 별도 프로세스를 7개 지점(저널 뒤·파일 교체 뒤·트랜잭션 안 시도 기록/청산/정리/위험 뒤·확정 뒤)에서 "
+      "강제 종료 → 저널이 남고, 재시작한 status가 확정 전이면 원래 파일 복원(ROLLED_BACK/NOT_REPLACED), 확정 뒤면 확인만"
+      "(COMMITTED). 어느 경우든 YAML·DB 일치, 보유 감시가 조용히 사라지지 않음, 신규 진입 차단 없음",
+      all(all(v) for v in crash.values()) and len(crash) == 7)
+
+# 파일 복원 실패 + DB 실패 기록도 실패 → 결과 불확정(성공 아님), 저널로 다음 실행이 복구
+E18 = setup("w1d-uncertain")
+b18 = held(E18)
+AP.sync_config, AP._restore = boom_sync, (lambda path, old: "PermissionError: denied")
+real_rf = AP._record_failure
+AP._record_failure = lambda *a, **k: "OperationalError: database is locked"
+try:
+    c94, o94 = cli(E18, "holding-close", "000660")
+finally:
+    AP.sync_config, AP._restore, AP._record_failure = real_sync, real_restore, real_rf
+with WatchStore(E18["wdb"]) as w18:
+    st94 = M.load_state(w18)
+    n94 = len(w18.history())
+y94 = yaml.safe_load(E18["cfg"].read_text(encoding="utf-8"))
+mismatch94 = not any(x.get("holding") for x in y94["symbols"]) and st94.config.symbol("000660").holding is not None
+journal94 = AP.journal_path(E18["cfg"]).exists()
+c94s, o94s = cli(E18, "status")
+check("9-4) [W1d-R1·C3] 파일 복원 실패와 DB 기록 실패가 겹침 → 종료 코드 2·'결과 불확정' 보고(정리 성공으로 쓰지 않음), DB는 "
+      "이전 v1(10주), 파일만 다른 상태로 저널 유지. 다음 실행이 저널로 원래 파일 복원 → 일치",
+      c94 == 2 and "결과 불확정" in o94 and "[불확정]" in o94 and n94 == 1 and mismatch94
+      and journal94 and c94s == 0 and "ROLLED_BACK" in o94s
+      and E18["cfg"].read_bytes() == b18 and consistent(E18, holding=True))
+
+# 성공 경로: 청산·새 설정·위험 자격이 같은 버전으로 함께 확정
+E19 = setup("w1d-ok")
+held(E19)
+c95, o95 = cli(E19, "holding-close", "000660")
+with WatchStore(E19["wdb"]) as w19:
+    st95 = M.load_state(w19)
+    cl95 = w19.closes()
+check("9-5) [W1d-R1] 정상 holding-close: 종료 코드 0, 새 설정 v2 사용 중·청산 기록 USED(used_version=v2, from_version=v1)·"
+      "위험 자격 v2, 저널·임시 파일 없음",
+      c95 == 0 and st95.active_version == 2 and [(c["state"], c["used_version"], c["from_version"]) for c in cl95]
+      == [("USED", 2, 1)] and consistent(E19, holding=False))
+
+# C2: 청산 근거의 종목·값·기준 버전
+with WatchStore(E19["wdb"]) as w19:
+    st_c2 = M.load_state(w19)
+cfg_h = validate(doc(HOLD10), LIST).config
+cfg_n = validate(doc({"code": "000660", "interest": {"enabled": False}}), LIST).config
+h10 = {"quantity": 10, "avg_price": 180000, "stop_price": 165000, "target_price": None, "source": "MANUAL"}
+g_wrong_code = M.holding_guard(cfg_h, 1, cfg_n, close_holdings={"005930": h10})
+g_wrong_val = M.holding_guard(cfg_h, 1, cfg_n, close_holdings={"000660": {**h10, "quantity": 9}})
+g_ok = M.holding_guard(cfg_h, 1, cfg_n, close_holdings={"000660": h10})
+E20 = setup("w1d-c2")
+held(E20)
+drop_holding(E20)
+with WatchStore(E20["wdb"]) as w20:
+    try:
+        M.sync_config(w20, E20["cfg"], LIST, None, now=NOW, close_holdings={"000660": h10})
+        no_ver = False
+    except ValueError:
+        no_ver = True
+    try:
+        M.sync_config(w20, E20["cfg"], LIST, None, now=NOW, close_holdings={"000660": h10}, expect_version=7)
+        conflict = False
+    except M.ConfigConflict:
+        conflict = True
+    n96 = len(w20.history())
+    st96 = M.load_state(w20)
+check("9-6) [C2] 청산 근거는 종목(사용 중 보유 종목)·값(지금 보유와 같음)·기준 버전(트랜잭션 안 재확인)이 모두 맞아야 함 — "
+      "다른 종목·다른 값은 오류, 기준 버전 없이 부르면 거부, 기준 버전이 다르면 ConfigConflict(아무것도 기록 안 함)",
+      g_wrong_code[0] and g_wrong_code[0][0].code == "005930" and g_wrong_val[0] and g_ok == ([], ["000660"])
+      and no_ver and conflict and n96 == 1 and st96.config.symbol("000660").holding.quantity == 10)
+
+# C1: 실제 두 프로세스 경쟁 — holding-close가 적용 도중(잠금 보유) 멈춘 사이 status·apply·짧은 대기 status
+E21 = setup("w1d-race")
+held(E21)
+pa = proc(E21, "holding-close", "000660", extra={"WATCH_TEST_SLEEP_AT": "after_replace:3"}, wait=False)
+time.sleep(1.0)
+t0 = time.monotonic()
+rc_b, out_b = proc(E21, "status")                       # 기다렸다가 확정된 상태를 봄
+waited = time.monotonic() - t0
+rc_c, out_c = proc(E21, "--lock-timeout", "0.3", "apply", extra={"WATCH_TEST_SLEEP_AT": ""})
+pa_out, _ = pa.communicate(timeout=60)
+with WatchStore(E21["wdb"]) as w21:
+    st97 = M.load_state(w21)
+    cl97 = [c["state"] for c in w21.closes()]
+    hist97 = [(h["version"], h["status"], h["origin"]) for h in w21.history()]
+check("9-7) [C1] 별도 프로세스 경쟁: holding-close가 파일 교체 뒤 3초 멈춘 동안 다른 프로세스 status는 잠금을 기다렸다가 확정 결과"
+      "(v2·보유 없음)를 봄 — 중간 상태(교체된 파일·미확정 DB)를 읽거나 진행 중 청산을 무효화하지 않음. apply는 잠금 대기 상한 뒤에도 "
+      "끝나 있으면 정상, 결과는 한 번의 청산 USED·저널 없음",
+      pa.returncode == 0 and rc_b == 0 and waited >= 1.0 and "v2 사용 중" in out_b and cl97 == ["USED"]
+      and st97.config.symbol("000660").holding is None and hist97[0][1] == "APPLIED" and consistent(E21, holding=False))
+pb = proc(E21, "set", "000660", "--memo", "x", extra={"WATCH_TEST_SLEEP_AT": "after_replace:3"}, wait=False)
+time.sleep(1.0)
+rc_d, out_d = proc(E21, "--lock-timeout", "0.3", "status")
+pb.communicate(timeout=60)
+check("9-8) [C1] 잠금 대기 상한(0.3초)을 넘기면 아무것도 바꾸지 않고 종료 코드 2·[잠금] 안내",
+      rc_d == 2 and "[잠금]" in out_d and pb.returncode == 0)
 
 # ── 5. 경계 ────────────────────────────────────────────────
 FORBIDDEN = ("infra.broker", "infra.storage", "infra.notify", "domain.strategy", "domain.service", "commands",
              "domain.position", "infra.market_data")
 bad_imports = []
 for f in [ROOT / "domain/watchlist/config.py", ROOT / "infra/watch/store.py", ROOT / "infra/watch/manager.py",
+          ROOT / "infra/watch/apply.py",
           ROOT / "tools/watchlist.py"]:
     for node in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
         mods = [node.module] if isinstance(node, ast.ImportFrom) and node.module else \

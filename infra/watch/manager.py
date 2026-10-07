@@ -149,37 +149,39 @@ def check_text(raw_text: str | None, listing: dict[str, Listing] | None, *, chec
     return validate(raw, listing, check_list=check_list)
 
 
-def holding_guard(wstore: WatchStore, active: WatchConfig | None, active_version: int | None,
-                  new: WatchConfig, *, pending: dict[str, dict] | None = None,
-                  closes: dict[str, int] | None = None) -> tuple[list[Issue], dict[str, int], list[str]]:
+class ConfigConflict(RuntimeError):
+    """적용하려던 기준 버전과 지금 사용 중 버전이 다름 — 다른 명령·프로세스가 먼저 적용함 (C1)."""
+
+
+def holding_guard(active: WatchConfig | None, active_version: int | None, new: WatchConfig, *,
+                  close_holdings: dict[str, dict] | None = None) -> tuple[list[Issue], list[str]]:
     """마지막 정상 설정의 수동 보유가 새 설정에서 사라졌는지 (W1-R1).
-    pending = 이번 명령이 남길 청산 기록 {코드: 보유 값} (CLI가 파일을 바꾸기 전에 검사할 때 — W1b-R2).
-    반환 (오류, 쓸 청산 기록 {코드: close_id}, 무효로 할 청산 기록 코드 — 보유가 그대로 남은 종목)."""
-    pending, closes = pending or {}, closes or {}
-    errors, used, void = [], {}, []
-    if active is None:
-        return errors, used, void
-    for old in active.symbols:
-        if old.holding is None:
-            continue
-        cur = new.symbol(old.code)
+    close_holdings = 이번 적용이 함께 기록할 청산 {코드: 보유 값}. 그 코드가 **사용 중 설정의 보유 종목이고 값이 지금
+    보유와 같을 때만** 근거가 됨(C2 — 종목·값 일치. 기준 버전 일치는 호출하는 쪽이 expect_version으로 같은 트랜잭션에서 확인).
+    저장소에 남은 OPEN 청산 기록은 근거가 아님(W1c-R1/W1d-R1).
+    반환 (오류, 이번에 청산으로 쓴 코드)."""
+    close_holdings = close_holdings or {}
+    errors, used = [], []
+    held = {} if active is None else {s.code: s for s in active.symbols if s.holding is not None}
+    for code in close_holdings:
+        if code not in held:
+            errors.append(Issue(code, "holding", f"청산 근거 불일치 — 사용 중 v{active_version}에 이 종목의 수동 보유가 없음"))
+    for code, old in held.items():
+        cur = new.symbol(code)
         if cur is not None and cur.holding is not None:
-            if wstore.open_close(old.code) is not None:
-                void.append(old.code)
             continue
-        if pending.get(old.code) == asdict(old.holding):
-            continue
-        # 이번 명령이 넘긴 청산 기록만 — 저장소에 남아 있는 다른 OPEN 기록은 근거가 아님 (W1c-R1)
-        close = wstore.get_close(closes[old.code]) if old.code in closes else None
-        if close is not None and close["state"] == "OPEN" and close["holding"] == asdict(old.holding):
-            used[old.code] = close["close_id"]
+        if code in close_holdings:
+            if close_holdings[code] == asdict(old.holding):
+                used.append(code)
+                continue
+            errors.append(Issue(code, "holding", f"청산 근거 불일치 — 청산하려는 보유 값이 사용 중 v{active_version}의 보유와 다름"))
             continue
         h = old.holding
-        errors.append(Issue(old.code, "holding",
+        errors.append(Issue(code, "holding",
                             f"마지막 정상 v{active_version}의 수동 보유({h.quantity:,}주 @ {h.avg_price:,})가 새 설정에 없음 — "
-                            f"청산이면 `python tools/watchlist.py holding-close {old.code}`(YAML에서 이미 지웠어도 됨), "
+                            f"청산이면 `python tools/watchlist.py holding-close {code}`(YAML에서 이미 지웠어도 됨), "
                             "실수면 `python tools/watchlist.py restore`로 마지막 정상 설정 복원 — 그 전까지 보유 감시 유지"))
-    return errors, used, void
+    return errors, used
 
 
 def refresh_risk(wstore: WatchStore, state: WatchState, listing: dict[str, Listing] | None, snapshot_id: int | None,
@@ -200,40 +202,61 @@ def refresh_risk(wstore: WatchStore, state: WatchState, listing: dict[str, Listi
     return wstore.set_risk(rows, snapshot_id=snapshot_id, version=state.active_version, at=now)
 
 
-def sync_config(wstore: WatchStore, path: str | Path, listing: dict[str, Listing] | None,
-                snapshot_id: int | None, *, now: datetime, origin: str = "FILE",
-                closes: dict[str, int] | None = None) -> tuple[WatchState, dict]:
-    """설정 파일을 읽어 검증·기록하고 위험 자격을 갱신. closes = 이 적용에서 쓸 청산 기록 {코드: close_id}(holding-close만). 반환 (상태, 이번 시도 {version, status, new, errors, warnings})."""
-    from domain.watchlist.config import ValidationResult
-    p = Path(path)
-    raw_text, read_error = read_config_text(p)
+def file_sha(raw_text: str | None, read_error: str | None, path: Path) -> str:
     if read_error:
         try:
-            raw_sha = "UNREADABLE:" + hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+            return "UNREADABLE:" + hashlib.sha256(path.read_bytes()).hexdigest()[:16]
         except OSError:
-            raw_sha = "UNREADABLE"
-    else:
-        raw_sha = "MISSING" if raw_text is None else hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16]
-    res = check_text(raw_text, listing, read_error=read_error)
-    before = load_state(wstore)
-    used, void = {}, []
-    if res.ok:
-        guard, used, void = holding_guard(wstore, before.config, before.active_version, res.config, closes=closes)
-        if guard:
-            res = ValidationResult(None, guard, res.warnings)
-    status = APPLIED if res.ok else REJECTED
-    version, new = wstore.record_attempt(
-        at=now, origin=origin, source_path=str(p), raw_sha=raw_sha, status=status,
-        config_hash=res.config.norm_hash() if res.ok else None, errors=_issues(res.errors),
-        warnings=_issues(res.warnings), raw_text=raw_text, config=res.config.to_dict() if res.ok else None,
-        list_snapshot_id=snapshot_id)
-    if res.ok and (used or void):
-        wstore.settle_closes(used, void, version)
-    wstore.void_open_closes(keep=set())          # 이번에 쓰지 않은 OPEN 청산 기록은 남기지 않음 (W1c-R1)
-    state = load_state(wstore)
-    refresh_risk(wstore, state, listing, snapshot_id, now=now)
+            return "UNREADABLE"
+    return "MISSING" if raw_text is None else hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16]
+
+
+def sync_config(wstore: WatchStore, path: str | Path, listing: dict[str, Listing] | None,
+                snapshot_id: int | None, *, now: datetime, origin: str = "FILE",
+                close_holdings: dict[str, dict] | None = None, expect_version: int | None = None,
+                hook: Callable[[str], None] | None = None) -> tuple[WatchState, dict]:
+    """설정 파일을 읽어 검증·기록하고 위험 자격을 갱신. 반환 (상태, 이번 시도 {version, status, new, errors, warnings}).
+
+    **확정 지점 = 아래 트랜잭션의 COMMIT 한 번** (W1d-R1). 시도 기록(APPLIED/REJECTED)·청산 기록(USED)·남은 OPEN 정리·
+    위험 자격 갱신이 모두 같은 트랜잭션 — 중간 어디서 실패·중단돼도 전부 되돌아가고 이전 사용 중 설정·보유 감시가 그대로.
+    COMMIT 뒤의 출력·보고 실패는 적용 취소가 아님.
+    close_holdings = 이번 적용이 함께 기록할 청산 {코드: 보유 값}(holding-close). 이때 expect_version 필수 —
+    트랜잭션 안에서 사용 중 버전이 그대로인지 다시 확인(아니면 ConfigConflict, 아무것도 기록 안 함)."""
+    from domain.watchlist.config import ValidationResult
+    if close_holdings and expect_version is None:
+        raise ValueError("close_holdings에는 expect_version이 필요")
+    hook = hook or (lambda point: None)
+    p = Path(path)
+    raw_text, read_error = read_config_text(p)
+    raw_sha = file_sha(raw_text, read_error, p)
+    res0 = check_text(raw_text, listing, read_error=read_error)
+    with wstore.tx():
+        before = load_state(wstore)
+        if expect_version is not None and before.active_version != expect_version:
+            raise ConfigConflict(f"사용 중 설정이 v{expect_version}에서 v{before.active_version}로 바뀜 — 다시 실행하세요")
+        res, used = res0, []
+        if res.ok:
+            guard, used = holding_guard(before.config, before.active_version, res.config, close_holdings=close_holdings)
+            if guard:
+                res, used = ValidationResult(None, guard, res.warnings), []
+        status = APPLIED if res.ok else REJECTED
+        version, new = wstore.record_attempt(
+            at=now, origin=origin, source_path=str(p), raw_sha=raw_sha, status=status,
+            config_hash=res.config.norm_hash() if res.ok else None, errors=_issues(res.errors),
+            warnings=_issues(res.warnings), raw_text=raw_text, config=res.config.to_dict() if res.ok else None,
+            list_snapshot_id=snapshot_id)
+        hook("after_attempt")
+        for code in used:
+            wstore.record_close(code, close_holdings[code], at=now, from_version=before.active_version, origin=origin,
+                                state="USED", used_version=version)
+        hook("after_close")
+        wstore.void_open_closes(keep=set())          # 예전 버전이 남긴 OPEN 청산 기록 정리
+        hook("after_void")
+        state = load_state(wstore)
+        refresh_risk(wstore, state, listing, snapshot_id, now=now)
+        hook("after_risk")
     return state, {"version": version, "status": status, "new": new, "errors": _issues(res.errors),
-                   "warnings": _issues(res.warnings)}
+                   "warnings": _issues(res.warnings), "raw_sha": raw_sha}
 
 
 # ── 데이터 준비 상태 ─────────────────────────────────────────
