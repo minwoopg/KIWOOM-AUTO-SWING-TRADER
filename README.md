@@ -250,6 +250,18 @@ python tools/probe_market_data.py --env-file ..\KIWOOM-AUTO-TRADER\.env --skip-d
   기록(`data/research/a5_checks.sqlite3`, 보고서 `reports/research/a5/`). 관찰 가격이며 체결이 아닙니다.
 - 다음 단계: 조회 전용 상시 실행 관리자(A24-A), 이후 움직임 평가(A5-2), 과거 일괄 스캔(A4-B).
 
+## 사용자 지정 종목 (주문 없음) — 방향 전환 2단계
+
+최종 목표는 사용자가 지정한 국내 종목의 24시간 운영·자동매매. 지금은 대상 선택(수동)·검증·데이터 준비까지. 명세: `docs/watchlist.md`.
+
+- 설정 `config/watchlist.yaml`(git 제외, 예시 `config/watchlist.example.yaml`): 종목마다 관심(켜기·S1 분석·가격대)과
+  수동 보유 정보(증권사 잔고 아님). `python tools/watchlist.py init | add | set | enable | disable | holding-close | remove`
+  — 바꾼 결과를 검증한 뒤에만 파일을 씁니다.
+- 잘못된 설정: 처음이면 감시를 시작하지 않고, 운영 중이면 마지막 정상 버전으로 계속(오류·버전 표시, 신규 매수 차단).
+  `apply`·`status`·`history`로 적용 이력 확인(`data/watch/watch.sqlite3`).
+- `prepare`: 등록 종목 + KOSPI·KOSDAQ만 일봉 갱신(새 종목은 전체 이력 즉시 수집), 준비 상태 READY/UNKNOWN 판정.
+  전체 시장 수집·S1 스캔은 그대로 `tools/research_collect.py`.
+
 ## 원본과의 관계 (`provenance.json`)
 
 | status | 의미 |
