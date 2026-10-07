@@ -116,14 +116,14 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def make_client(args):
+def make_client(args, **kw):
     import requests
     env = load_env(Path(args.env_file))
     key, secret = env.get("KIWOOM_APP_KEY", ""), env.get("KIWOOM_SECRET_KEY", "")
     if not key or not secret:
         raise ResearchConfigError("KIWOOM_APP_KEY / KIWOOM_SECRET_KEY가 .env에 없음")
     return ReadOnlyResearchClient(requests.Session(), args.base_url, key, secret, min_interval_sec=args.sleep,
-                                  log=print)
+                                  log=print, **kw)
 
 
 class _LazyClient:

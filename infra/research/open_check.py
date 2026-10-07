@@ -476,8 +476,12 @@ def commit_bound(run: dict) -> tuple[str | None, str]:
 class OpenChecker:
     def __init__(self, ostore: OpenCheckStore, sstore: ScanStore, rstore: ResearchStore, cal: TradingCalendar, *,
                  contract_hash: str, offset_min: int = 5, on_time_tolerance_sec: int = 120,
-                 log: Callable[[str], None] | None = None) -> None:
+                 log: Callable[[str], None] | None = None,
+                 gate: Callable[[dict, list[dict]], tuple[list[dict], dict]] | None = None) -> None:
+        """gate(선택): 후보 확정 직전 (초안, 계산 PASS 후보) → (남길 후보, 근거). 근거는 source.gate에 저장.
+        상시 실행 관리자의 운영 진입 게이트(W2 검토 R1) — 연구 CLI는 없음(이전과 같은 후보)."""
         self.ostore, self.sstore, self.rstore, self.cal = ostore, sstore, rstore, cal
+        self.gate = gate
         self.contract_hash = contract_hash
         self.offset = timedelta(minutes=offset_min)
         self.tolerance = timedelta(seconds=on_time_tolerance_sec)
@@ -507,6 +511,16 @@ class OpenChecker:
             cset = self.ostore.get_set(day)
             if cset is None:
                 draft, cands = select_candidates(self.sstore, self.rstore, self.cal, day, self.contract_hash)
+                if self.gate is not None:
+                    n0 = len(cands)
+                    cands, info = self.gate(draft, cands)
+                    draft = {**draft, "source": {**draft["source"], "gate": info}}
+                    if draft["status"] == "OK":
+                        if not cands:
+                            draft["status"] = "NO_CANDIDATES"
+                        if len(cands) != n0:
+                            draft["reason"] = (f"운영 후보 {len(cands)}건 (계산 PASS {n0}건 중 진입 게이트 제외 "
+                                               f"{n0 - len(cands)}건) — {draft['reason']}")
                 cset = self.ostore.freeze_set({**draft, "selected_at": _ts(started)}, cands)
                 self.log(f"[A5] {day} 후보 확정: {cset['status']} {cset['count']}건 (계약 {cset['contract_hash']})")
             note = ""

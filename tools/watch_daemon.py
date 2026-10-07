@@ -2,7 +2,7 @@
 
 사용법 (스윙 레포 루트, PowerShell)
     python tools/watch_daemon.py run                 # 시작(창에서 실행 — Ctrl+C로 종료). 이미 실행 중이면 종료 코드 2
-    python tools/watch_daemon.py run --until-idle    # 지금 할 일만 하고 끝냄(작업 스케줄러로 돌릴 때)
+    python tools/watch_daemon.py run --until-idle    # 지금 실행할 작업만 하고 끝냄(미래 시각의 다시 시도·예산 회복은 기다리지 않음)
     python tools/watch_daemon.py status              # 실행 여부·heartbeat·설정 버전·작업 결과·다음 예정·오늘 호출 수
     python tools/watch_daemon.py stop                # 실행 중인 관리자에 중지 요청(다음 순회·대상 사이에서 멈춤)
     python tools/watch_daemon.py report --day 2026-10-08   # 그날 일일 보고서 다시 만들기(재실행 없음)
@@ -63,7 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--poll-sec", type=float, default=60.0)
-    r.add_argument("--daily-call-cap", type=int, default=3000, help="하루 조회 호출 상한(모든 작업 합계)")
+    r.add_argument("--daily-call-cap", type=int, default=3000,
+                   help="하루(요청일) 실제 요청 상한 — 이 관리자 프로세스의 모든 작업·토큰·연속조회·재시도 합계")
+    r.add_argument("--open-check-reserve", type=int, default=100,
+                   help="마감 준비가 남겨 두는 개장 확인 몫(마감 준비는 cap−reserve에서 멈춤)")
     r.add_argument("--max-task-sec", type=float, default=1800.0, help="작업 하나의 시간 상한 — 넘으면 양보")
     r.add_argument("--max-ticks", type=int, help="시험용: 순회 횟수 상한")
     r.add_argument("--until-idle", action="store_true", help="지금 실행할 작업이 없어질 때까지만")
@@ -86,6 +89,7 @@ def paths_of(args) -> DaemonPaths:
 def _settings(args) -> DaemonSettings:
     rs = load_research_settings(args.research_config)
     return DaemonSettings(poll_sec=getattr(args, "poll_sec", 60.0), daily_call_cap=getattr(args, "daily_call_cap", 3000),
+                          open_check_reserve=getattr(args, "open_check_reserve", 100),
                           max_task_sec=getattr(args, "max_task_sec", 1800.0),
                           open_offset_min=rs.open_check.offset_min,
                           on_time_tolerance_sec=rs.open_check.on_time_tolerance_sec,
@@ -125,14 +129,20 @@ def cmd_status(args, *, now, calendar) -> int:
         since = ds.meta("since")
     with WatchStore(p.watch_db) as ws:
         st = load_state(ws)
-    nxt = None
+    nxt, cal = None, {"status": "UNKNOWN", "message": ""}
     try:
         d = WatchDaemon(p, calendar, None, settings=_settings(args), now=now, log=lambda m: None, hook=lambda x: None)
         nxt = d.next_due(t_now)
+        cal = d.calendar_status()
         d.dstore.close()
     except ResearchSettingsError:
         pass
+    stop_resp = None
+    if last and last.get("stop_requested_at") and last.get("stopped_at"):
+        stop_resp = (datetime.fromisoformat(last["stopped_at"])
+                     - datetime.fromisoformat(last["stop_requested_at"])).total_seconds()
     out = {"daemon": state, "run": last, "since": since, "config": st.summary(), "calls_today": usage,
+           "calendar": cal, "stop_response_sec": stop_resp,
            "next_due": nxt.isoformat() if nxt else None,
            "tasks": [{k: t[k] for k in ("kind", "trading_day", "status", "attempts", "failures", "finished_at",
                                         "next_retry_at", "config_version", "contract_hash", "error", "report_path",
@@ -143,7 +153,13 @@ def cmd_status(args, *, now, calendar) -> int:
     print(f"관리자: {state}")
     if last:
         print(f"  run_id {last['run_id']} pid {last['pid']} 시작 {last['started_at']} 현재 작업 {last['current_task'] or '-'}"
+              + (f" · 진척 {last['progress']}" if last.get("progress") else "")
               + (f" · 마지막 오류 {last['last_error']}" if last["last_error"] else ""))
+        if stop_resp is not None:
+            print(f"  중지 요청 {last['stop_requested_at']} → 종료 {last['stopped_at']} ({stop_resp:.0f}초)")
+    if cal["status"] != "OK":
+        print(f"거래일 달력: {cal['status']} {cal['message']}"
+              + (" — config/trading_calendar를 갱신한 뒤 관리자를 다시 시작" if cal["status"] == "CALENDAR_UNAVAILABLE" else ""))
     s = st.summary()
     print("설정: " + (f"v{s['active_version']} 사용 중" if st.can_monitor else "정상 설정 없음")
           + (f" · 신규 진입 차단 — {st.block_reason}" if st.entry_blocked else "")
@@ -213,7 +229,7 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
             print("실행 중인 관리자가 없음")
             return 0
         with DaemonStore(p.daemon_db) as ds:
-            ok = ds.request_stop()
+            ok = ds.request_stop(now())
         print("중지 요청을 남김 — 다음 순회(작업 중이면 대상 사이)에서 멈춥니다" if ok else "실행 기록을 찾지 못함")
         return 0 if ok else 2
     if args.cmd == "report":
@@ -236,19 +252,16 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
         return 2
     try:
         with daemon_lock(p.daemon_db):
-            if client is None:
-                client = _LazyClient(lambda: make_client(args))
+            holder: dict = {}
+            if client is None:                              # 모든 실제 요청 직전에 관리자의 예산·중지·우선 작업 검사(R3)
+                client = _LazyClient(lambda: make_client(args, guard=lambda api: holder["d"].request_guard(api)))
             d = WatchDaemon(p, calendar, client, settings=settings, now=now, sleep=sleep, log=log)
+            holder["d"] = d
             d.start()
             state, err = "STOPPED", ""
             try:
                 if args.until_idle:
-                    state = "IDLE"
-                    while True:
-                        r = d.tick()
-                        if not r.get("ran") or r.get("stop"):
-                            break
-                    d.retry_reports()
+                    state = d.run_until_idle()
                 else:
                     state = d.run_forever(max_ticks=args.max_ticks)
             except ResearchConfigError as exc:
@@ -263,7 +276,7 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                 except Exception as exc:                     # noqa: BLE001 — 상태 저장 실패를 정상으로 보이지 않게
                     print(f"[경고] 관리자 종료 상태 저장 실패 {type(exc).__name__}: {exc}")
                     return 1
-            return 0 if state in ("STOPPED", "IDLE", "MAX_TICKS", "INTERRUPTED") else 1
+            return 0 if state in ("STOPPED", "IDLE", "IDLE_CAP", "MAX_TICKS", "INTERRUPTED") else 1
     except ConfigLockTimeout:
         print("[중단] 이미 실행 중인 관리자가 있음 — `status`로 확인, 끝내려면 `stop`")
         return 2

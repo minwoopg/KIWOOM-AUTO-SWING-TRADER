@@ -41,7 +41,7 @@ from domain.watchlist.config import (
 from domain.research.s1 import STRATEGY_ID, STRATEGY_VERSION, S1Config
 from domain.research.series import SeriesView
 from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE, INDEX_TARGETS, CollectError, stock_series_id
-from infra.research.kiwoom_readonly import ResearchApiError, ResearchConfigError
+from infra.research.kiwoom_readonly import RequestStopped, ResearchApiError, ResearchConfigError
 from infra.research.kiwoom_rows import RowError
 from infra.research.s1_scanner import OK, ScanError, data_status, expected_session
 from infra.research.store import PENDING, ERROR, IntegrityError, ResearchStore
@@ -398,6 +398,11 @@ def prepare_data(wstore: WatchStore, rstore: ResearchStore, collector, calendar:
                 reg = date.fromisoformat(lrow.reg_day) if lrow is not None and lrow.reg_day else None
                 try:
                     res = collector.update_series(sid, kind, code, now=now, reg_day=reg)
+                except RequestStopped as exc:
+                    # 요청 경계에서 막힘(예산·중지·우선 작업) — 그 종목은 저장 안 됨(종목 단위 트랜잭션), 오류로 세지 않고 양보
+                    yielded = exc.reason
+                    log(f"[준비] {sid} 요청 전에 멈춤 — {exc.reason}")
+                    break
                 except ResearchConfigError:
                     raise
                 except (ResearchApiError, RowError, CollectError, ValueError, IntegrityError) as exc:

@@ -17,6 +17,9 @@ from __future__ import annotations
 만료 `token_refresh_margin_sec` 전부터 요청 전에 새로 발급. 읽을 수 없으면 HTTP 401 재인증에만 의존.
 재인증(401·만료 갱신)은 `reauth_window_sec` 안에 `max_reauth`번까지 — 넘으면 ResearchApiError(무한 재발급 방지).
 401 말고 다른 오류(return_code≠0 등)는 인증 오류로 보지 않음.
+요청 경계 검사(W2 검토 R3): `guard`(선택)가 있으면 토큰 발급을 포함한 **모든 실제 요청 직전**(호출 간격 대기·마감 검사 뒤,
+429·401 재시도·연속조회 페이지마다)에 부름 — 호출 예산·중지·우선 작업 때문에 보내면 안 되면 RequestStopped를 올림(그 요청은
+보내지 않음). 상시 실행 관리자가 쓰며, 연구 CLI는 guard 없이 이전과 같음.
 그 밖의 HTTP 오류·return_code≠0·목록 없음은 재시도하지 않고 `ResearchApiError`.
 
 응답 계약 (A2-R3): return_code가 **있고 0**이어야 성공. cont-yn 헤더는 Y 또는 N이어야 하고,
@@ -55,6 +58,14 @@ class ResearchApiError(RuntimeError):
 
 class _Retryable(RuntimeError):
     pass
+
+
+class RequestStopped(RuntimeError):
+    """요청 경계 검사(guard)가 요청을 막음 — 조회 실패가 아니라 '보내지 않음'(예산·중지·우선 작업). reason = 사유."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 class DeadlinePassed(RuntimeError):
@@ -115,7 +126,7 @@ class ReadOnlyResearchClient:
                  sleep: Callable[[float], None] = time.sleep,
                  log: Callable[[str], None] | None = None,
                  token_refresh_margin_sec: float = 600.0, max_reauth: int = 3,
-                 reauth_window_sec: float = 600.0) -> None:
+                 reauth_window_sec: float = 600.0, guard: Callable[[str], None] | None = None) -> None:
         assert_mock_domain(base_url)
         if min_interval_sec < 0.5:
             raise ResearchConfigError("min_interval_sec는 0.5 이상 (실측상 0.5초 간격에서도 429)")
@@ -139,11 +150,14 @@ class ReadOnlyResearchClient:
         self.calls = 0
         self.retries = 0
         self.token_issues = 0
+        self.guard = guard
 
     # ── 인증 ──
     def authenticate(self) -> None:
         assert_mock_domain(self.base_url)
         self._pace()
+        if self.guard is not None:
+            self.guard("token")
         r = self.session.post(f"{self.base_url}/oauth2/token", json={
             "grant_type": "client_credentials", "appkey": self._app_key, "secretkey": self._secret_key,
         }, timeout=10)
@@ -158,6 +172,9 @@ class ReadOnlyResearchClient:
         self._token = str(token)
         self.token_issues += 1
         self._token_expires_at = _parse_expires(body.get("expires_dt"))
+        raw = body.get("expires_dt")                       # 실측 확인용: 필드 존재·형식만(토큰 값은 남기지 않음)
+        self.log(f"[인증] 토큰 발급 — expires_dt {'없음' if raw is None else f'{type(raw).__name__} {len(str(raw))}자'}, "
+                 f"해석 {self._token_expires_at or '실패(401 재인증에만 의존)'}")
 
     @property
     def token_expires_at(self) -> datetime | None:
@@ -200,6 +217,8 @@ class ReadOnlyResearchClient:
         requested_at = self.now()
         if deadline is not None and requested_at >= deadline:      # 대기·재시도 뒤 실제 요청 직전에 검사
             raise DeadlinePassed(f"{api_id}: 요청 직전 {requested_at} ≥ 마감 {deadline} — 요청하지 않음", sent)
+        if self.guard is not None:
+            self.guard(api_id)                                     # 예산·중지·우선 작업 — 막히면 RequestStopped
         self.calls += 1
         try:
             r = self.session.post(f"{self.base_url}{_ALL_API[api_id]}", headers=headers, json=payload, timeout=15)
