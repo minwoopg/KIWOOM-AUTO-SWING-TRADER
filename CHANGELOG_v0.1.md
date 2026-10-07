@@ -1341,4 +1341,35 @@ GPT가 3단계 상시 관리자 연결 전에 4건을 재현.
 ### 전달 파일
 - 패치 0001 (fix: W1-R1~R4), 0002 (docs) — 기준 `0fcfa15`
 
+## 2026-10-07 — 지정 종목 보완 W1b-R1·R2 (GPT 재검토 `6dc8e11`)
+
+### 배경
+- R1: `history_sessions=60`이면 60봉만으로 분석 READY·진입 관찰 가능. 160봉 READY 뒤 300으로 올리고 apply만 해도 이전 READY 사용.
+- R2: YAML에서 보유를 지운 상태로 CLI 편집(add) → 보유 보호가 REJECTED로 막았지만 파일은 바뀌고 종료 코드 0.
+  YAML에서 이미 보유를 지웠으면 안내된 `holding-close`가 "수동 보유 정보가 없음"으로 거부.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `domain/watchlist/config.py` | `monitor.history_sessions` 하한 = `S1Config.min_history`(160), 기본값도 같은 값 |
+| `infra/watch/manager.py` | `analysis_basis`(전략·S1 설정 해시·필요 봉 수)를 준비 결과에 저장, `entry_gate`는 지금 기준과 다르면 HOLD(BASIS_CHANGED). `holding_guard(pending=)`: 파일을 바꾸기 전 검사용. 보유 보호 안내에 holding-close(YAML에서 지웠어도)·restore |
+| `tools/watchlist.py` | `commit_text`: 형식·목록·보유 보호 → 청산 기록 → 파일 교체 → 적용. 적용 거부 시 원래 파일로 되돌리고 종료 코드 2·청산 기록 VOID. `holding-close`는 사용 중 설정의 보유로 청산(YAML에서 이미 빠져도). `restore [--version N]` 신설. status에 BASIS_CHANGED 표시 |
+| `test_watchlist.py` | 33 → 39건 |
+| 문서 | `docs/watchlist.md` |
+
+### 테스트 및 검증
+- 수정 전 코드(`6dc8e11`)에서 재현: 60봉 설정 APPLIED, 300봉 상향 뒤 진입 관찰 가능, 거부된 CLI add 종료 코드 0·파일 변경, YAML 누락 뒤 holding-close 거부.
+  수정 후: 60봉 설정 오류, BASIS_CHANGED 보류(재판정 뒤 해제), add 거부·파일 그대로·종료 코드 2, holding-close 적용.
+- 새 검사 6건(7-1~7-6): S1 최소 이력, 기준 변경 보류·재판정, 쓰기 전 보유 보호, restore, YAML 누락 뒤 청산, 쓴 뒤 적용 거부 시 되돌리기.
+- 변이 확인 5종 모두 잡힘. 회귀 32개 파일·수집 120(실측 원문 포함)·스캔 56·A5 45·지정 종목 39·단타 동등성 18/18. `git status` 깨끗.
+
+### 변경하지 않은 것
+- 연구 수집·S1 스캔·A5, 주문 경로, 감시 DB 스키마(wa2 그대로).
+
+### 다음 작업
+- 3단계 조회 전용 상시 실행 관리자.
+
+### 전달 파일
+- 패치 0001 (fix: W1b-R1·R2), 0002 (docs) — 기준 `6dc8e11`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

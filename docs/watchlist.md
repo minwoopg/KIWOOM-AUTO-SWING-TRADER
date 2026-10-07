@@ -43,7 +43,8 @@ symbols:
 | 운영 중 잘못 고침·파일 없음·읽기 실패(UTF-8 아님·권한 등 OSError) | REJECTED, **마지막 정상 버전으로 감시 유지**(보유 감시 포함), 오류·사용 중 버전 표시, **신규 매수 차단**(`entry_blocked`) |
 | 마지막 정상 설정의 수동 보유가 새 설정에서 사라짐(파일 직접 수정 포함) | `holding-close` 청산 기록(같은 보유 값)이 있을 때만 APPLIED. 없으면 REJECTED — 보유 감시 유지 (W1-R1) |
 | 같은 파일을 다시 읽음 | 새 기록 없음(원문·판정·오류·경고가 같으면). 종목 목록 스냅숏만 바뀌면 `config_check`에 재검증 기록, 경고가 바뀌면 새 적용 기록 |
-| CLI로 바꿈 | 바꾼 결과를 먼저 검증 — 틀리면 파일·이력 그대로(거부), 맞으면 파일을 쓰고 APPLIED(origin `CLI:<명령>`) |
+| CLI로 바꿈 | 바꾼 결과를 먼저 검증(형식·목록·**보유 보호**) — 틀리면 파일·이력 그대로, 종료 코드 2. 맞으면 파일을 쓰고 적용(origin `CLI:<명령>`). 쓴 뒤 적용이 거부되면 **원래 파일로 되돌리고** 종료 코드 2, 그 명령의 청산 기록은 VOID (W1b-R2) |
+| YAML에서 보유를 이미 지움 | `holding-close <코드>` — 마지막 정상 설정의 보유 값으로 청산 기록 후 적용. 실수였으면 `restore`(마지막 정상 원문으로 되돌림, `--version N`) |
 
 청산 기록(`holding_close`): `holding-close`가 마지막 정상 보유 값으로 OPEN 기록 → 그 보유를 지운 설정이 적용되면 USED(적용
 버전 연결). 보유가 그대로 남은 설정이 적용되면 VOID — 나중에 실수로 지운 설정에 쓰이지 않음.
@@ -59,9 +60,11 @@ symbols:
 - 준비 상태는 둘로 나눔 (W1-R3):
   * **가격 데이터**(`status`): 최근 완성 거래일(정규장 종료 + 160분 기준)까지 그 시각에 확보 시각이 입증된 일봉이 있고 정합성
     정상이면 READY, 아니면 UNKNOWN(NO_SERIES·NOT_IN_LIST·STALE·UNPROVEN·INTEGRITY:*·CALENDAR). 보유 가격 감시는 이것만 봄.
-  * **S1 분석**(`analysis_status`): S1 계산과 같은 `SeriesView.window(history_sessions)` 계약 — 기준일 봉 없음·거래 없음
+  * **S1 분석**(`analysis_status`): S1 계산과 같은 `SeriesView.window(history_sessions)` 계약(history_sessions는 S1 min_history 이상만 — 160 미만은 설정 오류, W1b-R1) — 기준일 봉 없음·거래 없음
     (NO_TRADES_AT_T), 창 안 거래 없는 봉(NO_TRADES)·누락(DATA_GAP), 상장 이력 부족(INSUFFICIENT_HISTORY), 달력 부족
     (INSUFFICIENT_SESSIONS)이면 HOLD. 분석이 보류돼도 보유 가격 감시는 유지.
+  * 판정 기준(`detail.analysis_basis` = 전략·S1 설정 해시·필요 봉 수)을 함께 저장 — 지금 설정의 기준과 다르면(예: 160 → 300)
+    다시 prepare하기 전까지 진입 관찰 HOLD(BASIS_CHANGED), status에도 표시 (W1b-R1).
   * 사유는 범주만, 날짜·봉 수는 detail(`window`: 예 NO_TRADES:2026-09-15) — 매일 숫자가 바뀌어도 상태 이력이 늘지 않음.
 - **위험 자격**(`symbol_risk`, W1-R2): 설정을 읽을 때마다(status·apply·prepare·편집) 최신 종목 목록으로 갱신 — prepare를
   기다리지 않음. 확인한 목록 스냅숏·위험 표시를 함께 저장, 바뀌면 `symbol_risk_log`.
