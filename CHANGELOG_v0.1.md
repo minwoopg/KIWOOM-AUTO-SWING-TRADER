@@ -1372,4 +1372,35 @@ GPT가 3단계 상시 관리자 연결 전에 4건을 재현.
 ### 전달 파일
 - 패치 0001 (fix: W1b-R1·R2), 0002 (docs) — 기준 `6dc8e11`
 
+## 2026-10-07 — 지정 종목 보완 W1c-R1 (GPT 재검토 `a60c7df`)
+
+### 배경
+`commit_text()`가 청산 기록을 먼저 저장한 뒤 파일을 교체하는데, 교체가 `PermissionError`로 실패하면 정리 코드가 돌지 않아
+OPEN 기록이 남음. 이후 YAML에서 보유를 빼고 apply하면 그 기록이 쓰여 APPLIED·보유 감시 종료.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `tools/watchlist.py` | `commit_text`: 청산 기록·파일 읽기·교체·적용을 예외 처리 — 그 명령의 청산 기록 VOID(close_id로), 교체 뒤면 원래 파일 복원, 복원까지 실패하면 REJECTED 시도("복원 실패")로 기록·종료 코드 2. 중단(Ctrl+C)은 같은 정리 뒤 다시 올림 |
+| `infra/watch/manager.py` | 청산 기록은 그것을 만든 명령이 넘긴 close_id로만 보유 보호를 통과(`sync_config(closes=)`). 적용 뒤 쓰이지 않은 OPEN 기록은 모두 VOID — 강제 종료로 남은 기록도 이후 apply에 쓰이지 않음 |
+| `infra/watch/store.py` | `get_close`·`void_close`·`void_open_closes` |
+| `test_watchlist.py` | 39 → 44건 |
+| 문서 | `docs/watchlist.md` |
+
+### 테스트 및 검증
+- 수정 전 코드(`a60c7df`)에서 재현: holding-close 교체 실패 뒤 OPEN 남음 → 보유 누락 apply가 APPLIED·보유 감시 종료.
+  수정 후: 기록 VOID·종료 코드 2, 이후 apply REJECTED·보유 유지.
+- 새 검사 5건(8-1~8-5): 교체 실패 → 재시작 → 보유 누락 apply 거부, 강제 종료로 남은 OPEN 기록 무시·정리, 적용 중 예외 시 파일 복원,
+  복원 실패 기록·신규 매수 차단, 중단 시 정리 후 재발생.
+- 변이 확인 5종 모두 잡힘. 회귀 32개 파일·수집 120(실측 원문 포함)·스캔 56·A5 45·지정 종목 44·단타 동등성 18/18. `git status` 깨끗.
+
+### 변경하지 않은 것
+- 감시 DB 스키마(wa2), 연구 수집·S1·A5, 주문 경로.
+
+### 다음 작업
+- 3단계 조회 전용 상시 실행 관리자.
+
+### 전달 파일
+- 패치 0001 (fix: W1c-R1), 0002 (docs) — 기준 `a60c7df`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

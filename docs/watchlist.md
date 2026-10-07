@@ -48,6 +48,10 @@ symbols:
 
 청산 기록(`holding_close`): `holding-close`가 마지막 정상 보유 값으로 OPEN 기록 → 그 보유를 지운 설정이 적용되면 USED(적용
 버전 연결). 보유가 그대로 남은 설정이 적용되면 VOID — 나중에 실수로 지운 설정에 쓰이지 않음.
+청산 기록은 **그것을 만든 `holding-close` 명령의 적용에서만** 근거가 됩니다(close_id를 넘겨받음 — W1c-R1). 적용이 끝나면 쓰이지
+않은 OPEN 기록은 모두 VOID. 명령이 파일 교체·적용 중 예외(권한·DB 잠김)로 실패하면 그 기록을 VOID로 하고 교체한 파일을 되돌리며
+종료 코드 2. 되돌리기까지 실패하면 REJECTED 시도("복원 실패")로 남겨 신규 매수를 막고 파일 확인·apply·restore를 안내.
+강제 종료로 정리 코드가 돌지 못해 OPEN이 남아도 이후 apply는 그 기록을 쓰지 않음.
 
 이력(`data/watch/watch.sqlite3` `config_version`): 시도 시각·버전·APPLIED/REJECTED·원문·정규화 설정·오류·경고·대조한
 목록 스냅숏 ID. 사용 중 설정은 DB에 저장된 마지막 APPLIED에서 복원(파일을 다시 믿지 않음).
