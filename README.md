@@ -261,6 +261,9 @@ python tools/probe_market_data.py --env-file ..\KIWOOM-AUTO-TRADER\.env --skip-d
   `apply`·`status`·`history`로 적용 이력 확인(`data/watch/watch.sqlite3`).
 - `prepare`: 등록 종목 + KOSPI·KOSDAQ만 일봉 갱신(새 종목은 전체 이력 즉시 수집), 준비 상태 READY/UNKNOWN 판정.
   전체 시장 수집·S1 스캔은 그대로 `tools/research_collect.py`.
+- 상시 실행 관리자(W2, 조회 전용): `python tools/watch_daemon.py run | status | stop | report --day D | doctor` — 거래일 달력에 맞춰
+  마감 뒤 지정 종목·지수 일봉 준비와 지정 종목 S1 관찰(별도 계약·별도 DB), 다음 거래일 개장 + 5분 가격 기록. 중복 기동·설정 적용 잠금,
+  재시작 이어하기, 호출 예산·양보. 명세·Windows 명령·장애별 복구: `docs/watch_daemon.md`.
 
 ## 원본과의 관계 (`provenance.json`)
 
