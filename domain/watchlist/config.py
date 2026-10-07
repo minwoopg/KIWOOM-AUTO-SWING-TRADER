@@ -28,6 +28,10 @@ from dataclasses import asdict, dataclass, field
 
 import yaml
 
+from domain.research.s1 import S1Config
+
+S1_MIN_HISTORY = S1Config().min_history   # S1 계산 계약의 최소 이력 — 이보다 짧은 준비 기준은 허용 안 함
+
 WATCH_SCHEMA = "w1"
 MARKETS = ("KRX",)
 MAX_SYMBOLS = 200
@@ -104,7 +108,7 @@ class WatchSymbol:
 @dataclass(frozen=True)
 class MonitorSettings:
     interval_sec: int = 60            # 장중 가격 확인 간격(다음 단계에서 사용)
-    history_sessions: int = 160       # 준비 완료로 볼 최소 완성 일봉 수(S1 min_history와 같음, 거래일 달력 범위 안)
+    history_sessions: int = S1_MIN_HISTORY   # S1 분석 준비 이력(봉). S1 min_history 이상만(W1b-R1), 거래일 달력 범위 안
 
 
 @dataclass(frozen=True)
@@ -224,7 +228,7 @@ def validate(raw, listing: dict[str, Listing] | None, *, check_list: bool = True
         v.err("-", "schema", f"'{WATCH_SCHEMA}'여야 함 (현재 {top.get('schema')!r})")
     mon = v.only(top.get("monitor") or {}, {"interval_sec", "history_sessions"}, "-", "monitor") or {}
     monitor = MonitorSettings(v.integer(mon, "interval_sec", 10, 3600, "-", "monitor", default=60),
-                              v.integer(mon, "history_sessions", 60, 1000, "-", "monitor", default=160))
+                              v.integer(mon, "history_sessions", S1_MIN_HISTORY, 1000, "-", "monitor", default=S1_MIN_HISTORY))
     al = v.only(top.get("alerts") or {}, {"repeat_limit_per_day", "min_repeat_interval_min", "rearm_on_clear"},
                 "-", "alerts") or {}
     alerts = AlertSettings(v.integer(al, "repeat_limit_per_day", 1, 50, "-", "alerts", default=3),

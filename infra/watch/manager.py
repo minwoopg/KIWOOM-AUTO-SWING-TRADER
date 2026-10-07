@@ -20,9 +20,10 @@ from __future__ import annotations
 - 준비 상태는 둘로 나눔 (W1-R3):
   * 가격 데이터(status): 최근 완성 거래일까지 확보 시각이 입증된 일봉이 있고 정합성 정상이면 READY, 아니면 UNKNOWN.
     보유 가격 감시는 이것만 봄 — 분석이 보류돼도 보유 감시는 유지.
-  * S1 분석(analysis_status): S1 계산과 같은 `SeriesView.window(history_sessions)` 계약 — 기준일 봉 없음·거래 없음
+  * S1 분석(analysis_status): S1 계산과 같은 `SeriesView.window(max(history_sessions, S1 min_history))` 계약 — 기준일 봉 없음·거래 없음
     (NO_TRADES_AT_T), 창 안 거래 없는 봉(NO_TRADES)·누락(DATA_GAP)·이력 부족(INSUFFICIENT_HISTORY)·달력 부족이면 HOLD.
-    READY 전에는 진입 관찰(이후 매수) 대상이 아님.
+    READY 전에는 진입 관찰(이후 매수) 대상이 아님. 판정 기준(전략·S1 설정 해시·필요 봉 수)을 detail.analysis_basis에
+    남기고, 지금 설정의 기준과 다르면 다시 판정하기 전까지 HOLD(BASIS_CHANGED) — W1b-R1.
 - 모든 기록에 적용 중인 설정 버전을 남김.
 """
 
@@ -35,6 +36,7 @@ from typing import Callable
 from domain.watchlist.config import (
     Issue, Listing, WatchConfig, WatchSymbol, config_from_dict, parse_text, validate,
 )
+from domain.research.s1 import STRATEGY_ID, STRATEGY_VERSION, S1Config
 from domain.research.series import SeriesView
 from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE, INDEX_TARGETS, CollectError, stock_series_id
 from infra.research.kiwoom_readonly import ResearchApiError, ResearchConfigError
@@ -146,9 +148,12 @@ def check_text(raw_text: str | None, listing: dict[str, Listing] | None, *, chec
 
 
 def holding_guard(wstore: WatchStore, active: WatchConfig | None, active_version: int | None,
-                  new: WatchConfig) -> tuple[list[Issue], dict[str, int], list[str]]:
+                  new: WatchConfig, *, pending: dict[str, dict] | None = None
+                  ) -> tuple[list[Issue], dict[str, int], list[str]]:
     """마지막 정상 설정의 수동 보유가 새 설정에서 사라졌는지 (W1-R1).
+    pending = 이번 명령이 남길 청산 기록 {코드: 보유 값} (CLI가 파일을 바꾸기 전에 검사할 때 — W1b-R2).
     반환 (오류, 쓸 청산 기록 {코드: close_id}, 무효로 할 청산 기록 코드 — 보유가 그대로 남은 종목)."""
+    pending = pending or {}
     errors, used, void = [], {}, []
     if active is None:
         return errors, used, void
@@ -160,6 +165,8 @@ def holding_guard(wstore: WatchStore, active: WatchConfig | None, active_version
             if wstore.open_close(old.code) is not None:
                 void.append(old.code)
             continue
+        if pending.get(old.code) == asdict(old.holding):
+            continue
         close = wstore.open_close(old.code)
         if close is not None and close["holding"] == asdict(old.holding):
             used[old.code] = close["close_id"]
@@ -167,8 +174,8 @@ def holding_guard(wstore: WatchStore, active: WatchConfig | None, active_version
         h = old.holding
         errors.append(Issue(old.code, "holding",
                             f"마지막 정상 v{active_version}의 수동 보유({h.quantity:,}주 @ {h.avg_price:,})가 새 설정에 없음 — "
-                            f"청산이면 `python tools/watchlist.py holding-close {old.code}`로 기록하세요"
-                            "(그 전까지 보유 감시 유지)"))
+                            f"청산이면 `python tools/watchlist.py holding-close {old.code}`(YAML에서 이미 지웠어도 됨), "
+                            "실수면 `python tools/watchlist.py restore`로 마지막 정상 설정 복원 — 그 전까지 보유 감시 유지"))
     return errors, used, void
 
 
@@ -234,12 +241,20 @@ def _targets(cfg: WatchConfig, codes: list[str] | None = None) -> list[tuple[str
     return out
 
 
+def analysis_basis(cfg: WatchConfig) -> dict:
+    """S1 분석 준비를 판정한 기준. 설정·S1 계약이 바뀌면 값이 달라져 이전 READY를 쓰지 않음 (W1b-R1)."""
+    s1 = S1Config()
+    return {"strategy": f"{STRATEGY_ID}_{STRATEGY_VERSION}", "s1_config": s1.config_hash(),
+            "need": max(cfg.monitor.history_sessions, s1.min_history)}
+
+
 def evaluate_readiness(rstore: ResearchStore, calendar: TradingCalendar, cfg: WatchConfig,
                        listing: dict[str, Listing] | None, *, now: datetime,
                        after_close: timedelta = BAR_COMPLETE_AFTER_CLOSE, fetch: dict | None = None) -> list[dict]:
     """감시 대상(지수 2 + 등록 종목)마다 가격 데이터 준비(READY/UNKNOWN)와 S1 분석 준비(READY/HOLD). 저장하지 않음.
     사유는 범주만(날짜·봉 수는 detail) — 매일 숫자가 바뀌어도 상태 이력이 늘지 않게."""
-    need = cfg.monitor.history_sessions
+    basis = analysis_basis(cfg)
+    need = basis["need"]
     fetch = fetch or {}
     try:
         t = expected_session(calendar, now, after_close)
@@ -251,7 +266,7 @@ def evaluate_readiness(rstore: ResearchStore, calendar: TradingCalendar, cfg: Wa
     rows = []
     for sid, kind, code, sym in _targets(cfg):
         lrow = None if listing is None or kind != "STOCK" else listing.get(code)
-        detail = {"need": need, "expected_last": None if t is None else t.isoformat(),
+        detail = {"need": need, "analysis_basis": basis, "expected_last": None if t is None else t.isoformat(),
                   "modes": list(sym.modes) if sym else ["MARKET"], "fetch": fetch.get(sid)}
         if lrow is not None:
             detail["security_type"] = lrow.security_type
@@ -306,6 +321,8 @@ def entry_gate(state: WatchState, sym: WatchSymbol, ready: dict | None, risk: di
         why.append(f"DATA_{UNKNOWN}" + ("" if ready is None else f":{ready['reason']}"))
     elif ready.get("analysis_status") != READY:
         why.append(f"ANALYSIS_{HOLD}:{ready.get('analysis_reason') or 'NOT_EVALUATED'}")
+    elif state.config is not None and (ready.get("detail") or {}).get("analysis_basis") != analysis_basis(state.config):
+        why.append(f"ANALYSIS_{HOLD}:BASIS_CHANGED")            # 준비 기준이 바뀜 — 다시 prepare 전까지 (W1b-R1)
     return not why, why
 
 

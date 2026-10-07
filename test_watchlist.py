@@ -616,6 +616,102 @@ check("6-8) 감시 저장소 wa1(fe04b30) → wa2: 백업 후 분석 준비 열�
       bk is not None and "bak-wa1-" in bk and r_old["status"] == "READY" and r_old["analysis_status"] is None
       and {"holding_close", "symbol_risk", "symbol_risk_log", "config_check"} <= tabs and bk2 is None)
 
+# ── 7. GPT 재검토 6dc8e11 W1b-R1·R2 ────────────────────────
+from domain.research.s1 import S1Config  # noqa: E402
+
+def hist_doc(n, *syms):
+    d = doc(*syms)
+    d["monitor"]["history_sessions"] = n
+    return d
+
+
+S5930 = {"code": "005930", "interest": {"enabled": True, "s1_analysis": True}}
+r60, r159, r160 = (validate(hist_doc(n, S5930), LIST) for n in (60, 159, 160))
+check("7-1) [W1b-R1 재현] S1 분석 준비 이력은 S1 계산 계약의 최소 이력(S1Config.min_history=160) 이상만 — 60·159는 설정 오류, "
+      "기본값도 같은 값",
+      not r60.ok and not r159.ok and r160.ok and S1Config().min_history == 160
+      and r60.errors[0].field == "monitor.history_sessions"
+      and validate(doc(S5930), LIST).config.monitor.history_sessions == S1Config().min_history)
+
+E10 = setup("w1b-r1")
+E10["cfg"].write_text(dump_document(hist_doc(160, S5930)), encoding="utf-8")
+cli(E10, "prepare", "--no-list-refresh")
+g160 = gate(E10, "005930")
+E10["cfg"].write_text(dump_document(hist_doc(300, S5930)), encoding="utf-8")
+c72, _ = cli(E10, "apply")
+g300a = gate(E10, "005930")
+_, o72 = cli(E10, "status")
+cli(E10, "prepare", "--no-list-refresh")
+g300b = gate(E10, "005930")
+with WatchStore(E10["wdb"]) as w10:
+    r10 = w10.readiness()["STOCK:005930"]
+E10["cfg"].write_text(dump_document(hist_doc(160, S5930)), encoding="utf-8")
+cli(E10, "apply")
+g160b = gate(E10, "005930")
+cli(E10, "prepare", "--no-list-refresh")
+g160c = gate(E10, "005930")
+check("7-2) [W1b-R1 재현] 160봉 READY 뒤 300봉으로 올리고 apply만 → 이전 READY를 쓰지 않고 HOLD(BASIS_CHANGED)·status도 표시, "
+      "다시 prepare하면 300봉 기준으로 판정(달력이 2026년만 — INSUFFICIENT_SESSIONS 보류). 160으로 되돌려도 재판정 전까지 "
+      "보류, prepare 뒤 해제. 준비 결과에 판정 기준(전략·S1 설정 해시·필요 봉 수) 기록",
+      g160 == (True, []) and c72 == 0 and g300a == (False, ["ANALYSIS_HOLD:BASIS_CHANGED"])
+      and "HOLD(BASIS_CHANGED" in o72 and g300b == (False, ["ANALYSIS_HOLD:INSUFFICIENT_SESSIONS"])
+      and r10["detail"]["analysis_basis"] == {"strategy": "s1_pullback_v0.1", "s1_config": S1Config().config_hash(),
+                                              "need": 300}
+      and g160b[0] is False and g160c == (True, []))
+
+# R2: YAML에서 보유를 지운 뒤 CLI로 다른 종목 추가
+E11 = setup("w1b-r2")
+E11["cfg"].write_text(dump_document(doc(HOLD10)), encoding="utf-8")
+cli(E11, "apply")
+E11["cfg"].write_text(dump_document(doc({"code": "000660", "interest": {"enabled": False}})), encoding="utf-8")
+bytes11 = E11["cfg"].read_bytes()
+with WatchStore(E11["wdb"]) as w11:
+    n11 = len(w11.history())
+c73, o73 = cli(E11, "add", "005930", "--interest", "--no-fetch")
+with WatchStore(E11["wdb"]) as w11:
+    st11 = M.load_state(w11)
+    n11b = len(w11.history())
+check("7-3) [W1b-R2 재현] YAML에서 보유를 지운 상태로 CLI 편집(add) → 파일을 쓰기 전에 보유 보호까지 검사해 거부(종료 코드 2), "
+      "파일 바이트·적용 이력·사용 중 설정(보유 10주) 그대로. 안내에 holding-close·restore",
+      c73 == 2 and "보유 보호" in o73 and "holding-close 000660" in o73 and "restore" in o73
+      and E11["cfg"].read_bytes() == bytes11 and n11b == n11 and st11.config.symbol("000660").holding.quantity == 10)
+c74, o74 = cli(E11, "restore")
+with WatchStore(E11["wdb"]) as w11:
+    st11r = M.load_state(w11)
+    raw11 = w11.history()[-1]["raw_text"]
+c74b, _ = cli(E11, "restore", "--version", "99")
+check("7-4) [W1b-R2] restore: 파일을 마지막 정상(APPLIED) 원문으로 되돌리고 적용(보유 10주 그대로), 없는 버전은 거부",
+      c74 == 0 and "restore v1" in o74 and E11["cfg"].read_text(encoding="utf-8") == raw11
+      and st11r.config.symbol("000660").holding.quantity == 10 and not st11r.entry_blocked and c74b == 2)
+E11["cfg"].write_text(dump_document(doc({"code": "000660", "interest": {"enabled": False}})), encoding="utf-8")
+c75, o75 = cli(E11, "holding-close", "000660")
+with WatchStore(E11["wdb"]) as w11:
+    st11c = M.load_state(w11)
+    cl11 = w11.closes()
+check("7-5) [W1b-R2] YAML에서 이미 보유를 지운 뒤에도 holding-close 가능 — 마지막 정상 설정의 보유 값으로 청산 기록 후 적용(USED)",
+      c75 == 0 and "APPLIED" in o75 and st11c.config.symbol("000660").holding is None
+      and cl11[-1]["state"] == "USED" and '"quantity": 10' in cl11[-1]["holding_json"])
+# 파일을 쓴 뒤 적용이 거부되는 경로 — 적용 단계만 실패하게 흉내(목록 대조 실패)
+E12 = setup("w1b-r2b")
+E12["cfg"].write_text(dump_document(doc(HOLD10)), encoding="utf-8")
+cli(E12, "apply")
+bytes12 = E12["cfg"].read_bytes()
+real_sync = W.sync_config
+W.sync_config = lambda ws, path, listing, snap, **kw: real_sync(ws, path, None, snap, **kw)
+try:
+    c76, o76 = cli(E12, "holding-close", "000660")
+    c76b, o76b = cli(E12, "add", "005930", "--interest", "--no-fetch")
+finally:
+    W.sync_config = real_sync
+with WatchStore(E12["wdb"]) as w12:
+    st12 = M.load_state(w12)
+    cl12 = w12.closes()
+check("7-6) [W1b-R2] 파일을 쓴 뒤 최종 적용이 거부되면 원래 파일로 되돌리고 종료 코드 2(성공으로 알리지 않음), 그 명령의 청산 "
+      "기록은 VOID, 사용 중 설정·보유 그대로",
+      (c76, c76b) == (2, 2) and "되돌렸습니다" in o76 and "되돌렸습니다" in o76b
+      and E12["cfg"].read_bytes() == bytes12 and st12.config.symbol("000660").holding.quantity == 10
+      and [c["state"] for c in cl12] == ["VOID"])
+
 # ── 5. 경계 ────────────────────────────────────────────────
 FORBIDDEN = ("infra.broker", "infra.storage", "infra.notify", "domain.strategy", "domain.service", "commands",
              "domain.position", "infra.market_data")

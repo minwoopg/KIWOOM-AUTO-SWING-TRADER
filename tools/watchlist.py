@@ -7,7 +7,8 @@
     python tools/watchlist.py set 005930 --band 68000-70000 --clear-bands   # 가격대 바꾸기
     python tools/watchlist.py disable 005930                # 관심 감시 끄기(보유가 있으면 보유 감시는 유지)
     python tools/watchlist.py enable 005930
-    python tools/watchlist.py holding-close 000660          # 수동 보유 정보 지우기(청산)
+    python tools/watchlist.py holding-close 000660          # 수동 보유 정보 지우기(청산) — YAML에서 이미 지웠어도 됨
+    python tools/watchlist.py restore                       # 파일을 마지막 정상 설정(또는 --version N)으로 되돌림
     python tools/watchlist.py remove 005930                 # 항목 삭제(보유가 있으면 거부)
     python tools/watchlist.py validate                      # 검사만(기록 안 함)
     python tools/watchlist.py apply                         # 파일을 직접 고친 뒤 적용(이력 기록)
@@ -15,7 +16,8 @@
     python tools/watchlist.py status
     python tools/watchlist.py history
 
-- 바꾸는 명령(add·set·enable·disable·holding-close·remove)은 바꾼 결과를 먼저 검증하고, 틀리면 파일을 바꾸지 않습니다.
+- 바꾸는 명령(add·set·enable·disable·holding-close·remove·restore)은 바꾼 결과를 먼저 검증(보유 보호 포함)하고, 틀리면
+  파일을 바꾸지 않고 종료 코드 2. 파일을 쓴 뒤 적용이 거부되면 파일을 되돌리고 종료 코드 2(W1b-R2).
 - add는 적용 뒤 그 종목의 과거 일봉을 바로 받습니다(--no-fetch로 생략, 나중에 prepare).
 - 저장: config/watchlist.yaml(git 제외), data/watch/watch.sqlite3(적용 이력·준비 상태), 일봉은 연구 DB를 함께 씀.
 - 전체 시장 수집·S1 스캔은 그대로 tools/research_collect.py(별도 명령).
@@ -41,7 +43,8 @@ from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE, CollectError, Res
 from infra.research.kiwoom_readonly import ResearchApiError, ResearchConfigError  # noqa: E402
 from infra.research.store import ResearchStore  # noqa: E402
 from infra.watch.manager import (  # noqa: E402
-    READY, WatchNotReady, check_text, entry_gate, listing_from_store, load_state, prepare_data, read_config_text,
+    READY, WatchNotReady, analysis_basis, check_text, entry_gate, holding_guard, listing_from_store, load_state,
+    prepare_data, read_config_text,
     sync_config,
 )
 from infra.watch.store import WatchStore  # noqa: E402
@@ -97,6 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
         a.add_argument("code")
         if name == "disable":
             a.add_argument("--holding", action="store_true", help="(보유 감시는 끌 수 없음 — 안내만)")
+    rs = sub.add_parser("restore", help="파일을 마지막 정상(APPLIED) 설정으로 되돌림")
+    rs.add_argument("--version", type=int, help="되돌릴 APPLIED 버전(기본: 사용 중 버전)")
     pr = sub.add_parser("prepare")
     pr.add_argument("--codes", help="쉼표로 구분한 등록 종목만 조회(상태 판정은 전체)")
     pr.add_argument("--no-list-refresh", action="store_true", help="오늘 종목 목록을 다시 받지 않음")
@@ -180,6 +185,15 @@ def edit_document(doc: dict, args) -> str:
             raise EditError("보유 값(--qty 등)은 --holding과 함께")
         items.append(item)
         return f"add {code}"
+    if args.cmd == "holding-close":
+        if item is None or item.get("holding") is None:
+            if getattr(args, "active_holding", False):
+                return f"holding-close {code}"     # YAML에서 이미 빠진 보유 — 마지막 정상 설정의 보유 값으로 청산 (W1b-R2)
+            raise EditError(f"{code}에 수동 보유 정보가 없음(파일·사용 중 설정 모두)")
+        item.pop("holding")
+        if item.get("interest") is None:
+            item["interest"] = {"enabled": False, "s1_analysis": False, "price_bands": []}   # 항목은 비활성으로 남김
+        return f"holding-close {code}"
     if item is None:
         raise EditError(f"{code}가 설정에 없음")
     if args.cmd == "set":
@@ -202,19 +216,48 @@ def edit_document(doc: dict, args) -> str:
         it = item.setdefault("interest", {"enabled": False, "s1_analysis": False, "price_bands": []})
         it["enabled"] = args.cmd == "enable"
         return f"{args.cmd} {code}"
-    if args.cmd == "holding-close":
-        if item.get("holding") is None:
-            raise EditError(f"{code}에 수동 보유 정보가 없음")
-        item.pop("holding")
-        if item.get("interest") is None:
-            item["interest"] = {"enabled": False, "s1_analysis": False, "price_bands": []}   # 항목은 비활성으로 남김
-        return f"holding-close {code}"
     if args.cmd == "remove":
         if item.get("holding") is not None:
             raise EditError(f"{code}에 수동 보유 정보가 있음 — 보유 감시를 끊지 않도록 삭제 거부(먼저 holding-close)")
         items.remove(item)
         return f"remove {code}"
     raise EditError(args.cmd)
+
+
+def commit_text(wstore: WatchStore, cfg_path: Path, text: str, listing, snap_id, *, now, origin: str,
+                pending: dict[str, dict] | None = None):
+    """바꾼 원문을 검증(형식·목록·보유 보호) → 청산 기록 → 파일 교체 → 적용. 반환 (종료 코드, 상태, 시도).
+    파일을 쓰기 전에 거부되면 파일 그대로 2. 쓴 뒤 적용이 거부되면 원래 파일로 되돌리고 2 (W1b-R2)."""
+    pending = pending or {}
+    res = check_text(text, listing)
+    if not res.ok:
+        print("[거부] 바꾼 결과가 검증을 통과하지 못해 파일을 바꾸지 않았습니다:")
+        _print_issues([vars(e) for e in res.errors], [vars(w) for w in res.warnings])
+        return 2, None, None
+    before = load_state(wstore)
+    guard, _, _ = holding_guard(wstore, before.config, before.active_version, res.config, pending=pending)
+    if guard:
+        print("[거부] 보유 보호 — 파일을 바꾸지 않았습니다:")
+        _print_issues([vars(e) for e in guard], [])
+        return 2, None, None
+    for code, h in pending.items():
+        wstore.record_close(code, h, at=now(), from_version=before.active_version, origin=origin)
+    old_bytes = cfg_path.read_bytes() if cfg_path.is_file() else None
+    _atomic_write(cfg_path, text)
+    state, att = sync_config(wstore, cfg_path, listing, snap_id, now=now(), origin=origin)
+    if att["status"] != "APPLIED":
+        if old_bytes is None:
+            cfg_path.unlink(missing_ok=True)
+        else:
+            tmp = cfg_path.with_name(cfg_path.name + ".tmp")
+            tmp.write_bytes(old_bytes)
+            os.replace(tmp, cfg_path)
+        if pending:
+            wstore.settle_closes({}, list(pending), att["version"])      # 쓰이지 않은 청산 기록은 무효
+        print(f"[거부] v{att['version']} 적용 실패 — 파일을 원래대로 되돌렸습니다:")
+        _print_issues(att["errors"], [])
+        return 2, state, att
+    return 0, state, att
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -237,12 +280,13 @@ def _status_table(state, wstore: WatchStore, listing, snap_id=None) -> None:
     if state.config is None:
         return
     ready, risks = wstore.readiness(), wstore.risk()
+    basis = analysis_basis(state.config)
     print(f"\n종목 목록 스냅숏 {snap_id} 기준 위험 자격 · 가격 데이터 = 보유 가격 감시용, S1 분석 = 진입 관찰용")
     print("| 대상 | 이름 | 관심 | S1 | 관심 가격대 | 수동 보유(증권사 잔고 아님) | 가격 데이터 | S1 분석 | 위험 자격 | 신규 진입 관찰 |")
     print("|---|---|---|---|---|---|---|---|---|---|")
     for sid in ("INDEX:KOSPI:001", "INDEX:KOSDAQ:101"):
         r = ready.get(sid)
-        print(f"| {sid} | - | - | - | - | - | {_ready_cell(r)} | {_analysis_cell(r)} | - | - |")
+        print(f"| {sid} | - | - | - | - | - | {_ready_cell(r)} | {_analysis_cell(r, basis)} | - | - |")
     for sym in state.config.symbols:
         r = ready.get(f"STOCK:{sym.code}")
         rk = risks.get(sym.code)
@@ -260,7 +304,7 @@ def _status_table(state, wstore: WatchStore, listing, snap_id=None) -> None:
         risk = "미확인" if rk is None else (",".join(rk["flags"]) or ("없음" if rk["status"] == "OK" else rk["status"]))
         print(f"| {sym.code} | {lr.name if lr else (sym.name or '?')} | {'켜짐' if sym.interest_active else '꺼짐'} | "
               f"{'예' if it.s1_analysis else '-'} | {bands or '-'} | {hold} | "
-              f"{_ready_cell(r) if sym.active else '-'} | {_analysis_cell(r) if sym.active else '-'} | {risk} | {gate} |")
+              f"{_ready_cell(r) if sym.active else '-'} | {_analysis_cell(r, basis) if sym.active else '-'} | {risk} | {gate} |")
 
 
 def _ready_cell(r) -> str:
@@ -269,10 +313,12 @@ def _ready_cell(r) -> str:
     return READY if r["status"] == READY else f"UNKNOWN({r['reason']})"
 
 
-def _analysis_cell(r) -> str:
+def _analysis_cell(r, basis=None) -> str:
     if r is None or r.get("analysis_status") is None:
         return "HOLD(준비 안 함 — prepare)"
     if r["analysis_status"] == READY:
+        if basis is not None and (r.get("detail") or {}).get("analysis_basis") != basis:
+            return "HOLD(BASIS_CHANGED — 다시 prepare)"
         return READY
     w = (r.get("detail") or {}).get("window", "")
     return f"HOLD({w if ':' in w else r['analysis_reason']})"          # 날짜가 있으면 그대로(NO_TRADES:2026-09-15)
@@ -345,26 +391,23 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                 doc = raw if isinstance(raw, dict) else empty_document()
             else:
                 doc = empty_document()
+            pending = {}
+            if args.cmd == "holding-close":
+                # 명시적 청산 — 마지막 정상 설정의 보유 값으로 기록 (YAML에서 이미 빠졌어도 — W1b-R2)
+                before = load_state(wstore)
+                old = None if before.config is None else before.config.symbol(_code(args.code))
+                if old is not None and old.holding is not None:
+                    pending[old.code] = asdict(old.holding)
+                args.active_holding = bool(pending)
             try:
                 what = edit_document(doc, args)
             except EditError as exc:
                 print(f"[거부] {exc}")
                 return 2
-            text = dump_document(doc)
-            res = check_text(text, listing)
-            if not res.ok:
-                print("[거부] 바꾼 결과가 검증을 통과하지 못해 파일을 바꾸지 않았습니다:")
-                _print_issues([vars(e) for e in res.errors], [vars(w) for w in res.warnings])
-                return 2
-            if args.cmd == "holding-close":
-                # 명시적 청산 기록 — 이게 있어야 마지막 정상 설정의 보유를 지운 설정이 적용됨 (W1-R1)
-                before = load_state(wstore)
-                old = None if before.config is None else before.config.symbol(_code(args.code))
-                if old is not None and old.holding is not None:
-                    wstore.record_close(_code(args.code), asdict(old.holding), at=now(),
-                                        from_version=before.active_version, origin=f"CLI:{what}")
-            _atomic_write(cfg_path, text)
-            state, att = sync_config(wstore, cfg_path, listing, snap_id, now=now(), origin=f"CLI:{what}")
+            code_, state, att = commit_text(wstore, cfg_path, dump_document(doc), listing, snap_id, now=now,
+                                            origin=f"CLI:{what}", pending=pending)
+            if code_:
+                return code_
             print(f"{what} → v{att['version']} {att['status']}")
             _print_issues([], att["warnings"])
             if args.cmd == "add" and not args.no_fetch and state.config.symbol(_code(args.code)).active:
@@ -376,6 +419,20 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                     return 1
                 r = next(x for x in res2["rows"] if x["code"] == _code(args.code) and x["kind"] == "STOCK")
                 print(f"데이터: {_ready_cell(r)} (준비 실행 {res2['run_id']}, 조회 {res2['calls']}회)")
+            return 0
+
+        if args.cmd == "restore":
+            hist = [h for h in wstore.history(10_000) if h["status"] == "APPLIED"]
+            pick = hist[0] if hist and args.version is None else next(
+                (h for h in hist if h["version"] == args.version), None)
+            if pick is None or pick["raw_text"] is None:
+                print(f"[거부] 되돌릴 정상(APPLIED) 설정이 없음{'' if args.version is None else f': v{args.version}'}")
+                return 2
+            code_, state, att = commit_text(wstore, cfg_path, pick["raw_text"], listing, snap_id, now=now,
+                                            origin=f"CLI:restore v{pick['version']}")
+            if code_:
+                return code_
+            print(f"restore v{pick['version']} → v{att['version']} {att['status']}")
             return 0
 
         if args.cmd == "prepare":
