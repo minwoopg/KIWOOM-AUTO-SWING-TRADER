@@ -311,13 +311,22 @@ GPT 재검토 `71b78e3` 지시. 주문 없음·조회만(모의 도메인, 시�
   AFTER_CLOSE — 원문·실제 시각만 보존, 관찰가·판정·가정 체결가격으로 쓰지 않음. 실행 시작이 정규장 뒤면 조회 없이 MISSED.
 - 조회(판정 기준): ka10001 cur_prc(현재가)·base_pric(기준가) 필수, 시가·고가·저가·상한가·하한가·거래량은 있으면 기록,
   응답 본문 보존(토큰처럼 보이는 키는 가림).
-- 보조 조회(기록용, 스키마 a2): ka10001 행을 **먼저 저장**한 뒤 ka10003 → 그 조회의 최근 KRX 체결 시각(`trade_time`)·체결가
+- 보조 조회(기록용, 스키마 a3): ka10001 행을 **먼저 저장**한 뒤 ka10003 → 그 조회의 최근 KRX 체결 시각(`trade_time`)·체결가
   (`trade_price`)·체결 조회 요청 대비 지연(`trade_lag_sec`), ka10004 → 호가 기준 시각(`quote_time`)·최우선 매도/매수호가
   (`best_ask`·`best_bid`). 체결 시각은 **ka10001 가격의 원천 시각이 아님**(별도 조회) — ka10001 `source_time`은 원천에 시각이
   없어 비워 둠. 판정·가정 체결가격에는 쓰지 않음 — 실패하거나 형식이 틀려도 ka10001 판정은 그대로, 상태는 `extra_json`.
   보조 조회 중 중단되면 기본 가격 행은 남고(`extra_json` = 대기), 재시작 때 그 종목은 다시 조회하지 않고 보조 조회만 INTERRUPTED로 마감.
   ka10001 조회 실패·필드 없음이면 보조 조회도 하지 않음. 후보 하나에 조회 3회(1초 간격) — 후보 40개 안팎까지 ON_TIME.
-- a1 → a2(열 때 자동·백업 `a5_checks.sqlite3.bak-a1-<시각>`): 보조 조회 열 추가, 기존 기록은 비워 둠.
+- 체결 값의 근거 `trade_basis`: KA10003(이 코드가 ka10003에서 직접) / LEGACY_KA10003(a2에서 근거 확인 후 옮김) /
+  UNKNOWN(값은 있으나 근거 불명 — 보고서에 `UNKNOWN(근거 불명)`, 판정·가정 체결에 쓰지 않음) / 비어 있음(체결 값 없음).
+- a1·a2 → a3(열 때 자동·백업 `a5_checks.sqlite3.bak-<옛 버전>-<시각>`, 한 트랜잭션 — GPT 재검토 `0e494dd` P1):
+  - 열 추가: `trade_time`·`trade_price`·`trade_exchange`·`trade_lag_sec`·`trade_basis`·`legacy_json`(+ a1이면 보조 조회 열 전부).
+  - `53e56e5`(a2)는 ka10003 최근 체결을 `source_time`·`source_price`·`source_exchange`·`source_lag_sec`에 저장했음 →
+    같은 행 `extra_json`의 ka10003 OK 응답 첫 행(tm·cur_prc)과 **일치할 때만** trade_*로 옮기고 LEGACY_KA10003.
+    일치하지 않거나 대조할 응답이 없으면 trade_*는 비우고 UNKNOWN — 원래 값은 `legacy_json`과 옛 열에 그대로 보존.
+  - 어느 경우든 `source_time`은 비움(이제 ka10001 원천 시각 자리 — 원천에 시각이 없어 항상 비어 있음).
+  - a2 표시인데 이미 trade_* 열인 DB(`0e494dd` 코드가 새로 만든 경우)는 같은 근거 검사로 KA10003/UNKNOWN 표시만.
+  - 후보·기본 가격·판정·가정 체결·요청 시각 등 다른 열은 바꾸지 않음. 결과 집계는 `meta.a3_upgrade`, CLI가 출력.
 - 결과(fetch_status): OK / FETCH_FAILED(재시도 후 실패) / PARSE_FAILED(필수 필드 없음) / NOT_RUN(누락) — 그 확인의 결과로 남김.
 - 판정(outcome, 우선순위): NOT_TRADABLE(현재가 0·거래량 0(정지 가능)·상한가) > BASIS_CHANGED(D 기준가 ≠ 신호일 종가 —
   액면분할·권리락 등으로 가격 기준이 달라져 진입 상한 비교 보류) > ABOVE_CAP(관찰가 > 진입 상한) > BELOW_STOP(관찰가 ≤ 참고
