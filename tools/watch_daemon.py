@@ -284,6 +284,16 @@ def cmd_doctor(args, *, runner=None) -> int:
     return 1
 
 
+def _stop_daemon(d, state: str, err: str) -> bool:
+    """종료 상태 저장. 실패하면 경고를 찍고 False — 상태 저장 실패를 정상으로 보이지 않게 (finally 안 return 없이 같은 동작)."""
+    try:
+        d.stop(state, err)
+        return True
+    except Exception as exc:                                 # noqa: BLE001
+        print(f"[경고] 관리자 종료 상태 저장 실패 {type(exc).__name__}: {exc}")
+        return False
+
+
 def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar: TradingCalendar | None = None,
          sleep=time.sleep, log=print) -> int:
     args = build_parser().parse_args(argv)
@@ -328,7 +338,9 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
         with daemon_lock(p.daemon_db):
             holder: dict = {}
             if client is None:                              # 모든 실제 요청 직전에 관리자의 예산·중지·우선 작업 검사(R3)
-                client = _LazyClient(lambda: make_client(args, guard=lambda api: holder["d"].request_guard(api)))
+                # 인증·재발급·재시도 메시지도 관리자 log(시각·가림·로그 파일)로 (O1) — 연구 CLI는 기본 print 그대로
+                client = _LazyClient(lambda: make_client(args, log=lambda m: holder["d"].log(m),
+                                                         guard=lambda api: holder["d"].request_guard(api)))
             d = WatchDaemon(p, calendar, client, settings=settings, now=now, sleep=sleep, log=log)
             holder["d"] = d
             d.start()
@@ -343,13 +355,11 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                 print(f"[중단] {err}")
             except BaseException as exc:
                 state, err = "FAILED", f"{type(exc).__name__}: {exc}"
+                if not _stop_daemon(d, state, err):
+                    return 1                                 # 이전과 같음: 종료 상태 저장도 실패하면 예외 대신 종료 코드 1
                 raise
-            finally:
-                try:
-                    d.stop(state, err)
-                except Exception as exc:                     # noqa: BLE001 — 상태 저장 실패를 정상으로 보이지 않게
-                    print(f"[경고] 관리자 종료 상태 저장 실패 {type(exc).__name__}: {exc}")
-                    return 1
+            if not _stop_daemon(d, state, err):
+                return 1
             return 0 if state in ("STOPPED", "IDLE", "IDLE_CAP", "MAX_TICKS", "INTERRUPTED") else 1
     except ConfigLockTimeout:
         print("[중단] 이미 실행 중인 관리자가 있음 — `status`로 확인, 끝내려면 `stop`")

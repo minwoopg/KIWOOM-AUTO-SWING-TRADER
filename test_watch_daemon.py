@@ -1449,6 +1449,105 @@ check("10-14) 이전 판 DB를 올리기 전에 복구용 사본을 SQLite 백�
       "원본을 이전 코드로 되돌려 쓰는 데 의존하지 않음",
       bak7 and Path(bak7).exists() and ".bak-wd2-" in bak7 and bak7_schema == "wd2" and "committed_at" not in bak7_cols)
 
+# ── 11. O1 인증 로그 파일 기록·종료 코드(finally 안 return 정리) ─────────────
+import functools  # noqa: E402
+
+import requests as _requests  # noqa: E402
+
+from tools import research_collect as RC  # noqa: E402
+
+EO = env("o1_factory", datetime(2026, 10, 7, 19, 0), [S_5930, S_0660])
+with D.DaemonStore(EO["paths"].daemon_db) as ds:
+    ds.set_meta("since", "2026-10-07")
+EO["fake"].expires_in = timedelta(minutes=12)
+EO["fake"].tick = timedelta(minutes=1)
+EO["fake"].fail["000660"] = ["401"]
+tok0_o1 = EO["fake"].tokens                                   # 환경 준비(목록 스냅숏)에서 받은 토큰은 관리자 밖
+argsO = ["--config", str(EO["paths"].config), "--watch-db", str(EO["paths"].watch_db), "--db", str(EO["paths"].research_db),
+         "--daemon-db", str(EO["paths"].daemon_db), "--watch-scan-db", str(EO["paths"].watch_scan_db), "--watch-open-db",
+         str(EO["paths"].watch_open_db), "--report-dir", str(EO["paths"].report_dir), "--log-file", str(EO["paths"].log_file),
+         "--env-file", str(EO["dir"] / "fake.env"), "--sleep", "0.5"]
+real_le, real_cli, real_sess = RC.load_env, RC.ReadOnlyResearchClient, _requests.Session
+RC.load_env = lambda p: {"KIWOOM_APP_KEY": "APPKEY-XYZ", "KIWOOM_SECRET_KEY": "SECRET-XYZ"}   # 가짜 키(파일 없음)
+RC.ReadOnlyResearchClient = functools.partial(real_cli, now=EO["clock"], monotonic=EO["clock"].mono,
+                                              sleep=EO["clock"].sleep)                       # 가짜 시계만 주입
+_requests.Session = lambda: EO["fake"]                                                       # 가짜 키움(네트워크 없음)
+console_o1 = []
+try:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc_o1 = WD.main(argsO + ["run", "--max-ticks", "3"], client=None, now=EO["clock"], calendar=CAL,
+                        sleep=EO["clock"].sleep, log=console_o1.append)
+finally:
+    RC.load_env, RC.ReadOnlyResearchClient, _requests.Session = real_le, real_cli, real_sess
+log_o1 = EO["paths"].log_file.read_text(encoding="utf-8")
+issues = [ln for ln in log_o1.splitlines() if "[인증] 토큰 발급" in ln]
+check("11-1) O1 실제 CLI factory 경로(make_client·지연 생성·guard 그대로, 가짜 키·가짜 세션): 최초 발급·만료 임박 재발급·401 재인증 사건이 "
+      "관리자 로그 파일에 시각과 함께 남음(expires_dt는 형식·해석만), 토큰·앱키·비밀키 값은 없음, 요청 예산에 토큰 포함",
+      rc_o1 == 0 and len(issues) >= 3 and all("expires_dt str 14자" in ln and ln[:4] == "2026" for ln in issues)
+      and "토큰 만료 임박" in log_o1 and "HTTP 401" in log_o1
+      and not any(x in log_o1 for x in ("SECRET-TOKEN", "APPKEY-XYZ", "SECRET-XYZ"))
+      and any("[인증]" in m for m in console_o1)
+      and D.DaemonStore(EO["paths"].daemon_db).calls(date(2026, 10, 7)) == len(EO["fake"].calls) + EO["fake"].tokens - tok0_o1)
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    real_le2 = RC.load_env
+    RC.load_env = lambda p: {"KIWOOM_APP_KEY": "K", "KIWOOM_SECRET_KEY": "S"}
+    try:
+        c_default = RC.make_client(RC.build_parser().parse_args(["--env-file", "x", "universe"]))
+    finally:
+        RC.load_env = real_le2
+check("11-2) 연구 CLI의 make_client 기본 출력은 그대로 print", c_default.log is print)
+with WatchStore(EO["paths"].watch_db) as _w:
+    pass
+EQ2 = env("o1_exit", datetime(2026, 10, 7, 12, 0), [S_5930])
+argsQ = ["--config", str(EQ2["paths"].config), "--watch-db", str(EQ2["paths"].watch_db), "--db",
+         str(EQ2["paths"].research_db), "--daemon-db", str(EQ2["paths"].daemon_db), "--watch-scan-db",
+         str(EQ2["paths"].watch_scan_db), "--watch-open-db", str(EQ2["paths"].watch_open_db), "--report-dir",
+         str(EQ2["paths"].report_dir), "--log-file", str(EQ2["paths"].log_file), "run", "--max-ticks", "0"]
+
+
+def _boom_stop(self, *a, **k):
+    self.dstore.close()
+    raise sqlite3.OperationalError("disk I/O error(시험)")
+
+
+def _boom_run(self, **k):
+    raise sqlite3.DatabaseError("시험 — 루프 중 예외")
+
+
+exits = {}
+real_stop, real_run = D.WatchDaemon.stop, D.WatchDaemon.run_forever
+for label, stop_fn, run_fn in (("정상", None, None), ("종료 저장 실패", _boom_stop, None), ("예외·저장 성공", None, _boom_run),
+                               ("예외·저장 실패", _boom_stop, _boom_run)):
+    if stop_fn:
+        D.WatchDaemon.stop = stop_fn
+    if run_fn:
+        D.WatchDaemon.run_forever = run_fn
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            exits[label] = WD.main(argsQ, client=EQ2["client"], now=EQ2["clock"], calendar=CAL, log=lambda m: None)
+    except sqlite3.DatabaseError as exc:
+        exits[label] = f"raise {type(exc).__name__}"
+    finally:
+        D.WatchDaemon.stop, D.WatchDaemon.run_forever = real_stop, real_run
+    exits[label] = (exits[label], "[경고] 관리자 종료 상태 저장 실패" in buf.getvalue())
+    EQ2["client"].guard = None
+fin_ret = []
+for f in ROOT.rglob("*.py"):
+    if ".git" in f.parts:
+        continue
+    for node in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Try):
+            fin_ret += [(f.name, m.lineno) for s_ in node.finalbody for m in ast.walk(s_)
+                        if isinstance(m, (ast.Return, ast.Break, ast.Continue))]
+check("11-3) finally 안 return 정리(Python 3.14 SyntaxWarning): 레포 전체에 finally 안 return/break/continue 없음, 종료 코드·예외 전파는 "
+      "이전과 같음 — 정상 0, 종료 상태 저장 실패 1(경고), 루프 예외는 그대로 올라감, 예외 중 저장도 실패하면 1(경고)",
+      fin_ret == [] and exits == {"정상": (0, False), "종료 저장 실패": (1, True),
+                                  "예외·저장 성공": ("raise DatabaseError", False), "예외·저장 실패": (1, True)})
+
+
 # ── 8. 상태·로그·경계 ─────────────────────────────────────
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):

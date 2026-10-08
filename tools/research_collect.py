@@ -116,14 +116,15 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def make_client(args, **kw):
+def make_client(args, *, log=print, **kw):
+    """조회 클라이언트. log: 클라이언트 메시지(인증·재발급·재시도) 출력 — 기본 print(연구 CLI 그대로), 관리자는 자기 log를 넘김."""
     import requests
     env = load_env(Path(args.env_file))
     key, secret = env.get("KIWOOM_APP_KEY", ""), env.get("KIWOOM_SECRET_KEY", "")
     if not key or not secret:
         raise ResearchConfigError("KIWOOM_APP_KEY / KIWOOM_SECRET_KEY가 .env에 없음")
     return ReadOnlyResearchClient(requests.Session(), args.base_url, key, secret, min_interval_sec=args.sleep,
-                                  log=print, **kw)
+                                  log=log, **kw)
 
 
 class _LazyClient:
