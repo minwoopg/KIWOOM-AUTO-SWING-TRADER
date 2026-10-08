@@ -1660,4 +1660,34 @@ GPT가 `0a52c35`에서, wd2에서 이미 확정한 미완료 개장 후보를 �
 ### 전달 파일
 - 패치 0001 (fix: E1) — 기준 `01a0aad`
 
+## 2026-10-08 — O1 인증 로그를 관리자 로그 파일에, finally 안 return 정리 (GPT 검토 `9aa573f`)
+
+### 배경
+운영 중 확인: `watch_daemon.py` 실행마다 `SyntaxWarning: 'return' in a 'finally' block`(Python 3.14 — PEP 765). GPT 검토 O1:
+CLI factory `make_client`가 `log=print` 고정이라 인증·재발급 줄이 콘솔에만 나오고 `logs/watch_daemon.log`·번들에서 빠짐.
+사용자 실측(별도 universe 조회): `expires_dt` 14자 문자열·해석 성공. 관리자 장기 실행의 갱신은 미실측.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `tools/research_collect.py` | `make_client(args, *, log=print, **kw)` — 기본 print 그대로(연구 CLI·watchlist) |
+| `tools/watch_daemon.py` | 지연 생성 클라이언트에 관리자 `log` 연결(시각·가림·로그 파일) — guard·예산·지연 생성 그대로. finally 안 `return 1`을 `_stop_daemon()`로 정리 — 종료 코드·예외 전파 동일(정상 0, 종료 상태 저장 실패 1, 루프 예외 전파, 예외 중 저장 실패 1) |
+| `test_watch_daemon.py` | 11-1~11-3 |
+| `docs/watch_daemon.md` | 인증 줄 위치, 같은 프로세스 갱신 관찰 조건, 콘솔 로그 번들 포함 |
+
+### 테스트 및 검증
+- 11-1: 실제 CLI factory 경로(가짜 키·가짜 세션·가짜 시계만 주입)로 최초 발급·만료 임박 재발급·401 재인증이 로그 파일에 시각과 함께
+  남고 토큰·앱키·비밀키 값은 없음, 토큰 발급도 요청 예산에 포함. 11-3: 레포 전체 finally 안 return/break/continue 없음 + 종료 코드 4경우.
+  `9aa573f`에서 11-1·11-3 실패, 11-2(연구 CLI 기본 print)는 보호 시험.
+- Python 3.14.0rc2(정식 3.14.x 아님)에서 레포 전체 컴파일 SyntaxWarning 0건(이전 코드 1건), 회귀 33/33·관리자 81·지정 종목 60.
+- Python 3.11: 회귀 33/33(`test_broker_order_status.py` 제외 — 실측 fixture 없음, 통과로 세지 않음), 수집 120(실측 원문 JSONL),
+  스캔 56, A5 45, S1 49, 지정 종목 60, 관리자 81. 동등성·변이는 이번에 다시 돌리지 않음.
+- **미실측**: 관리자 프로세스의 만료 갱신·401 재인증, 마감 준비 → 다음 개장 확인.
+
+### 변경하지 않은 것
+- 전략·게이트·예산·작업 계획·DB 형식, 연구 CLI 출력, 주문 경로.
+
+### 전달 파일
+- 패치 0001 (fix: O1·finally), 0002 (docs) — 기준 `9aa573f`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

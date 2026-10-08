@@ -193,7 +193,8 @@ python tools/watch_daemon.py stop; python tools/watch_daemon.py status; python t
 |---|---|
 | 작업별 due·실제 요청/수신·완료 시각, 호출 수, 지연·누락·차단 사유 | `status --json`, `reports/watch/daily/`, 로그 |
 | 후보 근거(계산 PASS vs 운영 게이트 제외 사유)·설정 버전·계약 | 일일 보고서 '운영 진입 게이트', `reports/watch/open/` |
-| 토큰 `expires_dt` — **필드 존재·형식만**(로그는 타입·길이·해석 결과만 남김) | 로그 `[인증] 토큰 발급` 줄 |
+| 토큰 `expires_dt` — **필드 존재·형식만**(로그는 타입·길이·해석 결과만 남김) | 관리자 로그 `[인증] 토큰 발급`·`[RESEARCH] … 토큰 다시 발급` 줄(O1 이후 `logs/watch_daemon.log`에도 기록 — 그 전 실행분은 콘솔에만) |
+| 같은 프로세스의 만료 갱신 | 갱신은 **실제 요청 직전**에만 검사(백그라운드 타이머 없음) — 휴장일처럼 요청이 없으면 24시간 켜 둬도 사건이 없을 수 있고 실패가 아님. run_id가 같은 채로 만료 10분 전 이후 첫 요청에서 `토큰 만료 임박 … 다시 발급`이 나오면 관찰한 것. 재기동 뒤 첫 발급은 이와 별개(run_id·시각으로 구분). 일어나지 않은 경로는 미실측 |
 | 24시간 이상 유지 뒤 인증 갱신, 자정 전환, 휴장일 흐름 | 로그·status |
 | 160분 완성 기준: 마감 뒤 여러 시각과 다음 거래일의 같은 날짜 OHLCV·거래대금 대조 | `research_collect.py` 조회 결과(별도 작업) |
 
@@ -207,6 +208,7 @@ Get-Date -Format o > exports\watch_$d\bundle_time.txt                        # �
 python tools/watch_daemon.py status --json > exports\watch_$d\status.json    # 달력 버전·설정 버전·호출 수·작업·KST 시각
 python tools/watchlist.py status > exports\watch_$d\watchlist_status.txt
 Copy-Item logs\watch_daemon.log exports\watch_$d\ -ErrorAction SilentlyContinue
+Copy-Item logs\watch_console_*.log exports\watch_$d\ -ErrorAction SilentlyContinue  # 콘솔을 따로 저장했다면(O1 적용 전 실행분의 인증 줄)
 Copy-Item -Recurse reports\watch exports\watch_$d\reports -ErrorAction SilentlyContinue
 python tools/watch_daemon.py export-db --out exports\watch_$d\db           # 관리자·S1 관찰·개장 확인 DB 사본(SQLite 백업 API)
 # 지정 단어가 든 줄을 찾아 눈으로 확인하는 보조 수단 — 결과가 없다고 민감정보가 없다는 자동 판정은 아님
