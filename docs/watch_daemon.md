@@ -220,6 +220,8 @@ Compress-Archive -Force exports\watch_$d exports\watch_bundle_$d.zip
   `watchlist.py status` 출력만.
 - `export-db`는 파일마다 일관된 사본(실행 중이어도)이고 복사 시각을 `export_db.json`에 남김. 세 사본이 **같은 시점**이라는 보장은
   없음 — 같은 시점이 필요하면 `stop` → status '중지됨' 확인 → `export-db` → 다시 `run`.
+- `--out`은 원본 DB 폴더(`data\watch`)가 아닌 곳으로. 대상이 원본·감시 설정 DB·연구 DB와 같은 파일이거나 서로 다른 원본의 대상
+  이름이 겹치면 복사 전에 거부(종료 코드 2, 아무것도 복사 안 함).
 - 실행 옵션(상한·예약·poll·완성 지연·개장 offset)·달력 버전·스키마는 관리자 시작 로그 줄에, 계약·설정 버전·게이트 사유(SCAN·OPEN·
   RESUME)·호출 수는 `daemon.sqlite3`(task·candidate_gate·call_usage)와 일일 보고서에 있음.
 

@@ -180,15 +180,48 @@ def cmd_status(args, *, now, calendar) -> int:
     return 0
 
 
+def _same_file(a: Path, b: Path) -> bool:
+    """같은 파일인지 — 둘 다 있으면 OS 기준(심볼릭·하드 링크 포함), 아니면 실제 경로(대소문자는 OS 규칙) 비교."""
+    try:
+        if a.exists() and b.exists():
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def export_conflicts(sources, out: Path, *, protected=()) -> list[str]:
+    """export-db 예정 경로 사전 검사: 대상이 원본(또는 보호 DB)과 같은 파일, 서로 다른 원본의 대상 이름 충돌이면 사유 목록."""
+    out_msgs, seen = [], {}
+    existing = [s for s in sources if s.exists()]
+    for src in existing:
+        dest = out / src.name
+        key = os.path.normcase(dest.name)
+        if key in seen and not _same_file(seen[key], src):
+            out_msgs.append(f"대상 이름 충돌: {seen[key]} 와 {src} 가 모두 {dest}로 복사됨")
+        seen[key] = src
+        for other in (*sources, *protected):
+            if other is not None and _same_file(dest, Path(other)):
+                out_msgs.append(f"대상 {dest}이(가) 원본/보호 DB {other}와 같은 파일")
+    return out_msgs
+
+
 def cmd_export_db(args, *, now) -> int:
     """daemon·watch_s1·watch_open DB를 SQLite 백업 API로 복사(실행 중이어도 각 파일은 일관된 사본). 파일마다 복사 시작·끝 시각을
     남김 — 세 사본이 같은 시점이라는 보장은 없음(같은 시점이 필요하면 관리자를 stop한 뒤 실행). 감시 설정 DB(watch.sqlite3 —
     수동 보유 원문)와 연구 DB는 넣지 않음."""
     p = paths_of(args)
     out = Path(args.out)
+    sources = (p.daemon_db, p.watch_scan_db, p.watch_open_db)
+    problems = export_conflicts(sources, out, protected=(p.watch_db, p.research_db))
+    if problems:                                     # 복사 전에 전체 경로를 검사 — 원본에 쓰거나 일부만 복사하지 않음 (E1)
+        for m in problems:
+            print(f"[거부] {m}")
+        print("원본 DB 폴더가 아닌 다른 폴더를 --out으로 지정하세요(예: exports\\watch_<날짜>\\db). 아무것도 복사하지 않았습니다.")
+        return 2
     out.mkdir(parents=True, exist_ok=True)
     rows, rc = [], 0
-    for path in (p.daemon_db, p.watch_scan_db, p.watch_open_db):
+    for path in sources:
         if not path.exists():
             rows.append({"file": path.name, "status": "MISSING"})
             continue

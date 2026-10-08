@@ -1505,6 +1505,28 @@ check("8-6) export-db: 관리자·관찰·개장 확인 DB를 SQLite 백업 API�
       rc_exp == 0 and n_a == n_b > 0 and sorted(r["file"] for r in exp_meta["files"]) ==
       ["daemon.sqlite3", "watch_open.sqlite3", "watch_s1.sqlite3"] and all(r["status"] == "OK" for r in exp_meta["files"])
       and not (exp_dir / "watch.sqlite3").exists())
+import hashlib as _hl  # noqa: E402
+_dig = {f: _hl.sha256((E1["dir"] / f).read_bytes()).hexdigest() for f in ("daemon.sqlite3", "watch_s1.sqlite3",
+                                                                           "watch_open.sqlite3")}
+_t0 = time.monotonic()
+try:
+    rc_same, out_same = proc(E1, "export-db", "--out", str(E1["dir"]))
+except subprocess.TimeoutExpired:
+    rc_same, out_same = None, "TIMEOUT"
+el_same = time.monotonic() - _t0
+other = TMP / "export_clash"
+other.mkdir()
+shutil.copy(E1["paths"].watch_scan_db, other / "daemon.sqlite3")      # 다른 원본인데 대상 이름이 같음
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    rc_clash = WD.main(["--daemon-db", str(E1["paths"].daemon_db), "--watch-scan-db", str(other / "daemon.sqlite3"),
+                        "--watch-open-db", str(E1["paths"].watch_open_db), "export-db", "--out",
+                        str(TMP / "export_clash_out")], calendar=CAL)
+check("8-7) export-db 경로 보호(E1): --out이 원본 DB 폴더(대상 = 원본과 같은 파일)면 복사 전에 거부·종료 코드 2·즉시 끝남, 원본 바이트 "
+      "그대로. 서로 다른 원본의 대상 이름 충돌도 거부하고 아무것도 복사하지 않음. 정상 exports 경로(8-6)는 그대로",
+      rc_same == 2 and "[거부]" in out_same and el_same < 30
+      and {f: _hl.sha256((E1["dir"] / f).read_bytes()).hexdigest() for f in _dig} == _dig
+      and rc_clash == 2 and "대상 이름 충돌" in buf.getvalue() and not (TMP / "export_clash_out").exists())
 check("8-4) 테스트 산출물은 임시 폴더에만 — 레포에 data/·commands/·reports/·logs/ 변화 없음",
       {p: _fs(p) for p in ("data", "commands", "reports", "logs")} == FS_BEFORE)
 
