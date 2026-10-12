@@ -57,10 +57,13 @@ def snapshot(root: Path) -> dict:
             for p in sorted(root.rglob("*")) if p.is_file()}
 
 
+RC: list[int] = []
+
+
 def run(*argv) -> str:
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        diag_w2.main(list(argv))
+        RC.append(diag_w2.main(list(argv)))
     return buf.getvalue()
 
 
@@ -96,6 +99,32 @@ check("3) '그 시각 기준' 조회 시각 = 그 신호일 CLOSE_PREP가 기록
       and "as_of=2026-10-12 18:10:06 [--as-of 지정]" in out3b and "18:10:07 [" not in out3b)
 check("4) 그 신호일의 준비 완료 기록이 없으면 시각을 추정하지 않음 — 지금(현재 revision)만 보여 주고 --as-of 안내",
       "시각을 추정하지 않음" in out3c and "as_of=None [지금(현재 revision)]" in out3c and "[준비 실행" not in out3c)
+
+# 5. 판정 기준 시각이 기록돼 있으면 그 값(정확)을 씀
+R5 = make_root("evaluated")
+with WatchStore(R5 / "data/watch/watch.sqlite3") as w:
+    rid5 = w.prepare_runs(1)[0]["run_id"]
+    w.finish_prepare(rid5, datetime(2026, 10, 12, 18, 10, 7), "COMPLETE", {}, evaluated_as_of=datetime(2026, 10, 12, 18, 10, 7))
+out5 = run("005930", "2026-10-12", "--root", str(R5))
+check("5) 준비 실행에 판정 기준 시각(evaluated_as_of)이 있으면 그 값(기록값)으로 조회 — 완료 시각 근사보다 우선",
+      "as_of=2026-10-12 18:10:07 [준비 실행" in out5 and "판정 기준 시각(기록값)" in out5)
+
+# 6. 입력 검증·요약·종료 코드
+before6 = snapshot(R1)
+out6a = run("005930", "2026-10-12", "--root", str(R1), "--as-of", "2026-10-12T18:10:06+09:00")
+rc6a = RC[-1]
+out6b = run("005930", "2026-13-40", "--root", str(R1))
+rc6b = RC[-1]
+run("005930", "2026-10-12", "--root", str(R1))
+rc6c = RC[-1]
+out6d = run("005930", "2026-10-12", "--root", str(R0))
+rc6d = RC[-1]
+check("6) 입력 검증: 시간대가 붙은 --as-of·잘못된 신호일은 사용법 오류(종료 코드 2, 아무것도 열지 않음)",
+      rc6a == 2 and "시간대" in out6a and rc6b == 2 and "사용법 오류" in out6b and snapshot(R1) == before6)
+out6c = run("005930", "2026-10-12", "--root", str(R1))
+check("7) 끝에 구역별 요약과 종료 코드 — 빠진 DB·시계열이 있으면 MISSING으로 표시하고 1(부분 진단), 성공처럼 0을 내지 않음",
+      rc6c == 1 and "series MISSING(시계열 없음)" in out6c and "watch OK" in out6c
+      and rc6d == 1 and "## 요약:" in out6d and "watch MISSING" in out6d and "부분 진단" in out6d)
 
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)

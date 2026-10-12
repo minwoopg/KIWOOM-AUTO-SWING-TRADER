@@ -360,25 +360,29 @@ def entry_gate(state: WatchState, sym: WatchSymbol, ready: dict | None, risk: di
 
 
 # ── 데이터 준비 실행 ─────────────────────────────────────────
+CLOCK_NOT_SETTLED = "CLOCK_NOT_SETTLED"
+
+
 def settle_after_writes(now: Callable[[], datetime], sleep: Callable[[float], None],
-                        log: Callable[[str], None] = lambda m: None) -> datetime:
+                        log: Callable[[str], None] = lambda m: None) -> tuple[datetime, bool]:
     """방금 저장한 봉이 '그 시각에 쓸 수 있던 값'으로 보일 때까지 기다림 (W2 실측 10/8 — 005930 STALE).
     봉의 확보 시각은 초 미만을 올려 기록하고(_ts_up) 조회 기준 시각은 초 미만을 버리므로(as_of), 저장 직후 같은 초에 판정하면
     마지막에 받은 대상이 아직 없는 것으로 보임. 그래서 지금 시각을 초 단위로 올린 경계까지(최대 1초 남짓) 기다린 뒤 판정.
-    반환: 판정에 쓸 수 있는 가장 이른 시각.
-    대기 상한: 한 번에 최대 0.25초 × 12번(약 3초). 벽시계가 뒤로 움직이는 등으로 경계에 못 가면 시각을 앞으로 만들지 않고 지금
-    시각으로 판정 — 그때 막 받은 대상은 보류(STALE)로 남고 다음 준비가 다시 판정 — 그리고 사유를 로그에 남김."""
+    반환: (지금 시각, 경계에 닿았는지).
+    대기 상한: 한 번에 최대 0.25초 × 12번(약 3초). 벽시계가 뒤로 움직이는 등으로 경계에 못 가면 시각을 앞으로 만들지 않고
+    (지금, False) — 호출자(prepare_data)는 판정하지 않고 YIELDED(CLOCK_NOT_SETTLED)로 끝내 관리자가 나중에 다시 시도."""
     t = now()
     boundary = t.replace(microsecond=0) + timedelta(seconds=1) if t.microsecond else t
     for _ in range(12):
         cur = now()
         if cur >= boundary:
-            return cur
+            return cur, True
         sleep(min(0.25, max(0.01, (boundary - cur).total_seconds())))
     cur = now()
     if cur < boundary:
-        log(f"[준비] 판정 전 대기 상한 — 시계가 {boundary}에 닿지 않음(지금 {cur}); 막 받은 봉은 보류로 남을 수 있음")
-    return cur
+        log(f"[준비] 판정 전 대기 상한 — 시계가 {boundary}에 닿지 않음(지금 {cur}); 판정하지 않고 나중에 다시")
+        return cur, False
+    return cur, True
 
 
 
@@ -438,9 +442,17 @@ def prepare_data(wstore: WatchStore, rstore: ResearchStore, collector, calendar:
         status = "FAILED"
         wstore.finish_prepare(run_id, now(), status, {"fetch": tally}, f"{type(exc).__name__}: {exc}"[:300])
         raise
-    settle_after_writes(now, sleep or time.sleep, log)
-    rows = evaluate_readiness(rstore, calendar, cfg, listing, now=now(), after_close=after_close, fetch=fetch)
-    changed = wstore.set_readiness(rows, version=version, run_id=run_id, at=now())
+    _, settled = settle_after_writes(now, sleep or time.sleep, log)
+    if not settled:
+        # 시각이 안정되지 않음 — 판정·저장하지 않음(이전 준비 상태 그대로). 받은 봉은 저장돼 있어 다음 시도는 다시 받지 않음
+        reason = yielded or CLOCK_NOT_SETTLED
+        counts = {"fetch": tally, "not_fetched": len(targets) - len(fetch)}
+        wstore.finish_prepare(run_id, now(), "YIELDED", counts, reason)
+        return {"run_id": run_id, "config_version": version, "status": "YIELDED", "counts": counts,
+                "calls": getattr(collector.client, "calls", None), "rows": [], "yield_reason": reason}
+    as_of = now()
+    rows = evaluate_readiness(rstore, calendar, cfg, listing, now=as_of, after_close=after_close, fetch=fetch)
+    changed = wstore.set_readiness(rows, version=version, run_id=run_id, at=as_of)
     ready: dict[str, int] = {}
     for r in rows:
         k = f"{r['status']}/{r['analysis_status']}"
@@ -451,6 +463,6 @@ def prepare_data(wstore: WatchStore, rstore: ResearchStore, collector, calendar:
         status = "PARTIAL"
     counts = {"fetch": tally, "readiness": ready, "changed": changed,
               "not_fetched": len(targets) - len(fetch)}
-    wstore.finish_prepare(run_id, now(), status, counts, yielded)
+    wstore.finish_prepare(run_id, now(), status, counts, yielded, evaluated_as_of=as_of)
     return {"run_id": run_id, "config_version": version, "status": status, "counts": counts,
             "calls": getattr(collector.client, "calls", None), "rows": rows, "yield_reason": yielded}

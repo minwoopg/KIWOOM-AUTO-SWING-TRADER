@@ -17,6 +17,7 @@ readiness는 가격 데이터 준비(status)와 S1 분석 준비(analysis_status
 트랜잭션(`tx`)은 다시 들어갈 수 있음(W1d-R1) — 바깥 `with tx():` 안에서 부른 메서드는 같은 트랜잭션에 묶이고
 바깥 블록의 COMMIT 한 번으로 확정, 예외면 전부 ROLLBACK.
 wa1 → wa2: 열 때 백업 후 열·표 추가(기존 기록 그대로, 분석 준비는 다음 준비 때 채움).
+wa2 → wa3: 열 때 백업 후 prepare_run.evaluated_as_of(준비 판정에 실제로 쓴 조회 기준 시각) 열 추가 — 이전 행은 NULL(추정 안 함).
 연구 수집 DB(research.sqlite3)와 별도 파일 — 시세·일봉은 연구 DB를 함께 씀(다시 받지 않음).
 """
 
@@ -26,7 +27,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-WATCH_DB_SCHEMA = "wa2"
+WATCH_DB_SCHEMA = "wa3"
 APPLIED, REJECTED = "APPLIED", "REJECTED"
 
 _SCHEMA = """
@@ -46,7 +47,7 @@ CREATE TABLE IF NOT EXISTS readiness_log(
 CREATE TABLE IF NOT EXISTS prepare_run(
   seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT UNIQUE, config_version INTEGER NOT NULL,
   started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, targets_json TEXT NOT NULL DEFAULT '[]',
-  counts_json TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '');
+  counts_json TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '', evaluated_as_of TEXT);
 """
 _SCHEMA_WA2 = """
 CREATE TABLE IF NOT EXISTS config_check(
@@ -83,9 +84,12 @@ class WatchStore:
         if cur is None:
             self.conn.executescript(_SCHEMA_WA2)
             self.conn.execute("INSERT INTO meta(key, value) VALUES('watch_schema', ?)", (WATCH_DB_SCHEMA,))
-        elif cur[0] == "wa1":
+            return
+        version = cur[0]
+        if version in ("wa1", "wa2"):
             from infra.research.store import sqlite_backup
-            self.backup_path = sqlite_backup(self.conn, self.path, "wa1")
+            self.backup_path = sqlite_backup(self.conn, self.path, version)
+        if version == "wa1":
             with self.tx():
                 for t in ("readiness", "readiness_log"):
                     cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({t})")}
@@ -95,9 +99,16 @@ class WatchStore:
                 for stmt in _SCHEMA_WA2.strip().split(";"):
                     if stmt.strip():
                         self.conn.execute(stmt)
+                self.conn.execute("UPDATE meta SET value='wa2' WHERE key='watch_schema'")
+            version = "wa2"
+        if version == "wa2":
+            with self.tx():
+                if "evaluated_as_of" not in {r[1] for r in self.conn.execute("PRAGMA table_info(prepare_run)")}:
+                    self.conn.execute("ALTER TABLE prepare_run ADD COLUMN evaluated_as_of TEXT")
                 self.conn.execute("UPDATE meta SET value=? WHERE key='watch_schema'", (WATCH_DB_SCHEMA,))
-        elif cur[0] != WATCH_DB_SCHEMA:
-            raise RuntimeError(f"감시 저장소 스키마 {cur[0]} ≠ {WATCH_DB_SCHEMA}: {self.path}")
+            version = WATCH_DB_SCHEMA
+        if version != WATCH_DB_SCHEMA:
+            raise RuntimeError(f"감시 저장소 스키마 {version} ≠ {WATCH_DB_SCHEMA}: {self.path}")
 
     def close(self) -> None:
         self.conn.close()
@@ -273,9 +284,12 @@ class WatchStore:
             self.conn.execute("UPDATE prepare_run SET run_id=? WHERE seq=?", (run_id, seq))
         return run_id
 
-    def finish_prepare(self, run_id: str, at: datetime, status: str, counts: dict, note: str = "") -> None:
-        self.conn.execute("UPDATE prepare_run SET finished_at=?, status=?, counts_json=?, note=? WHERE run_id=?",
-                          (_ts(at), status, json.dumps(counts, ensure_ascii=False), note, run_id))
+    def finish_prepare(self, run_id: str, at: datetime, status: str, counts: dict, note: str = "", *,
+                       evaluated_as_of: datetime | None = None) -> None:
+        """evaluated_as_of: 준비 판정에 실제로 쓴 조회 기준 시각(초 미만 버림 — 연구 조회 as_of와 같은 기준). 판정을 안 했으면 NULL."""
+        self.conn.execute("UPDATE prepare_run SET finished_at=?, status=?, counts_json=?, note=?, evaluated_as_of=?"
+                          " WHERE run_id=?", (_ts(at), status, json.dumps(counts, ensure_ascii=False), note,
+                                              _ts(evaluated_as_of), run_id))
 
     def prepare_runs(self, limit: int = 10) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM prepare_run ORDER BY seq DESC LIMIT ?", (limit,))]

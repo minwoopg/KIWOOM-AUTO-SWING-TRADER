@@ -285,17 +285,21 @@ def cmd_doctor(args, *, runner=None) -> int:
 
 
 def code_version() -> str:
-    """시작 시점 Git HEAD와 추적 파일 로컬 수정 여부(읽기만). git이 없거나 실패하면 '확인 불가'."""
-    try:
-        head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short=12", "HEAD"], capture_output=True,
-                              text=True, timeout=10).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
-                               capture_output=True, text=True, timeout=10).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return "HEAD 확인 불가"
+    """시작 당시 체크아웃의 Git HEAD와 추적 파일 로컬 수정 여부(읽기만). 명령마다 반환 코드를 확인 — 실패는 '확인 불가'로
+    표시(정상처럼 보이지 않게). 미추적 파일(새 .py 등)은 보지 않음 — 실행 코드 식별의 한계."""
+    def git(*a):
+        try:
+            r = subprocess.run(["git", "-C", str(ROOT), *a], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+    head = git("rev-parse", "--short=12", "HEAD")
     if not head:
         return "HEAD 확인 불가"
-    return f"HEAD {head}" + (" (추적 파일 로컬 수정 있음)" if dirty else "")
+    dirty = git("status", "--porcelain", "--untracked-files=no")
+    if dirty is None:
+        return f"HEAD {head} (추적 파일 수정 여부 확인 불가)"
+    return f"HEAD {head}" + (" (추적 파일 로컬 수정 있음)" if dirty else " (추적 파일 수정 없음)")
 
 
 def _stop_daemon(d, state: str, err: str) -> bool:
@@ -358,8 +362,8 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
             d = WatchDaemon(p, calendar, client, settings=settings, now=now, sleep=sleep, log=log)
             holder["d"] = d
             d.start()
-            d.log(f"[관리자] 실행 코드 {code_version()} · Python {sys.version.split()[0]} (시작 시점 기록 — 실행 중 파일이 "
-                  "바뀌어도 이 프로세스는 시작할 때 읽은 코드로 동작)")
+            d.log(f"[관리자] 실행 코드 {code_version()} · Python {sys.version.split()[0]} (시작 당시 체크아웃 정보 — "
+                  "실행 중 바뀐 파일은 반영하지 않은 기록이므로 업데이트는 stop → 적용 → run 순서로)")
             state, err = "STOPPED", ""
             try:
                 if args.until_idle:

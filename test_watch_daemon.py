@@ -1490,7 +1490,8 @@ check("11-1) O1 실제 CLI factory 경로(make_client·지연 생성·guard 그�
       and any("[인증]" in m for m in console_o1)
       and D.DaemonStore(EO["paths"].daemon_db).calls(date(2026, 10, 7)) == len(EO["fake"].calls) + EO["fake"].tokens - tok0_o1)
 check("11-4) 관리자 시작 로그에 실행 코드(Git HEAD·추적 파일 로컬 수정 여부)·Python 버전 — 시작 시점 기록임을 표시",
-      "[관리자] 실행 코드 HEAD " in log_o1 and " · Python " in log_o1 and "시작 시점 기록" in log_o1)
+      "[관리자] 실행 코드 HEAD " in log_o1 and " · Python " in log_o1 and "시작 당시 체크아웃 정보" in log_o1
+      and ("수정 없음)" in log_o1 or "수정 있음)" in log_o1 or "확인 불가)" in log_o1))
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     real_le2 = RC.load_env
@@ -1579,7 +1580,7 @@ t_settle = WM.settle_after_writes(ck, ck.sleep)
 ck2 = Clock(datetime(2026, 10, 8, 18, 10, 6))
 t_settle2 = WM.settle_after_writes(ck2, ck2.sleep)
 check("12-2) 판정 전 대기: 18:10:06.134632면 18:10:07까지(1초 미만) 기다린 뒤 판정, 정각이면 기다리지 않음",
-      t_settle == datetime(2026, 10, 8, 18, 10, 7) and t_settle2 == datetime(2026, 10, 8, 18, 10, 6))
+      t_settle == (datetime(2026, 10, 8, 18, 10, 7), True) and t_settle2 == (datetime(2026, 10, 8, 18, 10, 6), True))
 
 
 class _StuckClock:                                            # 벽시계가 경계에 닿지 않음(뒤로 감 등) — sleep해도 그대로
@@ -1598,8 +1599,92 @@ _logs = []
 t_stuck = WM.settle_after_writes(_sc, _sc.sleep, _logs.append)
 check("12-3) 판정 전 대기 상한: 시계가 경계에 닿지 않아도 약 3초(0.25초 × 12) 안에 끝나고 시각을 앞으로 만들지 않음(지금 시각 반환), "
       "사유를 로그에 남김",
-      t_stuck == datetime(2026, 10, 12, 18, 10, 6, 500000) and len(_sc.slept) == 12 and max(_sc.slept) <= 0.25
+      t_stuck == (datetime(2026, 10, 12, 18, 10, 6, 500000), False) and len(_sc.slept) == 12 and max(_sc.slept) <= 0.25
       and sum(_sc.slept) <= 3.0 and _logs and "대기 상한" in _logs[0])
+
+# CLOCK_NOT_SETTLED: 시계가 경계에 못 가면 판정·S1 관찰 없이 YIELDED, poll 뒤 다시 → 정상화되면 READY·정상 관찰
+ECL = env("clock_stuck", datetime(2026, 10, 7, 19, 0, 0, 300000), [S_5930])
+ECL["fake"].tick = timedelta(milliseconds=100)
+_mode = {"stuck": False}
+dCL = D.WatchDaemon(ECL["paths"], CAL, ECL["client"], settings=D.DaemonSettings(), now=ECL["clock"],
+                    sleep=lambda s_: None if _mode["stuck"] else ECL["clock"].sleep(s_), log=lambda m: None,
+                    hook=lambda p: _mode.update(stuck=True) if p == "after_list" else None)
+dCL.start()
+dCL.dstore.set_meta("since", "2026-10-07")
+dCL.dstore.conn.execute("DELETE FROM task")
+dCL.tick()
+rCL1 = dCL.tick()
+tCL1 = tasks(ECL)[("CLOSE_PREP", "2026-10-07")]
+with ScanStore(ECL["paths"].watch_scan_db) as _ss:
+    runsCL1 = _ss.runs("2026-10-07")
+with WatchStore(ECL["paths"].watch_db) as _w:
+    prCL1 = _w.prepare_runs(1)[0]
+    rdCL1 = _w.readiness().get("STOCK:005930")
+rCL_early = dCL.tick()
+_mode["stuck"] = False
+dCL.hook = lambda p: None
+at(ECL, ECL["clock"].t + timedelta(seconds=61))
+rCL2 = dCL.tick()
+tCL2 = tasks(ECL)[("CLOSE_PREP", "2026-10-07")]
+with WatchStore(ECL["paths"].watch_db) as _w:
+    prCL2 = _w.prepare_runs(1)[0]
+dCL.stop()
+check("12-4) 시계가 초 경계에 닿지 않으면(정지·역행) 준비를 YIELDED(CLOCK_NOT_SETTLED)로 끝내고 판정·S1 관찰을 만들지 않음, poll 뒤 "
+      "다시 시도(즉시 반복 없음) → 시계 정상화 뒤 READY·S1 PASS·COMPLETE. 이전 코드는 COMPLETE·UNKNOWN·재시도 없음",
+      rCL1["status"] == "YIELDED" and tCL1["detail"]["yield"] == "CLOCK_NOT_SETTLED" and tCL1["next_retry_at"] is not None
+      and tCL1["failures"] == 0 and runsCL1 == [] and prCL1["status"] == "YIELDED" and prCL1["evaluated_as_of"] is None
+      and rdCL1 is None and rCL_early["ran"] is None
+      and rCL2["status"] == "COMPLETE" and tCL2["detail"]["prepare"]["counts"]["readiness"] == {"READY/READY": 3}
+      and tCL2["detail"]["s1"]["counts"]["by_signal"] == {"PASS": 1} and prCL2["evaluated_as_of"] is not None)
+with WatchStore(E1["paths"].watch_db) as _w:
+    _pr = [r for r in _w.prepare_runs(10) if r["status"] == "COMPLETE"][0]
+    _rd = _w.readiness()["STOCK:005930"]
+check("12-5) 준비 실행에 판정 기준 시각(evaluated_as_of)을 따로 기록 — readiness.checked_at과 같은 시각, 완료 시각과 구분",
+      _pr["evaluated_as_of"] is not None and _pr["evaluated_as_of"] <= _pr["finished_at"])
+EW = TMP / "wa2_migrate"
+EW.mkdir()
+with WatchStore(EW / "watch.sqlite3") as _w:
+    _rid = _w.begin_prepare(1, datetime(2026, 10, 8, 18, 10, 3), ["STOCK:005930"])
+    _w.finish_prepare(_rid, datetime(2026, 10, 8, 18, 10, 7), "COMPLETE", {})
+with sqlite3.connect(EW / "watch.sqlite3") as cx:                 # 이전 판(wa2): evaluated_as_of 열 없음
+    _cols = [r[1] for r in cx.execute("PRAGMA table_info(prepare_run)") if r[1] != "evaluated_as_of"]
+    cx.execute("ALTER TABLE prepare_run RENAME TO pr_new")
+    cx.execute("""CREATE TABLE prepare_run(
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT UNIQUE, config_version INTEGER NOT NULL,
+      started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, targets_json TEXT NOT NULL DEFAULT '[]',
+      counts_json TEXT NOT NULL DEFAULT '{}', note TEXT NOT NULL DEFAULT '')""")
+    cx.execute(f"INSERT INTO prepare_run({', '.join(_cols)}) SELECT {', '.join(_cols)} FROM pr_new")
+    cx.execute("DROP TABLE pr_new")
+    cx.execute("UPDATE meta SET value='wa2' WHERE key='watch_schema'")
+with WatchStore(EW / "watch.sqlite3") as _w:
+    _bk, _old = _w.backup_path, _w.prepare_runs(1)[0]
+    _ver = _w.conn.execute("SELECT value FROM meta WHERE key='watch_schema'").fetchone()[0]
+check("12-6) 감시 DB wa2 → wa3: 열기 전에 백업, prepare_run.evaluated_as_of 열 추가, 이전 행은 NULL(완료 시각으로 추정해 채우지 않음)",
+      _ver == "wa3" and _bk and Path(_bk).exists() and _old["evaluated_as_of"] is None and _old["finished_at"])
+
+_real_run = WD.subprocess.run
+
+
+def _fake_git(rc_head, rc_status, out_status=""):
+    def run_(cmd, **kw):
+        if "rev-parse" in cmd:
+            return subprocess.CompletedProcess(cmd, rc_head, "abc123def456\n" if rc_head == 0 else "", "")
+        return subprocess.CompletedProcess(cmd, rc_status, out_status if rc_status == 0 else "", "fatal")
+    return run_
+
+
+_cv = {}
+for _lbl, _f in (("status 실패", _fake_git(0, 128)), ("HEAD 실패", _fake_git(128, 0)), ("수정 없음", _fake_git(0, 0)),
+                 ("수정 있음", _fake_git(0, 0, " M infra/watch/daemon.py"))):
+    WD.subprocess.run = _f
+    try:
+        _cv[_lbl] = WD.code_version()
+    finally:
+        WD.subprocess.run = _real_run
+check("11-5) 실행 코드 기록은 git 명령마다 반환 코드를 확인 — status 실패는 '수정 여부 확인 불가', HEAD 실패는 'HEAD 확인 불가'(정상처럼 보이지 않음)",
+      _cv == {"status 실패": "HEAD abc123def456 (추적 파일 수정 여부 확인 불가)", "HEAD 실패": "HEAD 확인 불가",
+              "수정 없음": "HEAD abc123def456 (추적 파일 수정 없음)",
+              "수정 있음": "HEAD abc123def456 (추적 파일 로컬 수정 있음)"})
 
 # ── 8. 상태·로그·경계 ─────────────────────────────────────
 buf = io.StringIO()

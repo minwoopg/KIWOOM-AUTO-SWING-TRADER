@@ -20,7 +20,8 @@ from __future__ import annotations
 - 상태: PENDING → RUNNING → COMPLETE / PARTIAL(일부 조회 실패) / YIELDED(양보·미룸) / FAILED(예외) /
   ABORTED(프로세스 중단 — 다음 기동 때 표시) / MISSED / SUPERSEDED(목록 갱신 뒤 범위가 바뀌어 새 키 작업이 맡음).
 - 다시 시도: PARTIAL·FAILED·ABORTED는 실패 1·2·3번째 뒤 5·15·30분, 실패 4번째(총 4회 시도)면 더 예약 안 함. YIELDED는
-  실패로 세지 않고 사유별 시각(retry_at): CALL_BUDGET → 다음 날 00:00, TIME_BUDGET → poll_sec 뒤, PRIORITY·STOP → 지금.
+  실패로 세지 않고 사유별 시각(retry_at): CALL_BUDGET → 다음 날 00:00, TIME_BUDGET·CLOCK_NOT_SETTLED(판정 전 시계가
+  초 경계에 못 감 — 판정·S1 관찰 없이) → poll_sec 뒤, PRIORITY·STOP → 지금.
   다시 시도 시각 전에는 계획에 나오지 않음. COMPLETE는 다시 실행하지 않음(보고서만 `report`로 다시 만듦).
 
 우선순위·양보·예산 (R3): OPEN_CHECK > CLOSE_PREP(오래된 날 먼저). 조회 클라이언트의 guard가 실제 요청 직전마다(토큰·연속조회·
@@ -603,7 +604,7 @@ class WatchDaemon:
         """양보 사유별 다시 실행 가능한 시각 (R2)."""
         if reason.startswith("CALL_BUDGET"):
             return datetime.combine(now.date() + timedelta(days=1), dtime(0))   # 다음 예산 창(요청일 자정)
-        if reason.startswith("TIME_BUDGET"):
+        if reason.startswith("TIME_BUDGET") or reason.startswith("CLOCK_NOT_SETTLED"):
             return now + timedelta(seconds=self.s.poll_sec)                     # 받은 만큼 저장됨 — 한 번 쉬고 이어서
         return now          # PRIORITY: 계획이 OPEN_CHECK를 먼저 고름 / STOP_REQUESTED: 프로세스가 끝나고 다음 기동 때
 

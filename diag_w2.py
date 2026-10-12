@@ -5,8 +5,11 @@
 - 1·2번은 **지금** DB 상태(마지막 준비 판정, 현재 revision의 최근 봉).
 - 3번 '그 시각 기준' 조회의 시각:
   * `--as-of`(한국 시간, 시간대 없는 ISO)가 있으면 그 시각.
-  * 없으면 그 신호일 CLOSE_PREP가 기록한 준비 실행의 **완료 시각**(근사 — 당시 판정 그 순간을 입증하지 않음).
-  * 둘 다 없으면 시각을 추정하지 않고 '그 시각 기준' 조회를 건너뜀.
+  * 없으면 그 신호일 CLOSE_PREP가 기록한 준비 실행의 **판정 기준 시각**(evaluated_as_of — 감시 DB wa3부터 기록, 정확).
+  * 그 열이 비어 있으면(wa3 이전 실행) 준비 실행의 **완료 시각**(근사 — 당시 판정 그 순간을 입증하지 않음).
+  * 모두 없으면 시각을 추정하지 않고 '그 시각 기준' 조회를 건너뜀.
+- 입력 검증: `--as-of`는 시간대 없는 한국 시간만(`+09:00` 등 시간대가 붙으면 사용법 오류 2), 신호일은 실제 날짜(아니면 2).
+- 끝에 구역별 요약(OK·MISSING·FAILED). 종료 코드: 0 = 모두 OK, 1 = 일부 없음·실패(부분 진단), 2 = 사용법 오류.
 - 다시 계산·스캔·후보 생성을 하지 않음. 관리자가 도는 중이면 DB마다 다른 순간을 볼 수 있음 — 결정적 대조는 중지 뒤 사본으로.
 - `--root`: data/watch·data/research가 있는 프로젝트(또는 사본) 루트. export-db 산출물에는 연구·감시 설정 DB가 없어 이 진단 전체를
   돌릴 수 없음.
@@ -14,7 +17,7 @@
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -27,12 +30,23 @@ def q(conn, sql, *a):
     return [dict(r) for r in conn.execute(sql, a)]
 
 
+STATUS: dict[str, str] = {}
+
+
 def _open(path: Path, label: str):
     try:
         return open_readonly(path)
     except (FileNotFoundError, OSError) as exc:
         print(f"   [{label}] {exc}")
+        STATUS[label] = "MISSING" if isinstance(exc, FileNotFoundError) else f"FAILED {type(exc).__name__}"
         return None
+
+
+def _naive_kst(text: str) -> datetime:
+    t = datetime.fromisoformat(text)
+    if t.tzinfo is not None:
+        raise ValueError("시간대가 붙은 시각은 받지 않음 — 한국 시간을 시간대 없이(예 2026-10-08T18:10:06)")
+    return t
 
 
 def main(argv=None) -> int:
@@ -42,6 +56,13 @@ def main(argv=None) -> int:
     ap.add_argument("--as-of", help="'그 시각 기준' 조회 시각(한국 시간 ISO, 예 2026-10-08T18:10:06)")
     ap.add_argument("--root", default=str(Path.cwd()), help="data/ 가 있는 프로젝트(또는 사본) 루트")
     a = ap.parse_args(argv)
+    try:
+        date.fromisoformat(a.signal_date)
+        as_of_arg = _naive_kst(a.as_of) if a.as_of else None
+    except ValueError as exc:
+        print(f"[사용법 오류] {exc} (신호일 {a.signal_date!r}, --as-of {a.as_of!r})")
+        return 2
+    STATUS.clear()
     root, code, sig = Path(a.root), a.code, a.signal_date
     wdb, rdb = root / "data/watch/watch.sqlite3", root / "data/research/research.sqlite3"
     ddb, sdb = root / "data/watch/daemon.sqlite3", root / "data/watch/watch_s1.sqlite3"
@@ -50,6 +71,7 @@ def main(argv=None) -> int:
     print("## 1. 준비 상태 — 지금(마지막 판정) (watch.sqlite3 readiness)")
     w = _open(wdb, "watch")
     if w:
+        STATUS["watch"] = "OK"
         for r in q(w, "SELECT target,status,reason,analysis_status,analysis_reason,checked_at,run_id,detail_json"
                       " FROM readiness WHERE target IN (?,?,?)", f"STOCK:{code}", "INDEX:KOSPI:001", "INDEX:KOSDAQ:101"):
             d = json.loads(r.pop("detail_json") or "{}")
@@ -61,6 +83,7 @@ def main(argv=None) -> int:
     print("\n## 2. 연구 DB 시계열 — 지금(현재 revision) (research.sqlite3)")
     r = _open(rdb, "research")
     if r:
+        STATUS["research"] = "OK"
         for sid in (f"STOCK:{code}", "INDEX:KOSPI:001", "INDEX:KOSDAQ:101"):
             s = q(r, "SELECT series_id,revision,first_date,last_date,fetched_at,verified_base_dt,verified_at,coverage,"
                      "integrity,updated_at FROM series WHERE series_id=?", sid)
@@ -72,23 +95,31 @@ def main(argv=None) -> int:
                 print("   event", e["at"], e["event"], e["detail_json"][:300])
 
     d = _open(ddb, "daemon")
+    if d:
+        STATUS["daemon"] = "OK"
     tasks = [] if d is None else q(d, "SELECT task_key,kind,trading_day,status,attempts,started_at,finished_at,"
                                       "config_version,contract_hash,detail_json FROM task ORDER BY trading_day, kind")
     as_of, basis = None, ""
-    if a.as_of:
-        as_of, basis = datetime.fromisoformat(a.as_of), "--as-of 지정"
+    if as_of_arg is not None:
+        as_of, basis = as_of_arg, "--as-of 지정"
     else:
-        prep = next((json.loads(t["detail_json"] or "{}").get("prepare") for t in tasks
-                     if t["kind"] == "CLOSE_PREP" and t["trading_day"] == sig
-                     and json.loads(t["detail_json"] or "{}").get("prepare")), None)
-        fin = None
+        preps = [json.loads(t["detail_json"] or "{}").get("prepare") for t in tasks
+                 if t["kind"] == "CLOSE_PREP" and t["trading_day"] == sig]
+        preps = [x for x in preps if x and x.get("run_id")]
+        prep = preps[-1] if preps else None
         if prep and w:
-            row = q(w, "SELECT finished_at FROM prepare_run WHERE run_id=?", prep.get("run_id"))
-            fin = row[0]["finished_at"] if row and row[0]["finished_at"] else None
-        if fin:
-            as_of, basis = datetime.fromisoformat(fin), f"준비 실행 {prep['run_id']} 완료 시각(근사 — 판정 순간 자체 아님)"
+            cols = {c[1] for c in w.execute("PRAGMA table_info(prepare_run)")}
+            sel = "finished_at" + (", evaluated_as_of" if "evaluated_as_of" in cols else "")
+            row = q(w, f"SELECT {sel} FROM prepare_run WHERE run_id=?", prep["run_id"])
+            if row and row[0].get("evaluated_as_of"):
+                as_of, basis = (datetime.fromisoformat(row[0]["evaluated_as_of"]),
+                                f"준비 실행 {prep['run_id']} 판정 기준 시각(기록값)")
+            elif row and row[0]["finished_at"]:
+                as_of, basis = (datetime.fromisoformat(row[0]["finished_at"]),
+                                f"준비 실행 {prep['run_id']} 완료 시각(근사 — 판정 순간 자체 아님)")
 
     print("\n## 3. 연구 계산 입력")
+    STATUS["series"] = "OK"
     try:
         from infra.research.store import ResearchStore
         with ResearchStore(rdb, readonly=True) as rs:
@@ -106,8 +137,10 @@ def main(argv=None) -> int:
                           f"available_at={[(k.isoformat(), v.isoformat()) for k, v in sorted(ser.available_at.items())[-3:]]}")
                 except Exception as exc:                   # noqa: BLE001
                     print(f"as_of={when} [{label}]: {type(exc).__name__}: {exc}")
+                    STATUS["series"] = "MISSING(시계열 없음)" if isinstance(exc, KeyError) else f"FAILED {type(exc).__name__}"
     except Exception as exc:                               # noqa: BLE001
         print("   연구 DB를 읽기 전용으로 열 수 없음:", type(exc).__name__, exc)
+        STATUS["series"] = "MISSING" if isinstance(exc, FileNotFoundError) else f"FAILED {type(exc).__name__}"
 
     print("\n## 4. 관리자 DB(daemon.sqlite3)")
     if d:
@@ -123,6 +156,7 @@ def main(argv=None) -> int:
                                " ORDER BY rowid"))
 
     print("\n## 5. S1 관찰(watch_s1.sqlite3)")
+    STATUS["s1"] = "OK"
     try:
         from infra.research.scan_store import ScanStore
         with ScanStore(sdb, readonly=True) as sst:
@@ -136,7 +170,11 @@ def main(argv=None) -> int:
                                                              default=str)[:600])
     except Exception as exc:                               # noqa: BLE001
         print("   관찰 DB를 읽기 전용으로 열 수 없음:", type(exc).__name__, exc)
-    return 0
+        STATUS["s1"] = "MISSING" if isinstance(exc, FileNotFoundError) else f"FAILED {type(exc).__name__}"
+    bad = {k: v for k, v in STATUS.items() if v != "OK"}
+    print("\n## 요약: " + " · ".join(f"{k} {v}" for k, v in STATUS.items())
+          + (" — 부분 진단(종료 코드 1)" if bad else " — 모두 OK"))
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
