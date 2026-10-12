@@ -1548,6 +1548,38 @@ check("11-3) finally 안 return 정리(Python 3.14 SyntaxWarning): 레포 전체
                                   "예외·저장 성공": ("raise DatabaseError", False), "예외·저장 실패": (1, True)})
 
 
+# ── 12. 실측 10/8: 저장 직후 같은 초 판정 STALE (확보 시각 초 올림 vs 조회 기준 초 버림) ─────────────
+from infra.watch import manager as WM  # noqa: E402
+
+ES1 = env("settle_init", datetime(2026, 10, 7, 19, 0, 0, 300000), [S_5930])
+ES1["fake"].tick = timedelta(milliseconds=100)               # 실제처럼 초 미만 시각에 받음
+dS1 = daemon(ES1)
+dS1.dstore.set_meta("since", "2026-10-07")
+dS1.dstore.conn.execute("DELETE FROM task")
+dS1.tick()
+dS1.tick()
+tS1 = tasks(ES1)[("CLOSE_PREP", "2026-10-07")]["detail"]
+at(ES1, datetime(2026, 10, 8, 19, 0, 0, 300000))
+dS1.tick()
+dS1.tick()
+tS2 = tasks(ES1)[("CLOSE_PREP", "2026-10-08")]["detail"]
+with WatchStore(ES1["paths"].watch_db) as _w:
+    rd = _w.readiness()["STOCK:005930"]
+dS1.stop()
+check("12-1) 실측 10/8 재현(초 미만 시각에 받음): 마지막에 받은 종목도 저장 직후 판정에서 보임 — 처음 수집(INIT)·이어 받기(APPEND) 모두 "
+      "READY/READY, S1 계산 정상(10/7 PASS), 게이트 통과. 이전 코드는 같은 초에 판정해 NO_REVISION·STALE:last=전날로 보류",
+      tS1["prepare"]["counts"]["readiness"] == {"READY/READY": 3} and tS1["s1"]["counts"]["by_signal"] == {"PASS": 1}
+      and tS1["s1"]["gate"]["eligible"] == ["005930"]
+      and tS2["prepare"]["counts"]["readiness"] == {"READY/READY": 3} and rd["status"] == "READY"
+      and rd["detail"]["last"] == "2026-10-08")
+ck = Clock(datetime(2026, 10, 8, 18, 10, 6, 134632))
+t_settle = WM.settle_after_writes(ck, ck.sleep)
+ck2 = Clock(datetime(2026, 10, 8, 18, 10, 6))
+t_settle2 = WM.settle_after_writes(ck2, ck2.sleep)
+check("12-2) 판정 전 대기: 18:10:06.134632면 18:10:07까지(1초 미만) 기다린 뒤 판정, 정각이면 기다리지 않음",
+      t_settle == datetime(2026, 10, 8, 18, 10, 7) and t_settle2 == datetime(2026, 10, 8, 18, 10, 6))
+
+
 # ── 8. 상태·로그·경계 ─────────────────────────────────────
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):

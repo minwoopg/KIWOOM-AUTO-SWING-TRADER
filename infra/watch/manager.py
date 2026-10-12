@@ -30,6 +30,7 @@ from __future__ import annotations
 """
 
 import hashlib
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -359,11 +360,28 @@ def entry_gate(state: WatchState, sym: WatchSymbol, ready: dict | None, risk: di
 
 
 # ── 데이터 준비 실행 ─────────────────────────────────────────
+def settle_after_writes(now: Callable[[], datetime], sleep: Callable[[float], None]) -> datetime:
+    """방금 저장한 봉이 '그 시각에 쓸 수 있던 값'으로 보일 때까지 기다림 (W2 실측 10/8 — 005930 STALE).
+    봉의 확보 시각은 초 미만을 올려 기록하고(_ts_up) 조회 기준 시각은 초 미만을 버리므로(as_of), 저장 직후 같은 초에 판정하면
+    마지막에 받은 대상이 아직 없는 것으로 보임. 그래서 지금 시각을 초 단위로 올린 경계까지(최대 1초 남짓) 기다린 뒤 판정.
+    반환: 판정에 쓸 수 있는 가장 이른 시각."""
+    t = now()
+    boundary = t.replace(microsecond=0) + timedelta(seconds=1) if t.microsecond else t
+    for _ in range(50):
+        cur = now()
+        if cur >= boundary:
+            return cur
+        sleep(max(0.01, (boundary - cur).total_seconds()))
+    return now()
+
+
+
 def prepare_data(wstore: WatchStore, rstore: ResearchStore, collector, calendar: TradingCalendar,
                  state: WatchState, listing: dict[str, Listing] | None, *, now: Callable[[], datetime],
                  codes: list[str] | None = None, after_close: timedelta = BAR_COMPLETE_AFTER_CLOSE,
                  log: Callable[[str], None] = lambda m: None,
-                 should_stop: Callable[[], str | None] | None = None) -> dict:
+                 should_stop: Callable[[], str | None] | None = None,
+                 sleep: Callable[[float], None] | None = None) -> dict:
     """등록 종목(+지수)만 갱신하고 준비 상태를 저장. codes가 있으면 그 종목(+지수)만 조회 — 상태 판정은 전체 등록 종목.
     should_stop(): 대상마다 조회 전에 부름 — 사유를 돌려주면 남은 대상은 조회하지 않고 YIELDED로 끝냄(W2 — 더 급한 작업·
     중지 요청·호출 예산에 양보). 받은 만큼은 저장돼 있고 다음 실행이 이어서 받음(update_series는 같은 날 다시 불러도 안전)."""
@@ -414,6 +432,7 @@ def prepare_data(wstore: WatchStore, rstore: ResearchStore, collector, calendar:
         status = "FAILED"
         wstore.finish_prepare(run_id, now(), status, {"fetch": tally}, f"{type(exc).__name__}: {exc}"[:300])
         raise
+    settle_after_writes(now, sleep or time.sleep)
     rows = evaluate_readiness(rstore, calendar, cfg, listing, now=now(), after_close=after_close, fetch=fetch)
     changed = wstore.set_readiness(rows, version=version, run_id=run_id, at=now())
     ready: dict[str, int] = {}

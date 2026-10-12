@@ -917,7 +917,8 @@ class WatchDaemon:
             return SUPERSEDED, None
         self.hook("after_list")
         prep = prepare_data(wstore, rstore, collector, self.cal, state, listing, now=self.now,
-                            after_close=self.s.after_close, log=self.log, should_stop=self.should_stop)
+                            after_close=self.s.after_close, log=self.log, should_stop=self.should_stop,
+                            sleep=self.sleep)
         detail["prepare"] = {"run_id": prep["run_id"], "status": prep["status"], "counts": prep["counts"],
                              "yield": prep["yield_reason"]}
         if prep["status"] == "YIELDED":
