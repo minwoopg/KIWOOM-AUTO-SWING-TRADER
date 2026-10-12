@@ -1489,6 +1489,8 @@ check("11-1) O1 실제 CLI factory 경로(make_client·지연 생성·guard 그�
       and not any(x in log_o1 for x in ("SECRET-TOKEN", "APPKEY-XYZ", "SECRET-XYZ"))
       and any("[인증]" in m for m in console_o1)
       and D.DaemonStore(EO["paths"].daemon_db).calls(date(2026, 10, 7)) == len(EO["fake"].calls) + EO["fake"].tokens - tok0_o1)
+check("11-4) 관리자 시작 로그에 실행 코드(Git HEAD·추적 파일 로컬 수정 여부)·Python 버전 — 시작 시점 기록임을 표시",
+      "[관리자] 실행 코드 HEAD " in log_o1 and " · Python " in log_o1 and "시작 시점 기록" in log_o1)
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     real_le2 = RC.load_env
@@ -1535,9 +1537,9 @@ for label, stop_fn, run_fn in (("정상", None, None), ("종료 저장 실패", 
     exits[label] = (exits[label], "[경고] 관리자 종료 상태 저장 실패" in buf.getvalue())
     EQ2["client"].guard = None
 fin_ret = []
-for f in ROOT.rglob("*.py"):
-    if ".git" in f.parts:
-        continue
+_src = [*ROOT.glob("*.py")] + [f for d_ in ("app", "config", "domain", "infra", "tools", "utils")
+                               for f in (ROOT / d_).rglob("*.py")]   # 프로젝트 소스만(.venv·의존성 제외)
+for f in _src:
     for node in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Try):
             fin_ret += [(f.name, m.lineno) for s_ in node.finalbody for m in ast.walk(s_)
@@ -1579,6 +1581,25 @@ t_settle2 = WM.settle_after_writes(ck2, ck2.sleep)
 check("12-2) 판정 전 대기: 18:10:06.134632면 18:10:07까지(1초 미만) 기다린 뒤 판정, 정각이면 기다리지 않음",
       t_settle == datetime(2026, 10, 8, 18, 10, 7) and t_settle2 == datetime(2026, 10, 8, 18, 10, 6))
 
+
+class _StuckClock:                                            # 벽시계가 경계에 닿지 않음(뒤로 감 등) — sleep해도 그대로
+    def __init__(self, t):
+        self.t, self.slept = t, []
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.slept.append(s)
+
+
+_sc = _StuckClock(datetime(2026, 10, 12, 18, 10, 6, 500000))
+_logs = []
+t_stuck = WM.settle_after_writes(_sc, _sc.sleep, _logs.append)
+check("12-3) 판정 전 대기 상한: 시계가 경계에 닿지 않아도 약 3초(0.25초 × 12) 안에 끝나고 시각을 앞으로 만들지 않음(지금 시각 반환), "
+      "사유를 로그에 남김",
+      t_stuck == datetime(2026, 10, 12, 18, 10, 6, 500000) and len(_sc.slept) == 12 and max(_sc.slept) <= 0.25
+      and sum(_sc.slept) <= 3.0 and _logs and "대기 상한" in _logs[0])
 
 # ── 8. 상태·로그·경계 ─────────────────────────────────────
 buf = io.StringIO()

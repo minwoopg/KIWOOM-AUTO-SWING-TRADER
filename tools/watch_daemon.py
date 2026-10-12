@@ -284,6 +284,20 @@ def cmd_doctor(args, *, runner=None) -> int:
     return 1
 
 
+def code_version() -> str:
+    """시작 시점 Git HEAD와 추적 파일 로컬 수정 여부(읽기만). git이 없거나 실패하면 '확인 불가'."""
+    try:
+        head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short=12", "HEAD"], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "HEAD 확인 불가"
+    if not head:
+        return "HEAD 확인 불가"
+    return f"HEAD {head}" + (" (추적 파일 로컬 수정 있음)" if dirty else "")
+
+
 def _stop_daemon(d, state: str, err: str) -> bool:
     """종료 상태 저장. 실패하면 경고를 찍고 False — 상태 저장 실패를 정상으로 보이지 않게 (finally 안 return 없이 같은 동작)."""
     try:
@@ -344,6 +358,8 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
             d = WatchDaemon(p, calendar, client, settings=settings, now=now, sleep=sleep, log=log)
             holder["d"] = d
             d.start()
+            d.log(f"[관리자] 실행 코드 {code_version()} · Python {sys.version.split()[0]} (시작 시점 기록 — 실행 중 파일이 "
+                  "바뀌어도 이 프로세스는 시작할 때 읽은 코드로 동작)")
             state, err = "STOPPED", ""
             try:
                 if args.until_idle:

@@ -45,7 +45,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from infra.research.store import sqlite_backup
+from infra.research.store import open_readonly, sqlite_backup
 
 SCAN_SCHEMA = "s4"
 RUNNING, COMPLETE, FAILED, ABORTED = "RUNNING", "COMPLETE", "FAILED", "ABORTED"
@@ -170,13 +170,26 @@ def inspect_final_reset(path: str | Path) -> dict:
 
 
 class ScanStore:
-    def __init__(self, path: str | Path, *, backup_before_upgrade: bool = True) -> None:
-        """기존 DB의 스키마를 올려야 하면, 바꾸기 전에 같은 폴더에 백업(<파일>.bak-<옛 버전>-<시각>)을 만듭니다."""
+    def __init__(self, path: str | Path, *, backup_before_upgrade: bool = True, readonly: bool = False) -> None:
+        """기존 DB의 스키마를 올려야 하면, 바꾸기 전에 같은 폴더에 백업(<파일>.bak-<옛 버전>-<시각>)을 만듭니다.
+        readonly=True: `mode=ro`로만 엶 — 만들기·표 생성·스키마 올리기·백업·codec 행 넣기를 하지 않음(진단용). 스키마가
+        현재 판이 아니면 바꾸지 않고 RuntimeError."""
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
         self.path = str(p)
         self.backup_path: str | None = None
         self.upgrade_summary: dict | None = None
+        self.readonly = readonly
+        if readonly:
+            self.conn = open_readonly(p)
+            cur = self.conn.execute("SELECT value FROM meta WHERE key='scan_schema'").fetchone()
+            if cur is None or cur[0] != SCAN_SCHEMA:
+                ver = None if cur is None else cur[0]
+                self.conn.close()
+                raise RuntimeError(f"관찰 저장소 스키마 {ver} ≠ {SCAN_SCHEMA} — 읽기 전용이라 올리지 않음: {self.path}")
+            self._zdict = {r[0]: bytes(r[1]) for r in self.conn.execute("SELECT name, zdict FROM codec")}
+            self._zdict.setdefault(CODEC, ZDICT_V1)          # 메모리에서만 — DB에 쓰지 않음
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)

@@ -301,6 +301,16 @@ def load_series_evidence(conn: sqlite3.Connection, sid: str) -> tuple[RevisionTi
     return tl, attribute_writes(events, tl), {r["revision"]: r["reason"] for r in revs}
 
 
+def open_readonly(path: str | Path) -> sqlite3.Connection:
+    """기존 SQLite 파일을 읽기 전용(`mode=ro`)으로 엶 — 없으면 만들지 않고 FileNotFoundError."""
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"DB 파일 없음(읽기 전용이라 만들지 않음): {p}")
+    conn = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def sqlite_backup(conn: sqlite3.Connection, path: str, version: str) -> str:
     """SQLite 백업 API로 일관된 사본 `<파일>.bak-<옛 버전>-<시각>`(쓰는 중이어도 안전). 같은 이름이 있으면 번호를 붙임."""
     base = f"{path}.bak-{version}-{datetime.now():%Y%m%d_%H%M%S}"
@@ -405,13 +415,24 @@ class ResearchSeries:
 
 
 class ResearchStore:
-    def __init__(self, path: str | Path, *, backup_before_upgrade: bool = True) -> None:
-        """기존 DB의 스키마를 올려야 하면, 바꾸기 전에 같은 폴더에 백업(<파일>.bak-<옛 버전>-<시각>)을 만듭니다."""
+    def __init__(self, path: str | Path, *, backup_before_upgrade: bool = True, readonly: bool = False) -> None:
+        """기존 DB의 스키마를 올려야 하면, 바꾸기 전에 같은 폴더에 백업(<파일>.bak-<옛 버전>-<시각>)을 만듭니다.
+        readonly=True: 파일을 `mode=ro`로만 엶 — 만들기·표 생성·스키마 올리기·백업을 하지 않음(진단용). 스키마가 현재
+        판이 아니면 바꾸지 않고 RuntimeError."""
         p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
         self.path = str(p)
         self.backup_path: str | None = None
         self.upgrade_summary: dict | None = None     # 이번에 열면서 시각을 다시 점검했으면 그 집계
+        self.readonly = readonly
+        if readonly:
+            self.conn = open_readonly(p)
+            cur = self.conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            if cur is None or cur[0] != SCHEMA_VERSION:
+                ver = None if cur is None else cur[0]
+                self.conn.close()
+                raise RuntimeError(f"연구 저장소 스키마 {ver} ≠ {SCHEMA_VERSION} — 읽기 전용이라 올리지 않음: {self.path}")
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, isolation_level=None, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA_TABLES)
