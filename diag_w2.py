@@ -10,7 +10,8 @@
   * 모두 없으면 시각을 추정하지 않고 '그 시각 기준' 조회를 건너뜀.
 - 입력 검증: `--as-of`는 시간대 없는 한국 시간만(`+09:00` 등 시간대가 붙으면 사용법 오류 2), 신호일은 실제 날짜(아니면 2).
 - 끝에 구역별 요약(OK·MISSING·FAILED). 종료 코드: 0 = 모두 OK, 1 = 일부 없음·실패(부분 진단), 2 = 사용법 오류.
-- `--out 파일`: 결과를 UTF-8 파일로 직접 저장(Windows에서 `>` 리다이렉트는 cp949로 인코딩돼 실패·깨짐). 프로젝트 `data/` 안은 거부(2).
+- `--out 파일`: 결과를 UTF-8 **새** 파일로 직접 저장(Windows에서 `>` 리다이렉트는 cp949로 인코딩돼 실패·깨짐). 프로젝트 `data/` 안·
+  이미 있는 파일(하드링크 포함)은 거부(2) — 매번 새 이름으로.
   콘솔 출력은 표현 못 하는 문자를 바꿔 찍고 멈추지 않음.
 - 다시 계산·스캔·후보 생성을 하지 않음. 관리자가 도는 중이면 DB마다 다른 순간을 볼 수 있음 — 결정적 대조는 중지 뒤 사본으로.
 - `--root`: data/watch·data/research가 있는 프로젝트(또는 사본) 루트. export-db 산출물에는 연구·감시 설정 DB가 없어 이 진단 전체를
@@ -67,7 +68,12 @@ def main(argv=None) -> int:
             print(f"[사용법 오류] --out은 data/ 밖이어야 함: {out}")
             return 2
         out.parent.mkdir(parents=True, exist_ok=True)
-        with open(out, "w", encoding="utf-8", newline="\n") as fh, contextlib.redirect_stdout(fh):
+        try:                                # 'x' = 새로 만들 때만 — 기존 파일(다른 보고서·DB 하드링크)을 자르지 않음
+            fh = open(out, "x", encoding="utf-8", newline="\n")
+        except FileExistsError:
+            print(f"[사용법 오류] --out 파일이 이미 있음(덮어쓰지 않음 — 새 이름으로): {out}")
+            return 2
+        with fh, contextlib.redirect_stdout(fh):
             rc = _main(a)
         print(f"[진단] {out} 에 저장 (UTF-8) · 종료 코드 {rc}")
         return rc

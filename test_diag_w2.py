@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import io
+import os
 import shutil
 import sqlite3
 import sys
@@ -137,6 +138,21 @@ rc8b = RC[-1]
 check("8) --out은 결과를 UTF-8 파일로 저장('—' 등 cp949 밖 문자 포함, 종료 코드 그대로), data/ 안 경로는 거부(2) — DB 그대로",
       rc8 == 1 and "## 1. 준비 상태 — 지금" in txt8 and "## 요약:" in txt8 and "UTF-8" in msg8
       and rc8b == 2 and not (R1 / "data" / "x.txt").exists() and snapshot(R1) == before8)
+
+# 9. --out 기존 파일 거부 — DB 하드링크·이전 보고서를 자르지 않음 (GPT 검토 88686b9 P1)
+before9 = snapshot(R1)
+rdb9 = R1 / "data/research/research.sqlite3"
+size9 = rdb9.stat().st_size
+link9 = TMP / "out" / "link.txt"
+os.link(rdb9, link9)
+msg9 = run("005930", "2026-10-12", "--root", str(R1), "--out", str(link9))
+rc9 = RC[-1]
+old9 = O8.read_bytes()
+run("005930", "2026-10-12", "--root", str(R1), "--out", str(O8))
+rc9b = RC[-1]
+check("9) --out 대상이 이미 있으면(DB 하드링크·이전 보고서) 거부(2) — 원본 DB 크기·내용과 이전 보고서 그대로",
+      rc9 == 2 and "이미 있음" in msg9 and rdb9.stat().st_size == size9 and snapshot(R1) == before9
+      and rc9b == 2 and O8.read_bytes() == old9)
 
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)
