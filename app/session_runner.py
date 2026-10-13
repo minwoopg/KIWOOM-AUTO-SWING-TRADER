@@ -216,6 +216,72 @@ class SessionRunner:
         self._close_routine()
         return self._finish("COMPLETED")
 
+    # ── M1 수동 주문 실측 (M0 커밋 3) ───────────────────────
+
+    def run_probe(self, intent: OrderIntent, *, max_wait_sec: float = 180.0, poll_sec: float = 3.0) -> dict:
+        """주문 의도 하나를 하루 수명주기와 **같은 경로**(잔고 → 대조 → 원장 기록 → 안전 한도 → 주문 실행부)로 한 번 보내고,
+        체결·원장 기록·주문 종료가 확인될 때까지(최대 max_wait_sec) 대조만 반복합니다.
+
+        전략 게이트만 없음(수동 시험) — 계좌·복구·금액·시간대 안전 한도는 그대로. 재전송·재주문 없음.
+        반환 status: REFUSED(장 단계·잔고·원장 문제로 시도 안 함) / DENIED(안전 한도·실행부 차단, 전송 없음) /
+        NOT_ACCEPTED(전송했지만 미접수 — 응답 불명 포함) / FILLED(체결 기록·주문 종료) / CLOSED_NO_FILL(체결 없이 종료) /
+        UNRESOLVED(시간 안에 종료 확인 못함 — 재시작하면 ERROR로 복원, 사람 확인).
+        """
+        now = self.clock()
+        self.summary.trade_date = now.date()
+        phase = self.calendar.phase(now)
+        if phase != MarketPhase.REGULAR:
+            return {"status": "REFUSED", "reason": f"장 단계 {phase.value} — 정규장에서만"}
+        original, sent = self.strategy, []
+
+        class _Once:
+            strategy_id = "m1_probe"
+
+            def on_session_start(self, ctx):
+                return None
+
+            def on_session_end(self, ctx):
+                return None
+
+            def on_tick(self, ctx):
+                if sent:
+                    return []
+                sent.append(intent)
+                return [intent]
+
+        self.strategy = _Once()
+        try:
+            ctx = self._tick(allow_orders=True)
+        finally:
+            self.strategy = original
+        s = self.summary
+        base = {"denied": dict(s.denied_codes), "orders_sent": s.orders_sent, "halted": s.halted_reason}
+        if ctx is None or not sent:
+            return {"status": "REFUSED", "reason": s.halted_reason or "잔고 조회·원장 확인 실패", **base}
+        if s.intents_denied:
+            return {"status": "DENIED", "reason": ", ".join(s.denied_codes), **base}
+        if not s.orders_accepted:
+            last = self.executor.last_order_attempt(intent.symbol)
+            return {"status": "NOT_ACCEPTED" if s.orders_sent else "DENIED",
+                    "reason": (last.message if last else "주문 실행부 차단"),
+                    "ambiguous": bool(last and last.is_ambiguous), **base}
+        order_id = next((o.order_id for o in self.recorder.tracked.values()), "")
+        deadline = self.clock() + timedelta(seconds=max_wait_sec)
+        done = False
+        while self.clock() < deadline and not self.should_stop():
+            if not self._sleep_seconds(poll_sec):
+                break
+            self._tick(allow_orders=False)
+            if not self.recorder.tracked and not self.executor.has_unresolved_orders():
+                done = True
+                break
+        self.executor.save_state()
+        rep = self._last_report
+        status = ("FILLED" if s.fills_recorded else "CLOSED_NO_FILL") if done else "UNRESOLVED"
+        return {"status": status,
+                "order_id": order_id, "fills_recorded": s.fills_recorded,
+                "reconcile_ok": None if rep is None else rep.ok, "unresolved": not done, **base}
+
     # ── 장중 한 번 ──────────────────────────────────────────
 
     def _fetch_balance(self) -> AccountBalance | None:

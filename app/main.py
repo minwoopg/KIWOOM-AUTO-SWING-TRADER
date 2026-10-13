@@ -304,9 +304,11 @@ def build_session_config(s) -> "SessionConfig":
     )
 
 
-def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
-                should_stop=None, quote_source=None):
-    """하루 수명주기 실행. 테스트에서 clock/sleep/should_stop을 주입할 수 있음."""
+def build_session_runner(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
+                         should_stop=None, quote_source=None):
+    """실행기 조립 — 하루 수명주기와 M1 수동 주문 도구가 같은 OrderExecutor·FillRecorder·안전 한도를 씀 (M0 커밋 3).
+
+    (runner, executor). 상태 파일 손상이면 예외(주문 경로를 만들지 않음)."""
     import time as _time_mod
 
     from app.session_runner import SessionRunner
@@ -341,6 +343,14 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
         quote_source=quote_source if quote_source is not None else (
             KiwoomQuoteSource(broker, logger=app_logger) if isinstance(broker, KiwoomBroker) else None),
     )
+    return runner, executor
+
+
+def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
+                should_stop=None, quote_source=None):
+    """하루 수명주기 실행. 테스트에서 clock/sleep/should_stop을 주입할 수 있음."""
+    runner, executor = build_session_runner(settings, broker, app_logger, strategy=strategy, clock=clock, sleep=sleep,
+                                            should_stop=should_stop, quote_source=quote_source)
     import uuid as _uuid
     try:
         summary = runner.run()
@@ -360,7 +370,7 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
                 from app.reports import generate_daily_report
                 generate_daily_report(settings, summary.trade_date, balance=None,
                                       reconcile_report=summary.final_reconcile, session_lines=summary.lines(),
-                                      calendar=calendar, logger=app_logger, today=summary.trade_date,
+                                      calendar=runner.calendar, logger=app_logger, today=summary.trade_date,
                                       final_only=True, reconcile_missing_reason=missing,
                                       close_check=summary.close_check, close_issues=summary.close_issues)
                 summary.report = "OK"
