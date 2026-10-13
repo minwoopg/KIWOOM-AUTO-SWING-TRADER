@@ -215,6 +215,98 @@ check("3-6) paper 모드는 C 전에는 기동 거부, off는 NullStrategy, M1 �
       p11 and "그림자(shadow)만" in p11 and r12.strategy.strategy_id == "null" and r12.send_orders
       and r13.strategy.strategy_id == "null" and r13.send_orders)
 
+# 4. C1 승인 보완 (GPT 검토 R1~R4) — 정상 흐름 DB 사본을 바꿔 각 근거를 끊음
+def copy_ok(name: str) -> Path:
+    w = TMP / name
+    w.mkdir()
+    for f in w1.glob("*.sqlite3"):
+        (w / f.name).write_bytes(f.read_bytes())
+    return w
+
+
+def sql(w: Path, db: str, q: str, args=()):
+    with sqlite3.connect(w / db) as cx:
+        cx.execute(q, args)
+
+
+def why(w: Path) -> tuple:
+    b = CandidateReader(w, CAL).read(D108, datetime(2026, 10, 8, 9, 6))
+    return b.state, [a.symbol for a in b.approved], b.rejected.get("005930", []), b.note
+
+
+wA = copy_ok("c1_gate_run")
+sql(wA, "daemon.sqlite3", "UPDATE candidate_gate SET scan_run_id='WRONG_RUN'")
+stA, apA, rjA, _ = why(wA)
+check("C1-R2a) 게이트의 스캔 실행 ID가 후보와 다르면 그 게이트를 쓰지 않음 → SCAN·OPEN 게이트 없음으로 승인 안 함(이전 코드: 승인 1)",
+      apA == [] and "SCAN_GATE:NONE" in rjA and "OPEN_GATE:NONE" in rjA)
+wB = copy_ok("c1_task_contract")
+sql(wB, "daemon.sqlite3", "UPDATE task SET contract_hash='other' WHERE kind='OPEN_CHECK'")
+wC = copy_ok("c1_open_at")
+sql(wC, "watch_open.sqlite3", "UPDATE candidate_set SET open_at='2026-10-08T08:00:00'")
+wD = copy_ok("c1_ic_run")
+sql(wD, "daemon.sqlite3", "UPDATE input_check SET scan_run_id='WRONG_RUN'")
+check("C1-R2b) 개장 확인 작업 계약 ≠ 후보 목록 계약, 후보 목록 개장 시각 ≠ 달력 → ERROR(승인 없음). 입력 재확인이 다른 스캔 실행이면 없음으로",
+      why(wB)[0] == B_ERROR and "계약" in why(wB)[3] and why(wC)[0] == B_ERROR and "달력" in why(wC)[3]
+      and "INPUT_CHECK_STOCK:NONE" in why(wD)[2])
+wE = copy_ok("c1_late_ic")
+sql(wE, "daemon.sqlite3", "UPDATE input_check SET checked_at='2026-10-08T08:58:00', committed_at='2026-10-08T08:58:01'")
+wE2 = copy_ok("c1_early_ic")
+sql(wE2, "daemon.sqlite3", "UPDATE input_check SET checked_at='2026-10-08T08:30:00', committed_at='2026-10-08T08:30:01'")
+check("C1-R3) 입력 재확인의 확인·저장이 08:40~08:55 밖(08:58·08:30)이면 STABLE이어도 승인 안 함(이전 코드: 08:58 승인)",
+      why(wE)[1] == [] and any(r.startswith("INPUT_CHECK_STOCK:OUTSIDE_WINDOW") for r in why(wE)[2])
+      and why(wE2)[1] == [] and any("OUTSIDE_WINDOW" in r for r in why(wE2)[2]))
+wF = copy_ok("c1_late_price")
+sql(wF, "watch_open.sqlite3", "UPDATE price_check SET timing='LATE_RESPONSE'")
+wG = copy_ok("c1_kind")
+sql(wG, "watch_open.sqlite3", "UPDATE price_check SET check_kind='OPEN+10m'")
+wH = copy_ok("c1_target")
+sql(wH, "watch_open.sqlite3", "UPDATE price_check SET target_at='2026-10-08T09:15:00'")
+check("C1-R4) 개장 가격: LATE_RESPONSE 거부(이전 코드: 승인), 작업의 확인 종류(OPEN+5m)가 아닌 관찰은 쓰지 않음, 목표 시각 ≠ 달력 개장+5분 거부",
+      "OPEN_PRICE:TIMING_LATE_RESPONSE" in why(wF)[2] and why(wF)[1] == []
+      and any(r.startswith("OPEN_PRICE:NONE") for r in why(wG)[2])
+      and any(r.startswith("OPEN_PRICE:TIME_MISMATCH") for r in why(wH)[2]))
+check("C1-0) 정상 DB는 여전히 승인(보완이 정상 흐름을 막지 않음)", why(w1)[1] == ["005930"])
+
+# R1 — 전략: 승인을 폴링마다 다시 읽음
+from app.s1_strategy import S1EntryStrategy  # noqa: E402
+from domain.models import AccountBalance  # noqa: E402
+from domain.strategy.interface import TickContext  # noqa: E402
+from utils.trading_calendar import MarketPhase  # noqa: E402
+
+
+class Seq:
+    def __init__(self, books):
+        self.books, self.n = list(books), 0
+
+    def __call__(self, day, now):
+        self.n += 1
+        return self.books[min(self.n - 1, len(self.books) - 1)]
+
+
+import copy as _copy  # noqa: E402
+b_err = _copy.deepcopy(b1)
+b_err.state, b_err.approved, b_err.note = B_ERROR, [], "관리자 기록 읽기 실패(시험)"
+seq = Seq([b1, b_err, b_err])
+prices = iter([(int(a1.entry_cap + 1000), int(a1.entry_cap + 1000)), (a1.limit_price - 100, a1.limit_price),
+               (a1.limit_price - 100, a1.limit_price)])
+keys_r1 = SignalKeyStore(TMP / "r1_keys.jsonl")
+dec_r1: list = []
+strat = S1EntryStrategy(mode="shadow", scope="t", candidates=seq, quote=lambda sym: next(prices), keys=keys_r1,
+                        decisions=dec_r1.append, entry_start=dtime(9, 5), entry_end=dtime(9, 30))
+
+
+def ctx_at(t):
+    return TickContext(now=datetime.combine(D108, t), phase=MarketPhase.REGULAR, trade_date=D108,
+                       balance=AccountBalance(10_000_000, 10_000_000, []), positions={}, metas={},
+                       blocked_symbols=frozenset(), orders_in_flight=False)
+
+
+out_r1 = [strat.on_tick(ctx_at(dtime(9, 6))), strat.on_tick(ctx_at(dtime(9, 7))), strat.on_tick(ctx_at(dtime(9, 8)))]
+check("C1-R1) 첫 폴링 승인 + 가격 상한 위(보류) → 다음 폴링에 승인 조회가 ERROR면 가격이 정상이어도 의도 없음, 조회는 폴링마다(3회), "
+      "승인 상태 변화가 판단 기록에 남음(이전 코드: 의도 1·조회 1)",
+      out_r1 == [[], [], []] and seq.n == 3 and not keys_r1.keys()
+      and [d["event"] for d in dec_r1 if d["topic"] == "book"] == ["CANDIDATES_READY", "CANDIDATES_ERROR"])
+
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)
 print(f"\n총 {len(results)}건 중 통과 {passed}건, 실패 {len(results) - passed}건")

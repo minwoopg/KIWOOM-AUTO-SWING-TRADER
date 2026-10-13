@@ -155,6 +155,18 @@ with sqlite3.connect(bak) as cx:
 check("6) 관리자 DB wd3 → wd4: 올리기 전 사본(.bak-wd3-) 뒤 input_check 표 추가, 기존 표는 그대로",
       has and sch == "wd4" and ".bak-wd3-" in bak and old_sch == "wd3")
 
+# 9. C1(GPT R3): 작업은 기한 전에 시작했지만 조회가 늦게 끝남 → LATE로 기록, 승인 없음
+E9, d9 = prepared("late_finish")
+E9["fake"].tick = timedelta(seconds=50)
+at(E9, datetime(2026, 10, 8, 8, 54, 30))
+d9.tick()
+t9 = tasks(E9)[("INPUT_CHECK", "2026-10-08")]
+rows9 = d9.dstore.input_checks("2026-10-08")
+check("9) 기한(08:55) 전에 시작해도 확인이 기한 뒤에 끝난 행은 LATE:STABLE(승인 근거 아님)로 남기고 승인 없음",
+      rows9 and any(r["status"].startswith("LATE:") for r in rows9) and t9["detail"]["approved"] == []
+      and any("기한" in x for r in rows9 for x in r["diffs"] if r["status"].startswith("LATE:")))
+d9.stop()
+
 # 8. 시장 기준 실측 도구(읽기 전용) — 가짜 응답
 from infra.research.kiwoom_readonly import Page  # noqa: E402
 from tools import probe_market_basis as PMB  # noqa: E402

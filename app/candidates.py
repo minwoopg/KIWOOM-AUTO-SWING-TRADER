@@ -12,9 +12,12 @@ from __future__ import annotations
 | 2 | A5 candidate_set·D | status OK, 신호일 = D의 직전 거래일, 계약 C |
 | 3 | scan_run(후보의 run_id) | COMPLETE · 계약 C · scan_at·committed_at < 개장 · after_close_min ≥ 하한(기본 300 — 18:10 스캔은 잠정 관찰) |
 | 4 | s1_observation(signal_id) | PASS · final=1 · actionable=1 · run_id·input_hash·계약이 후보와 같음 |
-| 5 | candidate_gate | 마지막 SCAN 게이트 eligible·개장 전 저장 완료 ∧ 마지막 OPEN 게이트 eligible |
-| 6 | input_check(D·t·C·종목) | 종목·지수 각각 마지막 결과 STABLE, 같은 스캔 실행, 개장 전 저장 완료 |
-| 7 | A5 price_check(OPEN+Nm) | outcome WITHIN_CAP(관찰가 ≤ 진입 상한 ∧ > 참고 손절가) |
+| 5 | candidate_gate | **같은 스캔 실행(scan_run_id)**의 마지막 SCAN 게이트 eligible·개장 전 저장 완료 ∧ 마지막 OPEN 게이트 eligible |
+| 6 | input_check(D·t·C·종목) | **같은 스캔 실행**의 종목·지수 각각 마지막 결과 STABLE, 확인·저장 시각이 **개장 20분 전 ≤ · < 개장 5분 전**(일반 08:40~08:55) |
+| 7 | A5 price_check | OPEN_CHECK 작업의 확인 종류(OPEN+Nm)만, 같은 신호, fetch OK·**ON_TIME**·WITHIN_CAP, 목표 시각 = 달력 개장 + N분, 요청 ≥ 목표 |
+
+C1(GPT 검토 R2~R4): 개장 시각은 DB 값을 믿지 않고 거래일 달력으로 계산해 대조. OPEN_CHECK 작업의 계약 = 후보 목록 계약.
+다른 실행의 최신 행으로 누락을 대체하지 않음.
 | 8 | 가격 | 진입 상한·참고 손절가 양수, 지정가 = 진입 상한을 KRX 호가로 내림 > 참고 손절가 |
 
 DB를 못 읽거나 형식이 다르면 ERROR — 신규 매수만 보류(보유 청산·주문 복구와 무관). 주문 직전 가격 재확인은 전략이 따로 함.
@@ -24,12 +27,13 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from domain.market_data.tick_size import floor_to_tick
 
 READY, WAITING, ERROR = "READY", "WAITING", "ERROR"
+INPUT_CHECK_LEAD_MIN, INPUT_CHECK_DEADLINE_MIN = 20, 5      # infra/watch/daemon.py와 같은 값(관리자 코드는 import 안 함)
 
 
 @dataclass(frozen=True)
@@ -91,12 +95,25 @@ class CandidateReader:
     def _read(self, day: date, book: CandidateBook) -> CandidateBook:
         sig = self.cal.previous_trading_day(day).isoformat()
         book.signal_date = sig
+        st = self.cal.session_times(day)
+        if st is None:
+            book.state, book.note = ERROR, f"{day}는 달력상 거래일이 아님"
+            return book
+        cal_open = datetime.combine(day, st.open)
+        cal_open_s = cal_open.isoformat(timespec="seconds")
+        ic_from = (cal_open - timedelta(minutes=INPUT_CHECK_LEAD_MIN)).isoformat(timespec="seconds")
+        ic_until = (cal_open - timedelta(minutes=INPUT_CHECK_DEADLINE_MIN)).isoformat(timespec="seconds")
         with closing(_ro(self.daemon_db)) as dx:
-            ot = dx.execute("SELECT status FROM task WHERE kind='OPEN_CHECK' AND trading_day=? ORDER BY task_key",
-                            (day.isoformat(),)).fetchall()
-            if not ot or not any(r["status"] == "COMPLETE" for r in ot):
+            ot = dx.execute("SELECT status, scope, contract_hash FROM task WHERE kind='OPEN_CHECK' AND trading_day=?"
+                            " ORDER BY task_key", (day.isoformat(),)).fetchall()
+            done = [r for r in ot if r["status"] == "COMPLETE"]
+            if not done:
                 book.note = f"개장 확인(OPEN_CHECK {day}) 아직 끝나지 않음 — {[r['status'] for r in ot] or '작업 없음'}"
                 return book
+            if len(done) != 1:
+                book.state, book.note = ERROR, f"끝난 개장 확인 작업이 {len(done)}개 — 어느 것인지 정할 수 없음"
+                return book
+            check_kind, task_contract = done[0]["scope"], done[0]["contract_hash"]
             with closing(_ro(self.open_db)) as ox:
                 cs = ox.execute("SELECT * FROM candidate_set WHERE target_day=?", (day.isoformat(),)).fetchone()
                 if cs is None:
@@ -106,6 +123,13 @@ class CandidateReader:
                 if cs["signal_date"] != sig:
                     book.state, book.note = ERROR, f"후보 목록 신호일 {cs['signal_date']} ≠ 직전 거래일 {sig}"
                     return book
+                if cs["open_at"] != cal_open_s:
+                    book.state, book.note = ERROR, f"후보 목록 개장 시각 {cs['open_at']} ≠ 달력 {cal_open_s}"
+                    return book
+                if task_contract != cs["contract_hash"]:
+                    book.state, book.note = ERROR, (f"개장 확인 작업 계약 {task_contract} ≠ 후보 목록 계약 "
+                                                    f"{cs['contract_hash']}")
+                    return book
                 book.state = READY
                 if cs["status"] != "OK":
                     book.note = f"후보 없음 ({cs['status']}: {cs['reason']})"
@@ -114,7 +138,7 @@ class CandidateReader:
                 cands = [dict(r) for r in ox.execute("SELECT * FROM candidate WHERE set_id=? ORDER BY symbol",
                                                      (cs["set_id"],))]
                 checks = {r["symbol"]: dict(r) for r in ox.execute(
-                    "SELECT * FROM price_check WHERE set_id=? AND check_kind LIKE 'OPEN+%'", (cs["set_id"],))}
+                    "SELECT * FROM price_check WHERE set_id=? AND check_kind=?", (cs["set_id"], check_kind))}
             with closing(_ro(self.scan_db)) as sx:
                 runs = {r["run_id"]: dict(r) for r in sx.execute("SELECT * FROM scan_run WHERE signal_date=?", (sig,))}
                 obs = {r["signal_id"]: dict(r) for r in sx.execute(
@@ -147,14 +171,15 @@ class CandidateReader:
                       and o["run_id"] == c["run_id"] and o["input_hash"] == c["input_hash"]
                       and o.get("contract_hash") == C):
                 why.append("OBSERVATION_MISMATCH")
-            scan_g = [g for g in gates if g["symbol"] == sym and g["stage"] == "SCAN" and g["committed_at"]
+            same_run = [g for g in gates if g["symbol"] == sym and g.get("scan_run_id") == c["run_id"]]
+            scan_g = [g for g in same_run if g["stage"] == "SCAN" and g["committed_at"]
                       and g["committed_at"] < open_at and g["evaluated_at"] < open_at]
-            open_g = [g for g in gates if g["symbol"] == sym and g["stage"] == "OPEN" and g["open_at"] == open_at]
+            open_g = [g for g in same_run if g["stage"] == "OPEN" and g["open_at"] == open_at]
             if not scan_g or not scan_g[-1]["eligible"]:
                 why.append("SCAN_GATE:" + ("NONE" if not scan_g else ",".join(json.loads(scan_g[-1]["reasons_json"]))))
             if not open_g or not open_g[-1]["eligible"]:
                 why.append("OPEN_GATE:" + ("NONE" if not open_g else ",".join(json.loads(open_g[-1]["reasons_json"]))))
-            mine = [r for r in ics if r["symbol"] == sym]
+            mine = [r for r in ics if r["symbol"] == sym and r["scan_run_id"] == c["run_id"]]
             for role in ("STOCK", "INDEX"):
                 last = [r for r in mine if r["role"] == role]
                 if not last:
@@ -163,13 +188,26 @@ class CandidateReader:
                 r = last[-1]
                 if r["status"] != "STABLE":
                     why.append(f"INPUT_CHECK_{role}:{r['status']}")
-                elif r["scan_run_id"] != c["run_id"] or not r["committed_at"] or r["committed_at"] >= open_at:
-                    why.append(f"INPUT_CHECK_{role}:STALE")
+                elif not (r["checked_at"] and r["committed_at"] and ic_from <= r["checked_at"] < ic_until
+                          and ic_from <= r["committed_at"] < ic_until):
+                    why.append(f"INPUT_CHECK_{role}:OUTSIDE_WINDOW(확인 {r['checked_at']}·저장 {r['committed_at']}, "
+                               f"허용 {ic_from[11:16]}~{ic_until[11:16]})")
             pc = checks.get(sym)
             if pc is None:
-                why.append("OPEN_PRICE:NONE")
-            elif pc["outcome"] != "WITHIN_CAP":
-                why.append(f"OPEN_PRICE:{pc['outcome']}")
+                why.append(f"OPEN_PRICE:NONE({check_kind})")
+            else:
+                target = _target_at(cal_open, check_kind)
+                if pc["signal_id"] != c["signal_id"]:
+                    why.append("OPEN_PRICE:SIGNAL_MISMATCH")
+                if pc["fetch_status"] != "OK":
+                    why.append(f"OPEN_PRICE:FETCH_{pc['fetch_status']}")
+                if pc["timing"] != "ON_TIME":
+                    why.append(f"OPEN_PRICE:TIMING_{pc['timing']}")
+                if target is None or pc["target_at"] != target or not pc.get("requested_at") \
+                        or not pc.get("received_at") or pc["requested_at"] < target:
+                    why.append(f"OPEN_PRICE:TIME_MISMATCH(목표 {pc['target_at']}·달력 {target}·요청 {pc.get('requested_at')})")
+                if pc["outcome"] != "WITHIN_CAP":
+                    why.append(f"OPEN_PRICE:{pc['outcome']}")
             cap, stop = c.get("entry_cap"), c.get("stop_ref")
             limit = None
             if not cap or not stop or cap <= 0 or stop <= 0:
@@ -187,3 +225,11 @@ class CandidateReader:
                 observed_price=pc.get("observed_price"), observed_outcome=pc["outcome"]))
         book.note = f"후보 {len(cands)}건 → 승인 {len(book.approved)}건"
         return book
+
+
+def _target_at(cal_open: datetime, check_kind: str) -> str | None:
+    """'OPEN+5m' → 달력 개장 + 5분(ISO 초). 형식이 다르면 None(승인 안 함)."""
+    k = str(check_kind or "")
+    if not (k.startswith("OPEN+") and k.endswith("m") and k[5:-1].isdigit()):
+        return None
+    return (cal_open + timedelta(minutes=int(k[5:-1]))).isoformat(timespec="seconds")

@@ -1124,6 +1124,14 @@ class WatchDaemon:
         t_commit = self.now()
         if t_commit.microsecond:
             t_commit = t_commit.replace(microsecond=0) + timedelta(seconds=1)
+        deadline = self.due_times(d)[INPUT_CHECK][1]
+        late = [r for r in rows if datetime.fromisoformat(r["checked_at"]) >= deadline] if t_commit < deadline else rows
+        if late:
+            # C1(GPT 검토 R3): 기한(개장 5분 전) 뒤에 끝난 확인·저장은 근거로 남기되 승인 가능한 STABLE로 두지 않음
+            for r in late:
+                r["status"] = f"LATE:{r['status']}"
+                r["diffs"] = list(r.get("diffs") or []) + [f"기한 {_ts(deadline)} 뒤 확인·저장 — 승인 근거 아님"]
+            self.log(f"[관리자] 입력 재확인 기한 {_ts(deadline)} 초과 {len(late)}건 — LATE로 기록(승인 안 됨)")
         self.dstore.add_input_checks(rows, _ts(t_commit))
         by_sym: dict[str, str] = {}
         for r in rows:
@@ -1133,7 +1141,9 @@ class WatchDaemon:
         detail["approved"] = sorted(sym for sym, st in by_sym.items() if st == STABLE)
         self.log(f"[관리자] 입력 재확인 {sig}→{d}: " + ", ".join(f"{k}={v}" for k, v in sorted(by_sym.items())))
         # 조회 실패가 있으면 PARTIAL — 기한(개장 5분 전) 안에서 다시 시도(새 행 추가, 마지막 결과가 판정 기준)
-        return (PARTIAL if any(st == CHECK_FAILED for st in by_sym.values()) else COMPLETE), contract
+        if late:
+            detail["late"] = len(late)
+        return (PARTIAL if any(st == CHECK_FAILED for st in by_sym.values()) and not late else COMPLETE), contract
 
     def _open_check(self, t, detail, rstore, wstore, state, snap_id) -> tuple[str, str | None]:
         d = date.fromisoformat(t["trading_day"])

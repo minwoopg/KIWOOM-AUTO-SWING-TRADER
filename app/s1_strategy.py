@@ -5,7 +5,8 @@ from __future__ import annotations
 규칙 (GPT 최소판 요청 — S1 조건·기준값은 바꾸지 않음)
 - 진입 시간: entry_start(09:05) ≤ 지금 < entry_end(session.entry_cancel_at, 09:30), 정규장.
 - 최대 보유 1: 원장·잔고에 보유가 있거나 미해결 주문이 있으면 신규 의도 없음. 추가 매수 없음.
-- 후보는 승인된 것만(CandidateReader — 관리자 기록 교차 검증). 읽기 실패(ERROR)면 그날 신규 의도 없음.
+- 후보는 승인된 것만(CandidateReader — 관리자 기록 교차 검증). **폴링마다 다시 읽고**, 그 폴링의 결과가
+  ERROR·WAITING·거부면 신규 의도 없음(C1 — 한 번 받은 승인을 붙들고 있지 않음).
 - 주문 직전 재확인: 현재가 > 참고 손절가 ∧ 현재가 ≤ 진입 상한 ∧ 최우선 매도호가 ≤ 지정가. 하나라도 아니면 그 폴링은 보류
   (진입 시간 안에서 다음 폴링에 다시 확인). 호가를 못 받으면 보류.
 - 지정가 = 진입 상한을 KRX 호가 단위로 내림(후보 승인에서 계산), 수량 1.
@@ -62,12 +63,13 @@ class S1EntryStrategy:
         now = ctx.now
         if ctx.phase != MarketPhase.REGULAR or not (self.entry_start <= now.time() < self.entry_end):
             return []
-        if self.book is None or self.book.state != "READY":
-            self.book = self.candidates(ctx.trade_date, now)
-            self._note(ctx, "book", f"CANDIDATES_{self.book.state}", {
-                "signal_date": self.book.signal_date, "contract": self.book.contract_hash,
-                "approved": [a.symbol for a in self.book.approved], "rejected": self.book.rejected,
-                "note": self.book.note})
+        # C1(GPT 검토 R1): 신규 진입을 검토하는 폴링마다 승인을 새로 읽음 — 이전 READY를 계속 쓰지 않음.
+        # 최신 결과가 ERROR·WAITING·거부면 그 폴링은 의도 없음. 이미 쓴 신호 키는 다시 살아나지 않음.
+        self.book = self.candidates(ctx.trade_date, now)
+        self._note(ctx, "book", f"CANDIDATES_{self.book.state}", {
+            "signal_date": self.book.signal_date, "contract": self.book.contract_hash,
+            "approved": [a.symbol for a in self.book.approved], "rejected": self.book.rejected,
+            "note": self.book.note})
         if self.book.state != "READY" or not self.book.approved:
             return []
         held = ({s for s, p in ctx.positions.items() if p.quantity > 0}
