@@ -1774,4 +1774,27 @@ UNKNOWN 1), ② 진단 `--as-of`에 시간대가 붙으면 비교 오류·신호
 ### 전달 파일
 - 패치 0001 (fix), 0002 (docs) — 기준 `fcc5406`
 
+## 2026-10-13 — 진단 출력 인코딩: `--out` UTF-8 저장, 콘솔 문자 대체 (실측 중 발견)
+
+### 배경
+사용자 PC(Windows, Python 3.14)에서 `python diag_w2.py 005930 2026-10-12 > logs\diag_20261013.txt`가 첫 제목 줄에서
+`UnicodeEncodeError: 'cp949' codec can't encode character '\u2014'`로 중단. 리다이렉트 시 표준 출력 인코딩이 cp949. DB 영향 없음
+(읽기 전용). 이번에는 `cmd /c "python -X utf8 … > 파일"`로 우회.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `diag_w2.py` | `--out 파일`: UTF-8로 직접 저장(종료 코드 그대로, `data/` 안 경로는 거부 2). 콘솔은 다른 도구와 같이 `errors="replace"` |
+| `test_diag_w2.py` | 8) `--out` 저장·data/ 거부·DB 그대로 |
+
+### 테스트 및 검증
+- 이전 코드: `PYTHONIOENCODING=cp949`로 같은 `UnicodeEncodeError` 재현, 8번 실패(옵션 없음). 수정 후 cp949에서도 끝까지 출력(문자 대체)·
+  진단 8/8, 회귀 34/34(`test_broker_order_status.py` 제외 — 실측 fixture 없음, 통과로 세지 않음).
+
+### 변경하지 않은 것
+- 진단 내용·읽기 전용 보장·종료 코드 규칙.
+
+### 전달 파일
+- 패치 0003 — 0001·0002 위
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

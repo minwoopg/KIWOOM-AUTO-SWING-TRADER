@@ -126,6 +126,18 @@ check("7) 끝에 구역별 요약과 종료 코드 — 빠진 DB·시계열이 �
       rc6c == 1 and "series MISSING(시계열 없음)" in out6c and "watch OK" in out6c
       and rc6d == 1 and "## 요약:" in out6d and "watch MISSING" in out6d and "부분 진단" in out6d)
 
+# 8. --out: UTF-8 파일로 직접 저장(Windows `>` 리다이렉트 cp949 실패 대응), data/ 안은 거부
+O8 = TMP / "out" / "diag.txt"
+before8 = snapshot(R1)
+msg8 = run("005930", "2026-10-12", "--root", str(R1), "--out", str(O8))
+rc8 = RC[-1]
+txt8 = O8.read_text(encoding="utf-8") if O8.exists() else ""
+msg8b = run("005930", "2026-10-12", "--root", str(R1), "--out", str(R1 / "data" / "x.txt"))
+rc8b = RC[-1]
+check("8) --out은 결과를 UTF-8 파일로 저장('—' 등 cp949 밖 문자 포함, 종료 코드 그대로), data/ 안 경로는 거부(2) — DB 그대로",
+      rc8 == 1 and "## 1. 준비 상태 — 지금" in txt8 and "## 요약:" in txt8 and "UTF-8" in msg8
+      and rc8b == 2 and not (R1 / "data" / "x.txt").exists() and snapshot(R1) == before8)
+
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)
 print(f"\n총 {len(results)}건 중 통과 {passed}건, 실패 {len(results) - passed}건")
