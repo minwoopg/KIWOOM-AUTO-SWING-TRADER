@@ -53,6 +53,11 @@ READY, UNKNOWN, HOLD = "READY", "UNKNOWN", "HOLD"
 RISK_OK, RISK_FLAGGED, RISK_NOT_IN_LIST, RISK_NO_LIST = "OK", "RISK", "NOT_IN_LIST", "NO_LIST"
 INDEX_NAMES = {"INDEX:KOSPI:001": "KOSPI", "INDEX:KOSDAQ:101": "KOSDAQ"}
 
+# M3 B: 지정 종목 관찰(관리자·watchlist)의 일봉 완성 기준 — 정규장 종료 + 300분(일반 15:30 → 20:30). 18:10(160분)에 받은 당일 봉이
+# 뒤에 바뀐 것을 재현(10/8·10/12)해서 늦춤. **공급자 확정값 보장이 아님** — 다음 거래일 08:40 입력 재확인이 따로 확인.
+# 전체 시장 연구 수집(research_collect)은 이전 값(160분)을 그대로 씀(별도 DB·별도 계약).
+WATCH_AFTER_CLOSE = timedelta(minutes=300)
+
 
 class WatchNotReady(RuntimeError):
     """정상 설정이 없어 감시·준비를 시작할 수 없음."""

@@ -25,6 +25,7 @@ from __future__ import annotations
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -122,6 +123,8 @@ class StartupReport:
 
 async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=asyncio.sleep) -> StartupReport:
     """인증 → 잔고 → 미해결 주문 흔적 확인. 주문은 절대 내지 않습니다."""
+    if getattr(settings, "swing_strategy", None) is not None and settings.swing_strategy.mode == "paper":
+        raise StartupBlockedError("swing_strategy.mode=paper — C(E1 손절·시간 청산·일일 손실 한도) 전에는 그림자(shadow)만 허용")
     is_live = not settings.broker.is_paper_trading
     # M0 커밋 1: 키움 모의투자 서버 모드도 실전과 같은 엄격 기준(잔고·주문 기록·원장을 모르면 시작 안 함).
     # 로컬 가짜 브로커(MOCK_LOCAL)만 예전처럼 경고 후 계속. 실전 조합은 build_broker에서 이미 거부됨.
@@ -326,7 +329,8 @@ _CODE_VERSION: str | None = None
 
 
 def build_session_runner(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
-                         should_stop=None, quote_source=None, status_file=None, process: str = "app.main"):
+                         should_stop=None, quote_source=None, status_file=None, process: str = "app.main",
+                         use_settings_strategy: bool = False, candidates=None):
     """실행기 조립 — 하루 수명주기와 M1 수동 주문 도구가 같은 OrderExecutor·FillRecorder·안전 한도를 씀 (M0 커밋 3).
 
     (runner, executor). 상태 파일 손상이면 예외(주문 경로를 만들지 않음)."""
@@ -353,6 +357,19 @@ def build_session_runner(settings: Settings, broker, app_logger, *, strategy=Non
     after_close = None
     if settings.session.update_daily_bars_after_close and isinstance(broker, KiwoomBroker):
         after_close = _make_daily_bar_updater(settings, broker, calendar, state, ledger_store, app_logger)
+    if quote_source is None and isinstance(broker, KiwoomBroker):
+        quote_source = KiwoomQuoteSource(broker, logger=app_logger)
+    session_cfg = build_session_config(settings.session)
+    mode = settings.swing_strategy.mode if use_settings_strategy else "off"
+    send_orders, shadow_sink = True, None
+    if strategy is None and mode != "off":
+        if mode == "paper":
+            raise StartupBlockedError("swing_strategy.mode=paper — C(E1 손절·시간 청산·일일 손실 한도) 전에는 그림자(shadow)만 "
+                                      "허용. settings.yaml swing_strategy.mode를 shadow 또는 off로")
+        strategy = build_s1_strategy(settings, broker, calendar, quote_source, session_cfg, candidates=candidates)
+        send_orders, shadow_sink = False, _jsonl_sink(Path(settings.storage.state_file).with_name("shadow_intents.jsonl"))
+        import dataclasses as _dc
+        session_cfg = _dc.replace(session_cfg, max_buy_quantity=settings.swing_strategy.quantity)
     runner = SessionRunner(
         broker=broker, executor=executor, state=state, ledger_store=ledger_store,
         recorder=FillRecorder(ledger_store, logger=app_logger,
@@ -362,26 +379,62 @@ def build_session_runner(settings: Settings, broker, app_logger, *, strategy=Non
                               evidence_store=FillEvidenceStore(evidence_path(settings.storage.fill_ledger_file))),
         calendar=calendar,
         strategy=strategy or NullStrategy(), guard_config=build_guard_config(settings.guard),
-        session_config=build_session_config(settings.session), logger=app_logger,
+        session_config=session_cfg, logger=app_logger,
         clock=clock or now_local, sleep=sleep or _time_mod.sleep, should_stop=should_stop or (lambda: False),
         after_close=after_close,
-        quote_source=quote_source if quote_source is not None else (
-            KiwoomQuoteSource(broker, logger=app_logger) if isinstance(broker, KiwoomBroker) else None),
+        quote_source=quote_source,
         status_file=status_file, commands_dir=settings.storage.commands_dir,
         meta={"execution_mode": resolve_execution_mode(settings.broker),
               "account_scope": settings.broker.account_scope_id.strip() or "unscoped",
-              "code_version": code_version_cached(), "process": process},
+              "code_version": code_version_cached(), "process": process, "strategy_mode": mode},
+        send_orders=send_orders, shadow_sink=shadow_sink,
     )
+    runner.summary.strategy_mode = mode
     return runner, executor
 
 
+def _jsonl_sink(path: Path):
+    """append-only JSON Lines 기록 함수(그림자 의도·전략 판단)."""
+    def sink(rec: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    return sink
+
+
+def build_s1_strategy(settings: Settings, broker, calendar, quote_source, session_cfg, *, candidates=None):
+    """S1 진입 전략(M3 B) — 후보 승인(읽기 전용)·주문 직전 가격(현재가·최우선 매도호가)·신호 키."""
+    from datetime import time as _time
+    from app.candidates import CandidateReader
+    from app.s1_strategy import S1EntryStrategy
+    from infra.storage.signal_keys import SignalKeyStore, keys_path
+
+    st = settings.swing_strategy
+    reader = CandidateReader(st.watch_dir, calendar, min_after_close_min=st.min_after_close_min)
+    if quote_source is not None and hasattr(quote_source, "get_quote"):
+        quote = quote_source.get_quote
+    else:                       # MOCK_LOCAL 등 — 호가가 없으면 현재가를 호가로(그림자 확인용, 실제 전송 아님)
+        def quote(sym):
+            px = broker.get_market_price(sym).current_price
+            return px, px
+    hh, mm = st.entry_start.split(":")
+    entry_end = session_cfg.entry_cancel_at or _time(9, 30)
+    return S1EntryStrategy(
+        mode=st.mode, scope=settings.broker.account_scope_id.strip() or "unscoped",
+        candidates=candidates or reader.read, quote=quote,
+        keys=SignalKeyStore(keys_path(settings.storage.state_file, st.mode)),
+        decisions=_jsonl_sink(Path(settings.storage.state_file).with_name("strategy_decisions.jsonl")),
+        entry_start=_time(int(hh), int(mm)), entry_end=entry_end, quantity=st.quantity)
+
+
 def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
-                should_stop=None, quote_source=None):
+                should_stop=None, quote_source=None, candidates=None):
     """하루 수명주기 실행. 테스트에서 clock/sleep/should_stop을 주입할 수 있음."""
     from infra.storage.runner_status import status_path
     runner, executor = build_session_runner(settings, broker, app_logger, strategy=strategy, clock=clock, sleep=sleep,
                                             should_stop=should_stop, quote_source=quote_source,
-                                            status_file=status_path(settings))
+                                            status_file=status_path(settings), use_settings_strategy=True,
+                                            candidates=candidates)
     try:
         summary = runner.run()
     finally:

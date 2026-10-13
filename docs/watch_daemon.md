@@ -7,7 +7,8 @@
 ## 작업
 | 작업 | 실행 가능 시각 (Asia/Seoul) | 하는 일 |
 |---|---|---|
-| CLOSE_PREP(D) | D 정규장 종료 + 160분(잠정 완성 기준 — 확정값 아님) 뒤, 다음 거래일 완성 전까지 | 그날 마감 뒤 목록이 없으면 목록(2회) → 설정 반영(적용 잠금) → 지정 종목·지수 일봉 준비 → 지정 종목 S1 관찰 → 보고서 |
+| CLOSE_PREP(D) | D 정규장 종료 + 300분(일반 20:30, M3 B — 이전 160분/18:10 봉이 뒤에 바뀐 것을 재현해 늦춤. 공급자 확정 보장 아님) 뒤, 다음 거래일 완성 전까지 | 그날 마감 뒤 목록이 없으면 목록(2회) → 설정 반영(적용 잠금) → 지정 종목·지수 일봉 준비 → 지정 종목 S1 관찰 → 보고서 |
+| INPUT_CHECK(D) | D 개장 20분 전(일반 08:40) ~ 기한 개장 5분 전(08:55) | 직전 거래일 개장 후보(A5 선정 규칙)마다 스캔이 쓴 입력 창(종목·그 종목 지수 300세션)을 다시 받아 스캔 당시 값과 비교 → STABLE / INPUT_CHANGED / CHECK_FAILED를 `input_check` 표에 추가(연구 DB는 바꾸지 않음). 조회 실패면 PARTIAL로 기한 안에서 다시, 기한 넘기면 MISSED(그날 승인 없음). 후보 없으면 조회 0회 |
 | OPEN_CHECK(D) | D 개장 + 5분(달력의 실제 개장 — 1/2 특수 개장은 10:05) 뒤 | 직전 거래일 지정 종목 관찰의 **개장 전 저장 완료** PASS 후보 가격 기록(A5-1 규칙) |
 
 - CLOSE_PREP 기한(다음 거래일 완성 시각)을 넘기면 MISSED — 지난 날의 신호를 나중에 만들지 않음(일봉은 다음 준비가 이어 받음).
@@ -61,7 +62,7 @@
   이미 저장된 가격은 그대로.
 
 ## 작업 키·상태·재시도
-- task_key = `CLOSE_PREP|D|scope:v2:<해시>` / `OPEN_CHECK|D|OPEN+5m`. CLOSE_PREP 범위(W2 검토 R4)는 결과를 바꾸는 것만 넣음:
+- task_key = `CLOSE_PREP|D|scope:v2:<해시>` / `INPUT_CHECK|D|OPEN-20m` / `OPEN_CHECK|D|OPEN+5m`. CLOSE_PREP 범위(W2 검토 R4)는 결과를 바꾸는 것만 넣음:
   감시·S1 대상 코드 + **S1 계산 계약 해시**(전략·S1 설정 해시·달력 버전·완성 지연 after_close·선정 코드 등) + **분석 준비 기준**
   (analysis_basis) + 준비 이력 길이(history_sessions). 관심 가격대·수동 보유 수량/평단/손절·메모·알림 설정은 넣지 않음 — 바뀌어도 같은
   날 다시 준비하지 않음. 실행한 계산 계약·**실제로 쓴** 설정 버전(목록 갱신 뒤 다시 읽은 버전)은 행에 기록.
@@ -75,7 +76,7 @@
 - YIELDED: 실패로 세지 않음. 다시 실행 가능한 시각은 양보 사유별(아래). COMPLETE는 다시 실행하지 않음 — 보고서만 `report --day`.
 
 ## 우선순위·양보·호출 예산 (W2 검토 R2·R3)
-- OPEN_CHECK > CLOSE_PREP(오래된 날 먼저).
+- OPEN_CHECK > INPUT_CHECK > CLOSE_PREP(오래된 날 먼저). 마감 준비는 실행 가능한 입력 재확인이 있으면 `PRIORITY:INPUT_CHECK`로 양보.
 - **요청 경계 검사**: 조회 클라이언트가 실제 요청을 보내기 직전마다(토큰 발급·연속조회 페이지·429/401 재시도 포함) 관리자의 검사를
   부름. 막히면 그 요청은 보내지 않고 작업이 YIELDED. 대상 사이(`prepare_data`)도 같은 규칙.
 - **사용량**: 통과한 요청은 보내기 **전에** 요청일(관리자 시계 날짜) 사용량 +1을 저장 — 강제 종료돼도 빠지지 않고, 자정에 걸친 작업은
@@ -165,7 +166,7 @@ python tools/watch_daemon.py report --day 2026-10-08
 | 설정 적용 중 중단 | 적용 저널로 다음 실행이 원래 파일 복원 또는 확정 확인(docs/watchlist.md 적용 경계) | — |
 
 ## 저장·보고서
-- `data/watch/daemon.sqlite3`(wd3 — task·task_event·daemon_run(+진척·중지 요청 시각)·call_usage·candidate_gate(+저장 완료 시각); wd1·wd2는 열 때 자동으로 올림), `watch_s1.sqlite3`(지정 종목 S1 관찰, 관찰 DB s4 형식),
+- `data/watch/daemon.sqlite3`(wd4 — task·task_event·daemon_run(+진척·중지 요청 시각)·call_usage·candidate_gate(+저장 완료 시각)·input_check(M3 B 개장 전 입력 재확인); wd1~wd3는 열 때 복구용 사본을 남기고 자동으로 올림), `watch_s1.sqlite3`(지정 종목 S1 관찰, 관찰 DB s4 형식),
   `watch_open.sqlite3`(개장 확인, A5 a3 형식). 기존 DB는 바꾸지 않음(새 파일).
 - 보고서 `reports/watch/daily/watch_<D>.md`(작업·설정 버전·준비·관찰(계산)·운영 진입 게이트·개장 확인), `reports/watch/s1/`, `reports/watch/open/`. 로그
   `logs/watch_daemon.log`(토큰·앱키·계좌 값 가림). 모두 git 제외.

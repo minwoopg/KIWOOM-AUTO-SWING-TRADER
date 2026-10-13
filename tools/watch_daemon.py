@@ -38,7 +38,7 @@ from infra.watch.apply import ConfigLockTimeout, file_lock  # noqa: E402
 from infra.watch.daemon import (  # noqa: E402
     DaemonPaths, DaemonSettings, DaemonStore, WatchDaemon, daemon_lock, write_daily_report)
 from infra.research.s1_scanner import calendar_version  # noqa: E402
-from infra.watch.manager import load_state  # noqa: E402
+from infra.watch.manager import WATCH_AFTER_CLOSE, load_state  # noqa: E402
 from infra.watch.store import WatchStore  # noqa: E402
 from tools.research_collect import _LazyClient, make_client  # noqa: E402
 from utils.time_utils import now_local  # noqa: E402
@@ -62,7 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--env-file", default=str(ROOT / ".env"))
     p.add_argument("--base-url", default="https://mockapi.kiwoom.com")
     p.add_argument("--sleep", type=float, default=1.0, help="API 호출 간격(초, 0.5 이상)")
-    p.add_argument("--after-close-min", type=int, default=int(BAR_COMPLETE_AFTER_CLOSE.total_seconds() // 60))
+    p.add_argument("--after-close-min", type=int, default=int(WATCH_AFTER_CLOSE.total_seconds() // 60),
+                   help="일봉 완성 기준(정규장 종료 뒤 분) — 기본 300(15:30 마감 → 20:30). 공급자 확정 보장 아님, 다음날 08:40 입력 재확인")
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
     r.add_argument("--poll-sec", type=float, default=60.0)

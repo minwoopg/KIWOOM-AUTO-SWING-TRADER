@@ -166,7 +166,9 @@ def cli(env, *args, clock_t: datetime | None = None) -> tuple[int, str]:
         env["clock"].t = clock_t
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = W.main(["--config", str(env["cfg"]), "--watch-db", str(env["wdb"]), "--db", str(env["db"]), *args],
+        # 이 시험들은 19:00(=마감+160분 뒤) 시나리오 — 기본 완성 기준이 300분(20:30, M3 B)으로 바뀌어 명시
+        code = W.main(["--config", str(env["cfg"]), "--watch-db", str(env["wdb"]), "--db", str(env["db"]),
+                       "--after-close-min", "160", *args],
                       client=env["client"], now=env["clock"], calendar=CAL)
     return code, buf.getvalue()
 

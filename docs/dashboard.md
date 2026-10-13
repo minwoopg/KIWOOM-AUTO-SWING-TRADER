@@ -24,7 +24,7 @@ python -m dashboard.desktop
 | 상단 왼쪽 · 관리자 | 실행 중 / 응답 없음(heartbeat 180초 초과) / 중지됨, heartbeat, 현재 작업, 실행 ID, 코드 버전(로그의 시작 줄), 모드 | `daemon.sqlite3` daemon_run, `logs/watch_daemon.log` |
 | 상단 가운데 · 매매 실행기 | 같은 판정, 단계, 실행 모드(MOCK_LOCAL/KIWOOM_PAPER), 계좌 라벨, 코드 버전, 자동 전략 연결 여부, 잔고 조회·장부 대조 | `data/runner_status.json` |
 | 상단 오른쪽 · 신규 매수 중단 | 중단 없음 / 요청됨(반영 전) / 반영됨, 요청·반영 시각, 사유 입력 + 요청 버튼 | `commands/halt_new_buys.json` + 상태 파일 |
-| 탭 · 오늘 진행 | 신호일 마감 준비, 일봉 입력 재확인(미구현 표시), 개장 확인, 오늘 마감 준비, 후보 확정(0건 정상 / 확인 불가 구분), 주문 실행 | `daemon.sqlite3` task |
+| 탭 · 오늘 진행 | 신호일 마감 준비, 일봉 입력 재확인(08:40 결과·승인 종목, 없으면 '기록 없음 — 승인 없음'), 개장 확인, 오늘 마감 준비, 후보 확정(0건 정상 / 확인 불가 구분), 주문 실행 | `daemon.sqlite3` task |
 | 탭 · 감시 종목 | 종목명·코드, 가격 데이터·분석, S1, 신규 진입 제외 사유 | `watch.sqlite3`, `watch_s1.sqlite3`, candidate_gate |
 | 탭 · 보유 | 원장·잔고 수량·평균가·조회 시각. 최근 평가가격·손절 기준·시간 청산은 **미구현으로 표시** | 원장, 상태 파일 |
 | 탭 · 주문 | M1 도구 주문(시장가·지정가 취소 실측), 실행기 추적 주문(체결/미체결), ERROR·orphan 종목 | `paper_orders.jsonl`, 상태 파일 |

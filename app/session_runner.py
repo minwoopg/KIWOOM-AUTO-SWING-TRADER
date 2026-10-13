@@ -55,6 +55,8 @@ class SessionConfig:
     # M3 A2: 지정가 진입 마감 — 이 시각 이후 신규 지정가 매수 거부, 이 실행이 낸 미체결 지정가 매수 취소.
     # None이면 아무것도 하지 않음(기본 — 기존 동작 그대로).
     entry_cancel_at: time | None = None
+    # M3 B: 매수 의도 수량 상한(최소판 1). None이면 검사 안 함(기존 동작).
+    max_buy_quantity: int | None = None
 
     def __post_init__(self) -> None:
         if self.poll_interval_sec < 10:
@@ -89,6 +91,8 @@ class SessionSummary:
     execution_mode: str = ""             # M0 커밋 1: MOCK_LOCAL / KIWOOM_PAPER (run_session이 채움)
     account_scope: str = ""              # 비민감 계좌 라벨(계좌번호 아님)
     cancels_requested: int = 0           # M3 A2: 지정가 매수 취소 요청(접수·거절·불명 포함)
+    shadow_intents: int = 0              # M3 B: 그림자 모드 — 전송하지 않고 기록한 주문 의도
+    strategy_mode: str = ""              # off / shadow / paper
 
     def add_close_issue(self, issue: str) -> None:
         if issue not in self.close_issues:
@@ -115,6 +119,7 @@ class SessionSummary:
             "ticks": self.ticks, "balance_failures": self.balance_failures,
             "orders_sent": self.orders_sent, "orders_accepted": self.orders_accepted,
             "fills_recorded": self.fills_recorded, "cancels_requested": self.cancels_requested,
+            "strategy_mode": self.strategy_mode, "shadow_intents": self.shadow_intents,
         }
 
     def lines(self) -> list[str]:
@@ -127,6 +132,9 @@ class SessionSummary:
             f" | 원장 기록 {self.fills_recorded}건"
             + (f" | 지정가 취소 요청 {self.cancels_requested}" if self.cancels_requested else ""),
         ]
+        if self.strategy_mode and self.strategy_mode != "off":
+            out.append(f"전략 모드 {self.strategy_mode}"
+                       + (f" | 그림자 의도 {self.shadow_intents}건(전송 안 함)" if self.strategy_mode == "shadow" else ""))
         if self.denied_codes:
             out.append("차단 사유: " + ", ".join(f"{k} {v}" for k, v in sorted(self.denied_codes.items())))
         if self.halted_reason:
@@ -165,6 +173,8 @@ class SessionRunner:
         status_file=None,
         commands_dir: str | None = None,
         meta: dict | None = None,
+        send_orders: bool = True,
+        shadow_sink: Callable[[dict], None] | None = None,
     ) -> None:
         self.broker = broker
         self.executor = executor
@@ -205,6 +215,9 @@ class SessionRunner:
         self.buy_halt: dict | None = None
         self._limit_buy_orders: dict[str, str] = {}     # M3 A2: 이 실행이 낸 지정가 매수 (주문번호 → 종목)
         self._cancel_results: dict[str, str] = {}       # 종목 → 마지막 취소 요청 결과 코드
+        # M3 B: 그림자 모드 — 의도·안전 한도 판정까지 하고 전송하지 않음(기록만)
+        self.send_orders = send_orders
+        self.shadow_sink = shadow_sink
 
     # ── 진입점 ──────────────────────────────────────────────
 
@@ -418,6 +431,25 @@ class SessionRunner:
         self.executor.save_state()
         return ctx
 
+    def _shadow(self, intent: OrderIntent, ctx: TickContext, *, allowed: bool, code: str = "", detail: str = "") -> None:
+        """그림자 모드 기록 — 전송하지 않음. 판정(허용/차단 사유)과 의도 전체를 남김."""
+        if self.send_orders:
+            return
+        if allowed:
+            self.summary.shadow_intents += 1
+        rec = {"at": ctx.now.isoformat(timespec="seconds"), "run_id": self.run_id, "symbol": intent.symbol,
+               "side": intent.side, "quantity": intent.quantity, "order_type": intent.order_type,
+               "limit_price": intent.limit_price, "reference_price": intent.reference_price, "reason": intent.reason,
+               "context": intent.context, "would_send": allowed, "deny_code": code, "deny_detail": detail}
+        self.log.info(f"[SHADOW] {intent.symbol} {intent.side} {intent.quantity}주 "
+                      f"{intent.order_type} {intent.limit_price or ''} → "
+                      + ("전송했을 것(그림자 — 전송 안 함)" if allowed else f"차단 {code}"))
+        if self.shadow_sink is not None:
+            try:
+                self.shadow_sink(rec)
+            except Exception as exc:                     # noqa: BLE001 — 기록 실패가 실행을 멈추지 않음
+                self.log.warning(f"[SHADOW] 기록 실패: {type(exc).__name__}: {exc}")
+
     def _handle_intent(self, intent: OrderIntent, ctx: TickContext) -> None:
         self.summary.intents += 1
         if not isinstance(intent, OrderIntent):
@@ -430,6 +462,15 @@ class SessionRunner:
             self.summary.denied_codes["BUY_HALTED"] = self.summary.denied_codes.get("BUY_HALTED", 0) + 1
             self.log.info(f"[GUARD] {intent.symbol} BUY {intent.quantity}주 차단 | BUY_HALTED | "
                           f"요청 {self.buy_halt.get('request_id')}")
+            self._shadow(intent, ctx, allowed=False, code="BUY_HALTED")
+            return
+        if (intent.side == "BUY" and self.cfg.max_buy_quantity is not None
+                and intent.quantity > self.cfg.max_buy_quantity):
+            self.summary.intents_denied += 1
+            self.summary.denied_codes["QTY_LIMIT"] = self.summary.denied_codes.get("QTY_LIMIT", 0) + 1
+            self.log.critical(f"[GUARD] {intent.symbol} BUY {intent.quantity}주 차단 | QTY_LIMIT | "
+                              f"최소판 상한 {self.cfg.max_buy_quantity}주")
+            self._shadow(intent, ctx, allowed=False, code="QTY_LIMIT")
             return
         if (intent.side == "BUY" and intent.order_type == "limit" and self.cfg.entry_cancel_at is not None
                 and ctx.now.time() >= self.cfg.entry_cancel_at):
@@ -437,6 +478,7 @@ class SessionRunner:
             self.summary.denied_codes["ENTRY_WINDOW_CLOSED"] = self.summary.denied_codes.get("ENTRY_WINDOW_CLOSED", 0) + 1
             self.log.info(f"[GUARD] {intent.symbol} 지정가 BUY 차단 | ENTRY_WINDOW_CLOSED | "
                           f"진입 마감 {self.cfg.entry_cancel_at:%H:%M}")
+            self._shadow(intent, ctx, allowed=False, code="ENTRY_WINDOW_CLOSED")
             return
         prices: dict[str, int] = {}
         reserve, unknown_pending = 0, False
@@ -452,6 +494,10 @@ class SessionRunner:
             self.summary.intents_denied += 1
             self.summary.denied_codes[decision.code] = self.summary.denied_codes.get(decision.code, 0) + 1
             self.log.info(f"[GUARD] {intent.symbol} {intent.side} {intent.quantity}주 차단 | {decision.code} | {decision.detail}")
+            self._shadow(intent, ctx, allowed=False, code=decision.code, detail=decision.detail)
+            return
+        if not self.send_orders:
+            self._shadow(intent, ctx, allowed=True)
             return
         held = next((p for p in ctx.balance.positions if p.symbol == intent.symbol), None)
         base_qty = held.quantity if held else 0
@@ -581,6 +627,10 @@ class SessionRunner:
             **self.meta,
             "strategy_id": getattr(self.strategy, "strategy_id", ""),
             "strategy_connected": getattr(self.strategy, "strategy_id", "null") not in ("null", ""),
+            "strategy_mode": "shadow" if not self.send_orders else self.meta.get("strategy_mode", "off"),
+            "strategy_book": (self.strategy.book.to_dict() if getattr(self.strategy, "book", None) is not None
+                              and hasattr(self.strategy.book, "to_dict") else None),
+            "shadow_intents": self.summary.shadow_intents,
             "buy_halt": self.buy_halt, "halted_reason": self._halted_reason,
             "last_balance_at": iso(self._last_balance_ok_at), "last_balance_error": self.last_balance_error,
             "last_reconcile_at": iso(self._last_reconcile_at),

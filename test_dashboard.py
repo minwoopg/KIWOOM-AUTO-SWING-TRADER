@@ -58,8 +58,9 @@ check("3) 자동 전략 미연결(NullStrategy) 표시, 주문 실행 단계도 
       rn.data["strategy_label"].startswith("자동 전략 미연결")
       and any(r["단계"] == "주문 실행(실행기)" and "미연결" in r["상태"] for r in snap["progress"].data))
 prog = {r["단계"]: r for r in snap["progress"].data}
-check("4) 후보 0건은 '정상 완료'로, 일봉 입력 재확인은 '미구현'으로 구분",
-      prog["후보 확정"]["상태"] == "후보 0건(정상 완료)" and prog["일봉 입력 재확인(08:40)"]["상태"].startswith("미구현")
+check("4) 후보 0건은 '정상 완료'로, 일봉 입력 재확인 기록이 없으면 '기록 없음 — 그날 후보 승인 없음'으로 구분(M3 B)",
+      prog["후보 확정"]["상태"] == "후보 0건(정상 완료)" and prog["일봉 입력 재확인(08:40)"]["상태"].startswith("기록 없음")
+      and "승인 없음" in prog["일봉 입력 재확인(08:40)"]["상태"]
       and prog["개장 확인"]["상태"].startswith("COMPLETE"))
 w = {r["코드"]: r for r in snap["watch"].data}
 check("5) 감시 종목: HOLD 종목과 제외 사유(분석 HOLD·게이트), 가격 UNKNOWN 종목, S1 FAIL/UNKNOWN, 종목명",

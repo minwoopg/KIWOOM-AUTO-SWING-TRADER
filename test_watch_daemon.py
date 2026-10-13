@@ -299,8 +299,8 @@ at(E1, datetime(2026, 10, 7, 23, 59, 30))
 r_mid1 = d1.tick()
 at(E1, datetime(2026, 10, 8, 0, 0, 30))
 r_mid2 = d1.tick()
-check("2-4) 자정 전환: 23:59·00:00 순회 모두 할 일 없음, 다음 예정은 10/8 09:05",
-      r_mid1["ran"] is None and r_mid2["ran"] is None and r_mid2["next_due"] == datetime(2026, 10, 8, 9, 5))
+check("2-4) 자정 전환: 23:59·00:00 순회 모두 할 일 없음, 다음 예정은 10/8 08:40(개장 전 입력 재확인 — M3 B)",
+      r_mid1["ran"] is None and r_mid2["ran"] is None and r_mid2["next_due"] == datetime(2026, 10, 8, 8, 40))
 at(E1, datetime(2026, 10, 8, 9, 6))
 n2 = len(E1["fake"].calls)
 r_open = d1.tick()
@@ -884,7 +884,8 @@ with D.DaemonStore(EJ2["paths"].daemon_db) as ds:
 argsJ = ["--config", str(EJ2["paths"].config), "--watch-db", str(EJ2["paths"].watch_db), "--db",
          str(EJ2["paths"].research_db), "--daemon-db", str(EJ2["paths"].daemon_db), "--watch-scan-db",
          str(EJ2["paths"].watch_scan_db), "--watch-open-db", str(EJ2["paths"].watch_open_db), "--report-dir",
-         str(EJ2["paths"].report_dir), "--log-file", str(EJ2["paths"].log_file)]
+         str(EJ2["paths"].report_dir), "--log-file", str(EJ2["paths"].log_file),
+         "--after-close-min", "160"]   # 이 시험은 19:00 마감 준비 시나리오(기본 300분 = 20:30 이전 설계)
 with contextlib.redirect_stdout(buf):
     rcJ = WD.main(argsJ + ["run", "--until-idle", "--daily-call-cap", "4", "--open-check-reserve", "0"],
                   client=EJ2["client"], now=EJ2["clock"], calendar=CAL, sleep=EJ2["clock"].sleep, log=lambda m: None)
@@ -1466,7 +1467,7 @@ tok0_o1 = EO["fake"].tokens                                   # 환경 준비(�
 argsO = ["--config", str(EO["paths"].config), "--watch-db", str(EO["paths"].watch_db), "--db", str(EO["paths"].research_db),
          "--daemon-db", str(EO["paths"].daemon_db), "--watch-scan-db", str(EO["paths"].watch_scan_db), "--watch-open-db",
          str(EO["paths"].watch_open_db), "--report-dir", str(EO["paths"].report_dir), "--log-file", str(EO["paths"].log_file),
-         "--env-file", str(EO["dir"] / "fake.env"), "--sleep", "0.5"]
+         "--env-file", str(EO["dir"] / "fake.env"), "--sleep", "0.5", "--after-close-min", "160"]
 real_le, real_cli, real_sess = RC.load_env, RC.ReadOnlyResearchClient, _requests.Session
 RC.load_env = lambda p: {"KIWOOM_APP_KEY": "APPKEY-XYZ", "KIWOOM_SECRET_KEY": "SECRET-XYZ"}   # 가짜 키(파일 없음)
 RC.ReadOnlyResearchClient = functools.partial(real_cli, now=EO["clock"], monotonic=EO["clock"].mono,
@@ -1694,7 +1695,7 @@ with contextlib.redirect_stdout(buf):
                   now=lambda: datetime(2026, 10, 12, 10, 0), calendar=CAL)
 st1 = buf.getvalue()
 check("8-1) status: 관리자 상태·run_id·설정 버전·오늘 호출 수·다음 예정·작업별 상태/시도/다음 시도·오류",
-      "관리자: 중지됨" in st1 and "run_id wd_" in st1 and "v1 사용 중" in st1 and "다음 예정 2026-10-12T18:10:00" in st1
+      "관리자: 중지됨" in st1 and "run_id wd_" in st1 and "v1 사용 중" in st1 and "다음 예정 2026-10-12T20:30:00" in st1
       and "| CLOSE_PREP | 2026-10-08 | COMPLETE |" in st1)
 logs = "\n".join(E1.get("logs", [])) + "\n" + "\n".join(E10.get("logs", []))
 check("8-2) 로그에 토큰·앱키 값 없음(가림 함수: token=…·appkey: … → ***)",

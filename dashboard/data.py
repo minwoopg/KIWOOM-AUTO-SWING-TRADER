@@ -217,7 +217,8 @@ def runner_status(p: Paths, now: datetime) -> Section:
         label = (f"응답 없음 — heartbeat {age:.0f}초 전(멈춤·비정상 종료 의심)" if age is not None
                  else "응답 없음")
     d = {**d, "label": label, "heartbeat_age_sec": age,
-         "strategy_label": "자동 전략 연결됨" if d.get("strategy_connected") else "자동 전략 미연결(NullStrategy)"}
+         "strategy_label": ("S1 그림자(전송 안 함)" if d.get("strategy_mode") == "shadow" else
+                            "자동 전략 연결됨" if d.get("strategy_connected") else "자동 전략 미연결(NullStrategy)")}
     return Section(OK, d, source=sec.source, as_of=d.get("heartbeat_at", ""))
 
 
@@ -274,12 +275,29 @@ def today_progress(p: Paths, day: date, runner: Section) -> Section:
         why = f"관리자 DB {STATE_LABEL[sec.state]}"
         for title in ("마감 준비(신호일)", "개장 확인", "후보 확정"):
             rows.append({"단계": title, "상태": f"기록 없음 — {why}", "시각": "", "사유": sec.error})
-    rows.insert(1, {"단계": "일봉 입력 재확인(08:40)", "상태": "미구현(자동 모의매매 최소판 B 단계)", "시각": "", "사유": ""})
+    ic = next((t for t in (sec.data or []) if t["kind"] == "INPUT_CHECK" and t["trading_day"] == day.isoformat()),
+              None) if sec.state == OK else None
+    if ic is None:
+        rows.insert(1, {"단계": "일봉 입력 재확인(08:40)", "상태": "기록 없음(08:40~08:55 실행 — 없으면 그날 후보 승인 없음)",
+                        "시각": "", "사유": ""})
+    else:
+        det = json.loads(ic["detail_json"] or "{}")
+        res = det.get("result")
+        label = (f"{ic['status']} — 승인 {det.get('approved') or []}" if isinstance(res, dict) else
+                 f"{ic['status']} — {res or ic['error'] or ''}")
+        rows.insert(1, {"단계": "일봉 입력 재확인(08:40)", "상태": label, "시각": ic["finished_at"] or ic["started_at"] or "",
+                        "사유": json.dumps(res, ensure_ascii=False) if isinstance(res, dict) else (ic["error"] or ""),
+                        "작업": ic["task_key"], "계약": ic["contract_hash"] or ""})
     if runner.state == OK:
         d = runner.data
         c = d.get("counters") or {}
-        st = (d["strategy_label"] if not d.get("strategy_connected") else
-              f"전송 {c.get('orders_sent', 0)} · 접수 {c.get('orders_accepted', 0)} · 차단 {c.get('intents_denied', 0)}")
+        if d.get("strategy_mode") == "shadow":
+            bk = d.get("strategy_book") or {}
+            st = (f"그림자(전송 안 함) — 의도 {d.get('shadow_intents', 0)} · 차단 {c.get('intents_denied', 0)} · 후보 "
+                  f"{bk.get('state', '읽기 전')} 승인 {[a.get('symbol') for a in bk.get('approved') or []]}")
+        else:
+            st = (d["strategy_label"] if not d.get("strategy_connected") else
+                  f"전송 {c.get('orders_sent', 0)} · 접수 {c.get('orders_accepted', 0)} · 차단 {c.get('intents_denied', 0)}")
         rows.append({"단계": "주문 실행(실행기)", "상태": st, "시각": d.get("heartbeat_at", ""),
                      "사유": ", ".join(f"{k} {v}" for k, v in (d.get("denied_codes") or {}).items())})
     else:

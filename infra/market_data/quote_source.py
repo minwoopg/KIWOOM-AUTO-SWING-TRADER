@@ -69,6 +69,27 @@ class KiwoomQuoteSource:
         return out
 
 
+    BOOK_ENDPOINT = "/api/dostk/mrkcond"
+    BOOK_API_ID = "ka10004"
+
+    def get_quote(self, symbol: str) -> tuple[int | None, int | None]:
+        """주문 직전 재확인용 (현재가, 최우선 매도호가) — ka10001 + ka10004(2026-10-02 실측 필드 sel_fpr_bid).
+        조회 실패·값 이상은 None(그 값으로 판단하지 않음 — 전략이 보류)."""
+        price = self.get_prices([symbol]).get(symbol)
+        self._pace()
+        self.calls += 1
+        try:
+            resp = self.broker._post(endpoint=self.BOOK_ENDPOINT, api_id=self.BOOK_API_ID,
+                                     payload={"stk_cd": symbol}, cont_yn="N", next_key="")
+            body = resp.body if isinstance(resp.body, dict) else {}
+            ask = _abs_int(body.get("sel_fpr_bid"))
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warning(f"[QUOTE] {symbol} 호가 조회 실패: {type(exc).__name__}: {exc}")
+            return price, None
+        return price, (ask if ask > 0 else None)
+
+
 class StaticQuoteSource:
     """테스트·모의 실행용 고정 가격표."""
 

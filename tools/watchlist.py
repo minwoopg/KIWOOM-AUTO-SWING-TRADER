@@ -43,6 +43,7 @@ from infra.research.collector import BAR_COMPLETE_AFTER_CLOSE, CollectError, Res
 from infra.research.kiwoom_readonly import ResearchApiError, ResearchConfigError  # noqa: E402
 from infra.research.store import ResearchStore  # noqa: E402
 from infra.watch.manager import (  # noqa: E402
+    WATCH_AFTER_CLOSE,
     READY, WatchNotReady, analysis_basis, check_text, entry_gate, listing_from_store, load_state,
     prepare_data, read_config_text,
 )
@@ -74,7 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sleep", type=float, default=1.0)
     p.add_argument("--lock-timeout", type=float, default=DEFAULT_LOCK_TIMEOUT,
                    help="설정 적용 잠금 대기 상한(초) — 넘으면 아무것도 바꾸지 않고 종료 코드 2")
-    p.add_argument("--after-close-min", type=int, default=int(BAR_COMPLETE_AFTER_CLOSE.total_seconds() // 60))
+    p.add_argument("--after-close-min", type=int, default=int(WATCH_AFTER_CLOSE.total_seconds() // 60),
+                   help="일봉 완성 기준(정규장 종료 뒤 분) — 기본 300(15:30 마감 → 20:30). 공급자 확정 보장 아님, 다음날 08:40 입력 재확인")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init")
     v = sub.add_parser("validate")

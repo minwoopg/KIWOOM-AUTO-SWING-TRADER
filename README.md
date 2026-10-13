@@ -28,6 +28,7 @@
   M1 1주 수동 주문 실측·원장 정정: [`docs/mock_order_m0_m1.md`](docs/mock_order_m0_m1.md).
   지정가 매수·09:30 미체결 취소·실제 체결가 근거(M3 A2, 전략 미연결): [`docs/m3_a2_limit_cancel.md`](docs/m3_a2_limit_cancel.md)
   — 오늘 체결가 확인 `python tools/paper_order.py confirm-fills [--confirm]`.
+  20:30 스캔·08:40 입력 재확인·후보 승인·S1 그림자(`swing_strategy.mode: shadow`, M3 B): [`docs/m3_b_candidates_shadow.md`](docs/m3_b_candidates_shadow.md).
 - **관리 창**: `scripts\run_dashboard.bat`(Tkinter 데스크톱, 추가 설치 없음) — 읽기 전용 + 신규 매수 중단 요청. [`docs/dashboard.md`](docs/dashboard.md).
 
 ## 프로젝트 구조

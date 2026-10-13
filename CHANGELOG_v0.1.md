@@ -1938,4 +1938,42 @@ GPT 검토(R1~R4): 체결조회 행의 주문번호를 원장 기록 전에 검�
 ### 전달 파일
 - 패치 1개 — 기준 `0aea3ca`
 
+## 2026-10-13 — M3 B: 20:30 스캔·08:40 입력 재확인·읽기 전용 후보 승인·S1 그림자 운영 (GPT 최소판 요청 2, 기준 `5081913`)
+
+### 배경
+GPT 최소판 요청 2(일봉 승인·읽기 전용 후보 연결)와 `5081913` 검토(B → C 진행, 동일 신호 재진입은 영속 키로 차단). 18:10에 받은 당일 봉이 뒤에
+바뀐 것(10/8·10/12 재현)에 대해 20:30 스캔 + 다음 날 08:40 입력 재확인으로 대응. 실제 전송(paper)은 C 뒤.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `infra/watch/manager.py`, `tools/watch_daemon.py`, `tools/watchlist.py` | 관리자·watchlist 완성 기준 기본 마감 + 300분(20:30) — `--after-close-min`으로 바꿀 수 있음. 연구 수집(160분)은 그대로 |
+| `infra/watch/daemon.py` | INPUT_CHECK 작업(개장 20분 전~5분 전): 후보마다 종목·지수 입력 창 재조회·비교(STABLE/INPUT_CHANGED/CHECK_FAILED), 연구 DB 불변, 실패는 PARTIAL·기한 넘으면 MISSED. 스키마 wd4(`input_check` 표, wd3 사본 뒤 올림), 우선순위 OPEN > INPUT > PREP, 보고서 |
+| `app/candidates.py` (신규) | 관리자·A5·스캔 DB `mode=ro` 교차 검증 8단계 → 승인 후보(지정가 = 진입 상한 호가 내림) / 사유별 제외 / WAITING / ERROR |
+| `app/s1_strategy.py` (신규), `infra/storage/signal_keys.py` (신규) | S1 진입: 09:05~09:30, 1주, 최대 보유 1, 주문 직전 현재가·최우선 매도호가 재확인, 신호 키를 의도 전에 기록(같은 신호 한 번), 판단 기록 |
+| `infra/market_data/quote_source.py` | `get_quote` — ka10001 현재가 + ka10004 최우선 매도호가 |
+| `config/settings.py`, `app/main.py`, `app/session_runner.py` | `swing_strategy`(off/shadow/paper — paper는 C 전 기동 거부), 그림자: 안전 한도까지 판정하고 전송 안 함(`shadow_intents.jsonl`), 실행기 수량 상한(QTY_LIMIT), 상태 파일·요약에 모드·후보 상태. M1 도구 경로는 설정 전략을 쓰지 않음 |
+| `tools/probe_market_basis.py` (신규) | 시장 기준 실측(읽기 전용) — 단축코드·_NX·_AL 일봉 비교 |
+| `dashboard/data.py` | 오늘 진행: 입력 재확인 결과·승인 종목, 실행기 그림자 상태 |
+| `docs/m3_b_candidates_shadow.md` (신규), `docs/watch_daemon.md`, `docs/dashboard.md`, README | 하루 흐름·승인 조건·켜는 법 |
+
+### 테스트 및 검증
+- 새 시험: `test_input_check.py` 14(일정·정상 STABLE·원본 보존·바뀐 봉·조회 실패 재시도·기한·늦은 기동·후보 없음·스키마 올림·저장소 무변경·시장 기준 도구),
+  `test_s1_shadow.py` 12(관리자 실제 흐름으로 만든 DB에서 승인, 읽기 전용 바이트 동일, 잠정 스캔·입력 변경·상한 위·게이트·재확인 없음 거부,
+  WAITING·ERROR, 그림자 전송 0·의도 1, 판단 기록, 같은 신호 재실행 없음, 가격 보류, 최대 보유, paper 거부·M1 경로 분리).
+- 기존 시험 기대값 변경: 관리자 다음 예정 09:05 → 08:40(입력 재확인), status 다음 예정 18:10 → 20:30, 19:00 시나리오 CLI 시험은
+  `--after-close-min 160` 명시, 관리 창 '미구현' → '기록 없음 — 승인 없음', Settings 필드에 swing_strategy.
+- 변이 확인: 잠정 스캔 거부·입력 재확인 상태·최대 보유·호가 검사·INPUT_CHANGED 판정을 끄면 해당 시험 실패(신호 키 확인은 claim이 한 번 더 막음).
+- 회귀 45/45(`test_broker_order_status.py` 제외 — 통과로 세지 않음), 동등성 18/18. Python 3.11·3.14rc2.
+
+### 변경하지 않은 것
+- S1 조건·기준값, A5 선정·판정 규칙, 주문 경로(전송은 여전히 없음), 연구 수집의 완성 기준, `config/settings.yaml`.
+
+### 다음 작업
+- 사용자: 관리자 재기동(오늘 20:30 새 계약으로 10/13 스캔), 실행기 `swing_strategy.mode: shadow`, 시장 기준 도구 실측.
+- C: E1 손절·10거래일 15:10 시간 청산, 매수일·손절 기준 저장, 일일 손실 한도(실제/추정 비용 공통 계산), paper 전환 조건.
+
+### 전달 파일
+- 패치 1개 — 기준 `5081913`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

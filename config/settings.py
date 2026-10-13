@@ -144,6 +144,39 @@ class GuardSettings:
     buy_price_buffer_pct: float = 1.0    # 시장가 매수 체결가 변동 여유 (8-B)
 
 
+STRATEGY_MODES = ("off", "shadow", "paper")
+
+
+@dataclass(frozen=True)
+class StrategySettings:
+    """자동 전략 연결 (M3 B, settings.yaml `swing_strategy:`). 기본 off — NullStrategy(주문 의도 없음).
+
+    mode
+      off    : NullStrategy
+      shadow : S1 후보를 읽어 주문 의도를 만들고 안전 한도 판정까지 한 뒤 **전송하지 않고 기록**(data/shadow_intents.jsonl)
+      paper  : 실제 모의 전송 — C(E1 청산·일일 손실 한도) 전에는 기동 거부
+    watch_dir: 관리자 DB 폴더(daemon.sqlite3·watch_s1.sqlite3·watch_open.sqlite3) — 읽기 전용(mode=ro)으로만 엶
+    min_after_close_min: 승인할 스캔의 완성 기준 하한(분). 18:10(160분) 스캔은 잠정 관찰로만 남기고 승인하지 않음
+    quantity: 매수 수량(최소판 1주 고정 — 1이 아니면 기동 거부)
+    entry_start: 신규 진입 시작(진입 마감은 session.entry_cancel_at)
+    """
+
+    mode: str = "off"
+    id: str = "s1"
+    watch_dir: str = "data/watch"
+    min_after_close_min: int = 300
+    quantity: int = 1
+    entry_start: str = "09:05"
+
+    def __post_init__(self) -> None:
+        if self.mode not in STRATEGY_MODES:
+            raise ValueError(f"swing_strategy.mode={self.mode!r} (허용: {STRATEGY_MODES})")
+        if self.id != "s1":
+            raise ValueError(f"swing_strategy.id={self.id!r} — 지금은 s1만")
+        if type(self.quantity) is not int or self.quantity != 1:
+            raise ValueError("swing_strategy.quantity는 최소판에서 1 고정")
+
+
 @dataclass(frozen=True)
 class Settings:
     """프로그램 전체 설정을 한 번에 담는 최상위 객체입니다."""
@@ -155,6 +188,8 @@ class Settings:
     market_data: MarketDataConfig = field(default_factory=MarketDataConfig)
     session: SessionSettings = field(default_factory=SessionSettings)
     guard: GuardSettings = field(default_factory=GuardSettings)
+    # yaml 키 swing_strategy — 단타 설정의 strategy 섹션과 섞이지 않게 다른 이름(추출 경계 시험 3-1)
+    swing_strategy: StrategySettings = field(default_factory=StrategySettings)
 
 
 def _substitute_env(value: Any) -> Any:
@@ -184,4 +219,5 @@ def load_settings(path: str | Path = "config/settings.yaml") -> Settings:
                                    for k, v in (raw.get("session") or {}).items()}),
         guard=GuardSettings(**{k: (tuple(v) if isinstance(v, list) else v)
                                for k, v in (raw.get("guard") or {}).items()}),
+        swing_strategy=StrategySettings(**(raw.get("swing_strategy") or {})),
     )

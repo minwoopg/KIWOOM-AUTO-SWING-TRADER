@@ -62,11 +62,15 @@ from infra.watch.manager import WatchNotReady, analysis_basis, entry_gate, listi
 from infra.watch.store import WatchStore
 from utils.trading_calendar import CalendarCoverageError, TradingCalendar
 
-DAEMON_SCHEMA = "wd3"
+DAEMON_SCHEMA = "wd4"
 # wd1 → wd2: candidate_gate 표·daemon_run 진척/중지 요청 시각 열 추가. wd2 → wd3: candidate_gate.committed_at(저장 완료 시각,
 # W2 재검토 I1) 추가 — 이전 행은 NULL(추정해 채우지 않음 = 저장 완료 증거 없음). 기존 행은 모두 보존.
-_UPGRADABLE = ("wd1", "wd2")
-CLOSE_PREP, OPEN_CHECK = "CLOSE_PREP", "OPEN_CHECK"
+# wd3 → wd4 (M3 B): input_check 표(개장 전 입력 재확인) 추가 — 기존 표·행 그대로.
+_UPGRADABLE = ("wd1", "wd2", "wd3")
+CLOSE_PREP, OPEN_CHECK, INPUT_CHECK = "CLOSE_PREP", "OPEN_CHECK", "INPUT_CHECK"
+INPUT_CHECK_LEAD_MIN = 20         # 개장 20분 전(일반 08:40) 실행 가능
+INPUT_CHECK_DEADLINE_MIN = 5      # 개장 5분 전(일반 08:55)까지 — 넘으면 MISSED(후보 승인 없음)
+STABLE, INPUT_CHANGED, CHECK_FAILED = "STABLE", "INPUT_CHANGED", "CHECK_FAILED"
 PENDING, RUNNING, COMPLETE, PARTIAL, YIELDED, FAILED, ABORTED, MISSED, SUPERSEDED = (
     "PENDING", "RUNNING", "COMPLETE", "PARTIAL", "YIELDED", "FAILED", "ABORTED", "MISSED", "SUPERSEDED")
 RETRYABLE = (PARTIAL, FAILED, ABORTED)
@@ -101,6 +105,13 @@ CREATE TABLE IF NOT EXISTS candidate_gate(
   reasons_json TEXT NOT NULL, config_version INTEGER, latest_version INTEGER, latest_status TEXT,
   list_snapshot_id INTEGER, evidence_json TEXT NOT NULL, evaluated_at TEXT NOT NULL, task_key TEXT, committed_at TEXT);
 CREATE INDEX IF NOT EXISTS ix_gate ON candidate_gate(signal_date, contract_hash, symbol, stage);
+CREATE TABLE IF NOT EXISTS input_check(
+  check_id INTEGER PRIMARY KEY AUTOINCREMENT, target_day TEXT NOT NULL, signal_date TEXT NOT NULL,
+  contract_hash TEXT NOT NULL, scan_run_id TEXT NOT NULL, scan_at TEXT NOT NULL, symbol TEXT NOT NULL,
+  series_id TEXT NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL, window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+  scan_bars INTEGER, fresh_bars INTEGER, scan_digest TEXT, fresh_digest TEXT, diffs_json TEXT NOT NULL,
+  market_basis TEXT NOT NULL, checked_at TEXT NOT NULL, task_key TEXT NOT NULL, committed_at TEXT);
+CREATE INDEX IF NOT EXISTS ix_input_check ON input_check(target_day, signal_date, contract_hash, symbol);
 """
 _ADD_COLS = {"daemon_run": (("progress", "TEXT"), ("stop_requested_at", "TEXT")),
              "candidate_gate": (("committed_at", "TEXT"),)}
@@ -325,6 +336,36 @@ class DaemonStore:
                      "evidence_json": json.dumps(r["evidence"], ensure_ascii=False, default=str)}).lastrowid)
         return ids
 
+    def add_input_checks(self, rows: list[dict], at: str) -> list[int]:
+        """입력 재확인 결과 저장(행 추가만 — 덮어쓰지 않음). 커밋 뒤 committed_at 기록."""
+        ids = []
+        with self.tx():
+            for r in rows:
+                cur = self.conn.execute(
+                    "INSERT INTO input_check(target_day, signal_date, contract_hash, scan_run_id, scan_at, symbol, series_id,"
+                    " role, status, window_start, window_end, scan_bars, fresh_bars, scan_digest, fresh_digest, diffs_json,"
+                    " market_basis, checked_at, task_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (r["target_day"], r["signal_date"], r["contract_hash"], r["scan_run_id"], r["scan_at"], r["symbol"],
+                     r["series_id"], r["role"], r["status"], r["window_start"], r["window_end"], r.get("scan_bars"),
+                     r.get("fresh_bars"), r.get("scan_digest"), r.get("fresh_digest"),
+                     json.dumps(r.get("diffs") or [], ensure_ascii=False), r["market_basis"], r["checked_at"],
+                     r["task_key"]))
+                ids.append(cur.lastrowid)
+        with self.tx():
+            self.conn.executemany("UPDATE input_check SET committed_at=? WHERE check_id=?", [(at, i) for i in ids])
+        return ids
+
+    def input_checks(self, target_day: str | None = None) -> list[dict]:
+        q, a = "SELECT * FROM input_check", ()
+        if target_day:
+            q, a = q + " WHERE target_day=?", (target_day,)
+        out = []
+        for r in self.conn.execute(q + " ORDER BY check_id", a):
+            d = dict(r)
+            d["diffs"] = json.loads(d.pop("diffs_json") or "[]")
+            out.append(d)
+        return out
+
     def mark_gates_committed(self, ids: list[int], at: str) -> None:
         if ids:
             self.conn.execute(f"UPDATE candidate_gate SET committed_at=? WHERE gate_id IN ({','.join('?' * len(ids))})"
@@ -499,14 +540,21 @@ class WatchDaemon:
             prep_deadline = None if nst is None else datetime.combine(nxt, nst.close) + self.s.after_close
         except CalendarCoverageError:
             prep_deadline = None
+        open_at = datetime.combine(d, st.open)
         return {CLOSE_PREP: (prep_due, prep_deadline),
-                OPEN_CHECK: (datetime.combine(d, st.open) + timedelta(minutes=self.s.open_offset_min), None)}
+                INPUT_CHECK: (open_at - timedelta(minutes=INPUT_CHECK_LEAD_MIN),
+                              open_at - timedelta(minutes=INPUT_CHECK_DEADLINE_MIN)),
+                OPEN_CHECK: (open_at + timedelta(minutes=self.s.open_offset_min), None)}
 
     def prep_scope(self, cfg) -> tuple[str, dict]:
         return prep_scope(cfg, self.cal, self.s.after_close)
 
     def open_key(self, d: date) -> str:
         return f"{OPEN_CHECK}|{d.isoformat()}|OPEN+{self.s.open_offset_min}m"
+
+    @staticmethod
+    def input_key(d: date) -> str:
+        return f"{INPUT_CHECK}|{d.isoformat()}|OPEN-{INPUT_CHECK_LEAD_MIN}m"
 
     @staticmethod
     def _runnable(t: dict, now: datetime) -> bool:
@@ -553,23 +601,29 @@ class WatchDaemon:
         out = []
         for d in days:
             dt = self.due_times(d)
-            for kind in (OPEN_CHECK, CLOSE_PREP):
+            for kind in (OPEN_CHECK, INPUT_CHECK, CLOSE_PREP):
                 due, deadline = dt[kind]
                 if now < due:
                     continue
-                key = f"{kind}|{d.isoformat()}|scope:{scope}" if kind == CLOSE_PREP else self.open_key(d)
-                t = self.dstore.ensure_task(key, kind, d, scope if kind == CLOSE_PREP else f"OPEN+{self.s.open_offset_min}m",
-                                            due, now)
+                if kind == INPUT_CHECK and now >= deadline and self.dstore.task(self.input_key(d)) is None:
+                    continue        # 기한 뒤에 처음 보는 날(관리자를 늦게 켬) — 만들지 않음(지난 시각 확인 없음)
+                key = (f"{kind}|{d.isoformat()}|scope:{scope}" if kind == CLOSE_PREP else
+                       self.open_key(d) if kind == OPEN_CHECK else self.input_key(d))
+                t = self.dstore.ensure_task(key, kind, d, scope if kind == CLOSE_PREP else
+                                            f"OPEN+{self.s.open_offset_min}m" if kind == OPEN_CHECK else
+                                            f"OPEN-{INPUT_CHECK_LEAD_MIN}m", due, now)
                 if t["status"] in DONE:
                     continue
-                if kind == CLOSE_PREP and deadline is not None and now >= deadline:
+                if kind in (CLOSE_PREP, INPUT_CHECK) and deadline is not None and now >= deadline:
                     if t["status"] != MISSED:
-                        self.dstore.mark(key, MISSED, now, f"기한 {deadline} 지남 — 다음 거래일 완성 뒤라 그날 신호를 "
-                                                           "만들지 않음(일봉은 다음 준비가 이어 받음)")
+                        self.dstore.mark(key, MISSED, now,
+                                         f"기한 {deadline} 지남 — 다음 거래일 완성 뒤라 그날 신호를 만들지 않음(일봉은 다음 "
+                                         "준비가 이어 받음)" if kind == CLOSE_PREP else
+                                         f"기한 {deadline} 지남 — 개장 전 입력 재확인 없음: 그날 후보는 승인되지 않음")
                     continue
                 if self._runnable(t, now):
                     out.append(t)
-        prio = {OPEN_CHECK: 0, CLOSE_PREP: 1}
+        prio = {OPEN_CHECK: 0, INPUT_CHECK: 1, CLOSE_PREP: 2}
         return sorted(out, key=lambda t: (prio[t["kind"]], t["trading_day"]))
 
     def next_due(self, now: datetime) -> datetime | None:
@@ -621,6 +675,19 @@ class WatchDaemon:
         t = self.dstore.task(self.open_key(d))
         return t is None or self._runnable(t, now)
 
+    def _input_check_waiting(self, now: datetime) -> bool:
+        """오늘 입력 재확인이 실행 시각~기한 사이이고 아직 끝나지 않았는지(예산 소진이면 아님)."""
+        d = now.date()
+        dt = self.due_times(d)
+        if INPUT_CHECK not in dt or not (dt[INPUT_CHECK][0] <= now < dt[INPUT_CHECK][1]):
+            return False
+        if d < date.fromisoformat(self.dstore.meta("since") or d.isoformat()):
+            return False
+        if self.budget_reason(INPUT_CHECK, now):
+            return False
+        t = self.dstore.task(self.input_key(d))
+        return t is None or self._runnable(t, now)
+
     def yield_reason(self, now: datetime | None = None) -> str | None:
         now = now or self.now()
         if self.run_id and self.dstore.stop_requested(self.run_id):
@@ -632,6 +699,8 @@ class WatchDaemon:
             return f"TIME_BUDGET({self.s.max_task_sec:.0f}초)"
         if self._current_kind == CLOSE_PREP and self._open_check_waiting(now):
             return "PRIORITY:OPEN_CHECK"
+        if self._current_kind == CLOSE_PREP and self._input_check_waiting(now):
+            return "PRIORITY:INPUT_CHECK"
         return None
 
     def should_stop(self) -> str | None:
@@ -856,6 +925,8 @@ class WatchDaemon:
         try:
             if t["kind"] == CLOSE_PREP:
                 status, contract = self._close_prep(t, detail, rstore, wstore, state, listing, snap_id)
+            elif t["kind"] == INPUT_CHECK:
+                status, contract = self._input_check(t, detail, rstore)
             else:
                 status, contract = self._open_check(t, detail, rstore, wstore, state, snap_id)
         except RequestStopped as exc:                         # 요청 경계에서 양보 — 실패 아님
@@ -963,6 +1034,107 @@ class WatchDaemon:
                          selection=_selection(codes),
                          context_extra={"watch_config_version": version, "selection_rule": SELECTION_RULE})
 
+    def _input_check(self, t, detail, rstore) -> tuple[str, str | None]:
+        """개장 전 입력 재확인 (M3 B — GPT 최소판 요청 2): 신호일 t의 개장 후보(A5 선정 규칙 그대로 — 개장 전 저장 완료·PASS·
+        final·actionable)마다 그 스캔이 실제로 쓴 입력 창(종목·그 종목의 시장 지수)의 일봉을 **지금 다시 조회**해
+        스캔 당시 값(연구 DB as_of=scan_at)과 날짜·시가·고가·저가·종가·거래량·거래대금을 비교합니다.
+
+        - 저장하지 않음: 다시 받은 값은 비교에만 쓰고 연구 DB를 바꾸지 않음(원본 보존). 결과만 input_check 표에 행 추가.
+        - STABLE(창 전체 같음) / INPUT_CHANGED(하나라도 다름 — 바뀐 날짜·필드 기록) / CHECK_FAILED(조회·해석 실패).
+          종목과 지수가 모두 STABLE일 때만 실행기 후보 승인(app/candidates.py)이 통과. 그 밖은 그날 신규 진입 보류.
+        - 시장 기준: 종목 일봉은 단축코드 그대로(ka10081 stk_cd=코드, 수정주가) — KRX 단독인지 통합인지는 **미확인**
+          (`market_basis` 기록). 확인 전에는 승인 결과를 실제 전송의 근거로 쓰지 않음(그림자 운영).
+        - 후보가 없으면 조회 없이 COMPLETE(NO_CANDIDATES/NO_SCAN)."""
+        from infra.research.collector import spec_of
+        from infra.research.kiwoom_rows import to_research_bar
+        from infra.research.s1_scanner import SCAN_LOOKBACK_SESSIONS, _bars_digest
+        d = date.fromisoformat(t["trading_day"])
+        sig = self.cal.previous_trading_day(d)
+        open_at = datetime.combine(d, self.cal.session_times(d).open)
+        open_s = _ts(open_at)
+        detail["signal_date"] = sig.isoformat()
+        with ScanStore(self.p.watch_scan_db) as sstore:
+            runs = [r for r in sstore.runs(sig.isoformat()) if r["status"] == "COMPLETE" and r.get("committed_at")
+                    and r["committed_at"] < open_s and r["scan_at"] < open_s]
+            if not runs:
+                detail.update({"result": "NO_SCAN", "note": f"{sig} 신호 스캔이 개장 전에 저장 완료되지 않음 — 확인할 후보 없음"})
+                return COMPLETE, None
+            contract = sorted(runs, key=lambda r: r["committed_at"])[-1]["contract_hash"]
+            cset, cands = A5.select_candidates(sstore, rstore, self.cal, d, contract)
+            index_of: dict[str, str | None] = {}
+            for c in cands:          # 스캔이 그 종목에 쓴 지수(증거) — 시장 이름으로 추정하지 않음
+                ev = next((e for e in sstore.evals(c["run_id"]) if e["symbol"] == c["symbol"]), None)
+                index_of[c["symbol"]] = None if ev is None else (ev.get("evidence") or {}).get("index_id")
+        detail.update({"contract_hash": contract, "candidates": [c["symbol"] for c in cands],
+                       "candidate_reason": cset["reason"]})
+        if not cands:
+            detail["result"] = "NO_CANDIDATES"
+            return COMPLETE, contract
+        cov_start = date(min(self.cal.covered_years), 1, 1)
+        collector = ResearchCollector(self.client, rstore, self.cal, after_close=self.s.after_close, log=self.log)
+        rows: list[dict] = []
+        fresh_cache: dict[str, tuple] = {}
+        for c in cands:
+            scan_at = datetime.fromisoformat(c["scan_at"])
+            sessions = self.cal.trading_days_in_range(cov_start, sig)[-SCAN_LOOKBACK_SESSIONS:]
+            start = sessions[0]
+            index_id = index_of.get(c["symbol"])
+            targets = [("STOCK", f"STOCK:{c['symbol']}")] + ([("INDEX", index_id)] if index_id else [])
+            if not index_id:
+                rows.append({"target_day": d.isoformat(), "signal_date": sig.isoformat(), "contract_hash": contract,
+                             "scan_run_id": c["run_id"], "scan_at": c["scan_at"], "symbol": c["symbol"],
+                             "series_id": "INDEX:?", "role": "INDEX", "status": CHECK_FAILED,
+                             "window_start": start.isoformat(), "window_end": sig.isoformat(),
+                             "diffs": ["스캔 증거에 지수 ID 없음"], "market_basis": "INDEX(ka20006)",
+                             "task_key": t["task_key"], "checked_at": _ts(self.now())})
+            for role, sid in targets:
+                kind, code = ("STOCK", c["symbol"]) if role == "STOCK" else ("INDEX", sid.split(":")[-1])
+                spec = spec_of(kind)
+                row = {"target_day": d.isoformat(), "signal_date": sig.isoformat(), "contract_hash": contract,
+                       "scan_run_id": c["run_id"], "scan_at": c["scan_at"], "symbol": c["symbol"], "series_id": sid,
+                       "role": role, "window_start": start.isoformat(), "window_end": sig.isoformat(),
+                       "market_basis": "UNCONFIRMED(stk_cd 단축코드·수정주가 — KRX 단독/통합 미실측)"
+                       if role == "STOCK" else "INDEX(ka20006)", "task_key": t["task_key"]}
+                try:
+                    rs = rstore.research_series(sid, as_of=scan_at, start=start)
+                    scan_bars = [b for b in rs.bars if start <= b.date <= sig]
+                except KeyError:
+                    scan_bars = None
+                try:
+                    if sid not in fresh_cache:
+                        fr = collector.fetch_full(spec, code, sig.strftime("%Y%m%d"), start)
+                        fresh_cache[sid] = ([rb for rb in (to_research_bar(fb.raw, spec) for fb in fr.bars) if rb], None)
+                    fresh_all, _ = fresh_cache[sid]
+                    fresh = [b for b in fresh_all if start <= b.date <= sig]
+                except RequestStopped:
+                    raise
+                except Exception as exc:                    # noqa: BLE001 — 그 종목만 실패로
+                    rows.append({**row, "status": CHECK_FAILED, "scan_bars": None if scan_bars is None else len(scan_bars),
+                                 "fresh_bars": None, "diffs": [f"조회 실패 {type(exc).__name__}: {exc}"[:300]],
+                                 "checked_at": _ts(self.now())})
+                    continue
+                if scan_bars is None:
+                    rows.append({**row, "status": CHECK_FAILED, "scan_bars": None, "fresh_bars": len(fresh),
+                                 "diffs": ["스캔 당시 시계열 없음"], "checked_at": _ts(self.now())})
+                    continue
+                diffs = _bar_diffs(scan_bars, fresh)
+                rows.append({**row, "status": STABLE if not diffs else INPUT_CHANGED, "scan_bars": len(scan_bars),
+                             "fresh_bars": len(fresh), "scan_digest": _bars_digest(scan_bars),
+                             "fresh_digest": _bars_digest(fresh), "diffs": diffs[:50], "checked_at": _ts(self.now())})
+        t_commit = self.now()
+        if t_commit.microsecond:
+            t_commit = t_commit.replace(microsecond=0) + timedelta(seconds=1)
+        self.dstore.add_input_checks(rows, _ts(t_commit))
+        by_sym: dict[str, str] = {}
+        for r in rows:
+            prev = by_sym.get(r["symbol"], STABLE)
+            by_sym[r["symbol"]] = prev if prev != STABLE else r["status"]
+        detail["result"] = {sym: st for sym, st in by_sym.items()}
+        detail["approved"] = sorted(sym for sym, st in by_sym.items() if st == STABLE)
+        self.log(f"[관리자] 입력 재확인 {sig}→{d}: " + ", ".join(f"{k}={v}" for k, v in sorted(by_sym.items())))
+        # 조회 실패가 있으면 PARTIAL — 기한(개장 5분 전) 안에서 다시 시도(새 행 추가, 마지막 결과가 판정 기준)
+        return (PARTIAL if any(st == CHECK_FAILED for st in by_sym.values()) else COMPLETE), contract
+
     def _open_check(self, t, detail, rstore, wstore, state, snap_id) -> tuple[str, str | None]:
         d = date.fromisoformat(t["trading_day"])
         sig = self.cal.previous_trading_day(d)
@@ -1062,6 +1234,27 @@ class WatchDaemon:
         return "IDLE_CAP"
 
 
+_BAR_FIELDS = ("open", "high", "low", "close", "volume", "trade_value")
+
+
+def _bar_diffs(scan_bars, fresh_bars) -> list[str]:
+    """스캔 당시 봉과 다시 받은 봉 비교(같은 창) — 다른 날짜·필드를 사람이 읽을 수 있게. 같으면 []."""
+    a = {b.date: b for b in scan_bars}
+    f = {b.date: b for b in fresh_bars}
+    out = []
+    for d in sorted(set(a) | set(f)):
+        if d not in f:
+            out.append(f"{d} 다시 받은 값에 없음")
+        elif d not in a:
+            out.append(f"{d} 스캔 당시 없던 봉")
+        else:
+            for k in _BAR_FIELDS:
+                x, y = getattr(a[d], k), getattr(f[d], k)
+                if x != y:
+                    out.append(f"{d} {k} {x}→{y}")
+    return out
+
+
 def _current_gate_text(cg) -> str:
     if not cg:
         return "기록 없음"
@@ -1096,6 +1289,11 @@ def write_daily_report(dstore: DaemonStore, p: DaemonPaths, day: str) -> str:
                       + (f"통과 {(s1.get('gate') or {}).get('eligible')} · 제외 "
                          f"{json.dumps((s1.get('gate') or {}).get('blocked'), ensure_ascii=False)}"
                          if s1.get("gate") else "기록 없음") + " — 계산 PASS라도 게이트 제외면 개장 후보 아님"]
+        if t["kind"] == INPUT_CHECK and d:
+            lines += ["", "## 개장 전 입력 재확인",
+                      f"- 신호일 {d.get('signal_date')} 계약 {d.get('contract_hash') or '-'} 후보 {d.get('candidates') or []}",
+                      f"- 결과 {json.dumps(d.get('result'), ensure_ascii=False)} · 승인 {d.get('approved') or []}",
+                      "- 종목·지수 입력 창을 다시 받아 스캔 당시 값과 비교(연구 DB는 바꾸지 않음). 시장 기준(KRX/통합)은 미실측"]
         if t["kind"] == OPEN_CHECK and d:
             lines += ["", "## 개장 확인",
                       f"- 신호일 {d.get('signal_date')} 후보 {d.get('candidate_status')} — {d.get('candidate_reason')}",
