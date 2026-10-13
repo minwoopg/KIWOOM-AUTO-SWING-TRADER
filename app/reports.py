@@ -50,15 +50,21 @@ def generate_daily_report(
     calendar = calendar or TradingCalendar.load()
     historical = trade_date < (today or date.today())
     events = FillLedgerStore(settings.storage.fill_ledger_file).load()
+    actual_costs: dict[str, tuple] = {}
+    evidence_notes: list[str] = []
     try:   # M3 A2: 주문별 체결 근거(ka10076)로 추정가를 실제 체결가로 — 원장 파일은 그대로
         from domain.service.fill_evidence import apply_fill_evidence
         from infra.storage.fill_evidence import FillEvidenceStore, evidence_path
         overlay = apply_fill_evidence(
             events, FillEvidenceStore(evidence_path(settings.storage.fill_ledger_file), read_only=True).load())
         events = overlay.events
-        if overlay.mismatched and logger is not None:
-            logger.warning(f"[REPORT] 체결 근거 적용 안 함 {len(overlay.mismatched)}건: {overlay.mismatched[:3]}")
+        actual_costs = {eid: (r.commission, r.tax) for eid, r in overlay.applied.items()}
+        if overlay.mismatched:
+            evidence_notes.append(f"적용 안 함·충돌 {len(overlay.mismatched)}건 — {'; '.join(overlay.mismatched[:3])}")
+            if logger is not None:
+                logger.warning(f"[REPORT] 체결 근거 적용 안 함 {len(overlay.mismatched)}건: {overlay.mismatched[:3]}")
     except Exception as exc:
+        evidence_notes.append(f"읽기 실패 — 원장 가격(추정 포함)으로 작성: {type(exc).__name__}: {exc}")
         if logger is not None:
             logger.warning(f"[REPORT] 체결 근거 읽기 실패 — 원장 가격으로 작성: {type(exc).__name__}: {exc}")
     state, _ = SwingStateStore(settings.storage.state_file).load()
@@ -88,6 +94,7 @@ def generate_daily_report(
         session_lines=session_lines or [], generated_at=datetime.now(), historical=historical,
         reconcile_missing_reason=reconcile_missing_reason if reconcile_report is None else "",
         close_check=close_check, close_issues=list(close_issues or []),
+        actual_costs=actual_costs, evidence_notes=evidence_notes,
     ), calendar=calendar, cost_model=cost_model)
     path = write_report(settings.storage.reports_dir, trade_date, text)
     if logger is not None:
@@ -119,7 +126,8 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
     """그날 운영 기록을 민감정보를 가려 ZIP 하나로 묶음 (GPT 검토·사후 분석 공유용).
 
     포함: app.log(+순환 파일)의 그날 줄, trades.csv·position_lifecycle.csv의 그날 행,
-    체결 원장 전체, state.json, 주문 저널, 실행 기준선, 그날 리포트, 체결조회 관측의 그날 줄.
+    체결 원장 전체, 체결 근거 전체(fill_evidence), 지정가 취소 감사(buy_cancels), 실행 모드 표식,
+    state.json, 주문 저널, 실행 기준선, 그날 리포트, 체결조회 관측의 그날 줄.
     텍스트는 mask_text(), JSON은 키 기준 mask_json()으로 가립니다.
     """
     st = settings.storage
@@ -154,6 +162,16 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
         return "\n".join(out)
 
     files["fill_ledger.jsonl"] = json_lines(Path(st.fill_ledger_file))
+    # M3 A2 보완(GPT R3): 보정 가격을 번들만으로 재현할 수 있게 체결 근거 전체, 취소 감사·실행 모드 표식도 함께
+    ledger_dir = Path(st.fill_ledger_file).parent
+    files["fill_evidence.jsonl"] = json_lines(ledger_dir / "fill_evidence.jsonl")
+    files["buy_cancels.jsonl"] = json_lines(Path(st.state_file).with_name("buy_cancels.jsonl"))
+    em = ledger_dir / "execution_mode.json"
+    try:
+        files["execution_mode.json"] = json.dumps(mask_json(json.loads(em.read_text(encoding="utf-8"))),
+                                                  ensure_ascii=False, indent=2) if em.exists() else ""
+    except ValueError:
+        files["execution_mode.json"] = mask_text(em.read_text(encoding="utf-8", errors="replace"))
     files["order_status_observations.jsonl"] = json_lines(Path(st.order_status_observation_log_file),
                                                           day_filter="started_at")
     for name, path in (("state.json", st.state_file), ("tracked_order_journal.json", st.tracked_order_journal_file)):
@@ -171,6 +189,7 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
     manifest = {
         "trade_date": day.isoformat(), "created_at": datetime.now().isoformat(timespec="seconds"),
         "git_sha": _git_sha(root), "account_scope_id": settings.broker.account_scope_id,
+        "note": "파일마다 읽은 시각이 조금씩 다를 수 있음(실행 중 수집). 가격 재현은 fill_ledger + fill_evidence 겹치기",
         "files": {n: {"bytes": len(t.encode("utf-8")), "sha256": hashlib.sha256(t.encode("utf-8")).hexdigest(),
                       "empty": not t} for n, t in files.items()},
     }

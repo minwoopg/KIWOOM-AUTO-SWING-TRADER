@@ -409,16 +409,48 @@ def orders(p: Paths, runner: Section) -> Section:
     if runner.state == OK:
         for o in runner.data.get("tracked_orders") or []:
             rows.append({"출처": "실행기(추적 중)", "명령": runner.data.get("run_id"), "매수/매도": o["side"], "종목": o["symbol"],
-                         "주문번호": o["order_id"], "주문 유형": "시장가", "가격": o.get("reference_price"),
+                         "주문번호": o["order_id"], "주문 유형": "지정가" if o.get("order_type") == "limit" else "시장가",
+                         "가격": o.get("reference_price"),
                          "수량": o["requested"], "결과": f"체결 {o['filled']}/{o['requested']} · 미체결 {o['requested'] - o['filled']}",
                          "시각": runner.data.get("heartbeat_at", ""), "비고": "추적 중 — 종료 전"})
         for sym in runner.data.get("recovery_symbols") or []:
             rows.append({"출처": "실행기", "명령": "", "매수/매도": "", "종목": sym, "주문번호": "", "주문 유형": "",
                          "가격": None, "수량": None, "결과": "ERROR·orphan — 사람 확인 필요", "시각": runner.data.get("heartbeat_at", ""),
                          "비고": "commands/recovery_required.json의 recovery_id로 ack 명령"})
+        CANCEL_LABEL = {"CANCEL_CONFIRMED": "취소 확정", "FILLED": "취소 전 체결(정상 체결)",
+                        "UNRESOLVED": "미확정 — 사람 확인"}
+        for c in runner.data.get("buy_cancels") or []:
+            if c.get("resolved"):
+                result = CANCEL_LABEL.get(c["resolved"], c["resolved"])
+            elif c.get("ambiguous"):
+                result = "취소 응답 불명 — 재전송 안 함, 사람 확인"
+            elif c.get("accepted"):
+                result = "취소 접수 — 체결조회로 확정 대기"
+            else:
+                result = f"취소 거절({c.get('attempts')}/3)"
+            if str(c.get("message", "")).startswith("UNRESOLVED"):
+                result = "미확정 — 사람 확인"
+            rows.append({"출처": "실행기(지정가 취소)", "명령": runner.data.get("run_id"), "매수/매도": "BUY",
+                         "종목": c.get("symbol"), "주문번호": c.get("order_id"), "주문 유형": "지정가 취소",
+                         "가격": None, "수량": c.get("quantity"), "결과": result, "시각": c.get("requested_at", ""),
+                         "비고": f"취소 주문 {c.get('cancel_order_id') or '-'} · {c.get('message', '')}"})
+        ev = runner.data.get("fill_evidence") or {}
+        for item in ev.get("lookup_pending") or []:
+            rows.append({"출처": "실행기(체결가 확인)", "명령": runner.data.get("run_id"), "매수/매도": item["side"],
+                         "종목": item["symbol"], "주문번호": item["order_id"], "주문 유형": "", "가격": None, "수량": None,
+                         "결과": f"체결가·비용 미확인(조회 {item['attempts']}/5)", "시각": item.get("next_at") or "",
+                         "비고": "원장은 추정가 — 다음 확인 시각 / 끝내 실패하면 paper_order.py confirm-fills"})
+        for item in ev.get("save_pending") or []:
+            rows.append({"출처": "실행기(체결 근거 저장)", "명령": runner.data.get("run_id"), "매수/매도": item["side"],
+                         "종목": item["symbol"], "주문번호": item["order_id"], "주문 유형": "", "가격": None, "수량": None,
+                         "결과": f"근거 저장 실패 — 재시도 {item['attempts']}/10", "시각": item.get("next_at") or "",
+                         "비고": item.get("error", "")})
     st = OK if (reg.state in (OK, MISSING) or runner.state == OK) else reg.state
     s = Section(st, rows, error=reg.error, source="paper_orders.jsonl · runner_status.json")
-    s.notes.append("취소 요청·부분 체결의 자동 처리(09:30 취소)는 미구현 — M1 limit-cancel 실측 결과만 표시")
+    s.notes.append("09:30 미체결 지정가 취소는 실행기가 자동 처리(이 실행이 낸 주문만). 취소 확정은 '우리 취소 접수 + "
+                   "원주문 행 없음 + 잔고 그대로'일 때만 — 부분 체결·응답 불명은 사람 확인")
+    if runner.state == OK and (runner.data.get("fill_evidence") or {}).get("last_error"):
+        s.notes.append(f"최근 체결 근거 문제: {runner.data['fill_evidence']['last_error']}")
     return s
 
 
@@ -450,9 +482,24 @@ def costs(p: Paths, settings) -> Section:
                         "수수료": "-" if r is None or r.commission is None else r.commission,
                         "세금": "-" if r is None or r.tax is None else r.tax,
                         "주문번호": e.order_id, "메모": e.note})
-    real = [{"매도일": r.sell_date.isoformat(), "종목": r.symbol, "수량": r.quantity, "매수가": r.buy_price,
-             "매도가": r.sell_price, "손익(비용 전)": r.gross_pnl,
-             "구분": "추정 포함" if r.is_estimate else "브로커 근거"} for r in led.realized]
+    ev_qty = {e.event_id: e.quantity for e in events}
+
+    def _cost(eid: str, qty: int):
+        """사건의 실제 비용을 이 매칭 수량만큼 안분. 근거 없음·값 미확인이면 None."""
+        r = overlay.applied.get(eid)
+        if r is None or r.commission is None or r.tax is None or not ev_qty.get(eid):
+            return None
+        return (r.commission + r.tax) * qty / ev_qty[eid]
+
+    real = []
+    for r in led.realized:
+        cb, cs = _cost(r.buy_event_id, r.quantity), _cost(r.sell_event_id, r.quantity)
+        actual = None if cb is None or cs is None else int(round(cb + cs))
+        real.append({"매도일": r.sell_date.isoformat(), "종목": r.symbol, "수량": r.quantity, "매수가": r.buy_price,
+                     "매도가": r.sell_price, "손익(비용 전)": r.gross_pnl,
+                     "실제 비용": "미확인" if actual is None else actual,
+                     "손익(실제 비용 후)": "—" if actual is None else r.gross_pnl - actual,
+                     "구분": "추정 포함" if r.is_estimate else "브로커 근거"})
     try:
         from domain.cost_model import load_cost_model
         cm = load_cost_model(p.root / "config/settings.yaml", use_cache=False)
@@ -462,8 +509,8 @@ def costs(p: Paths, settings) -> Section:
     s = Section(OK, {"events": ev_rows, "realized": real, "cost_model": cmd},
                 source="fill_ledger.jsonl + fill_evidence.jsonl")
     n_cost = sum(1 for r in overlay.applied.values() if r.commission is not None)
-    s.notes.append(f"실제 수수료·세금은 체결 근거가 있는 사건만 표시({n_cost}건) — 손익(비용 전)과 비용 모델은 추정. "
-                   "장부 대조 일치는 체결 가격 검증이 아님")
+    s.notes.append(f"실제 수수료·세금은 체결 근거가 있는 사건만 표시({n_cost}건) — 근거가 없으면 '미확인'. 비용 모델 값은 "
+                   "추정. 장부 대조 일치는 체결 가격 검증이 아님")
     for m in overlay.mismatched[:5]:
         s.notes.append(f"체결 근거 적용 안 함: {m}")
     if ev_note:
@@ -548,7 +595,8 @@ def log_lines(path: Path, day: date, red: Redactor) -> list[str]:
 
 
 def download_bundle(p: Paths, day: date, red: Redactor, summary: dict) -> bytes:
-    """선택 날짜 로그·운영 요약 zip(비밀값 가림). .env·DB 원본은 넣지 않음."""
+    """선택 날짜 로그·운영 요약 zip(비밀값 가림). .env·DB 원본은 넣지 않음.
+    원장·체결 근거·취소 감사 포함(보정 가격 재현). 파일마다 읽은 시각이 다를 수 있음."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(f"summary_{day}.json", json.dumps(red.obj(summary), ensure_ascii=False, indent=1, default=str))
@@ -560,6 +608,12 @@ def download_bundle(p: Paths, day: date, red: Redactor, summary: dict) -> bytes:
                 z.writestr(f"reports/{f.name}", red.text(f.read_text(encoding="utf-8", errors="replace")))
         if p.paper_orders.exists():
             z.writestr("paper_orders.jsonl", red.text(p.paper_orders.read_text(encoding="utf-8", errors="replace")))
+        # M3 A2 보완(GPT R3): 보정 가격 재현용 원장 + 체결 근거, 지정가 취소 감사
+        for f, name in ((p.fill_ledger, "fill_ledger.jsonl"),
+                        (p.fill_ledger.with_name("fill_evidence.jsonl"), "fill_evidence.jsonl"),
+                        (p.state_file.with_name("buy_cancels.jsonl"), "buy_cancels.jsonl")):
+            if f.exists() and f.is_file():
+                z.writestr(f"data/{name}", red.text(f.read_text(encoding="utf-8", errors="replace")))
     return buf.getvalue()
 
 

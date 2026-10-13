@@ -20,7 +20,7 @@ from __future__ import annotations
   - (M3 A2) `fill_lookup`이 있으면 **주문 전량이 한 사건으로 끝날 때** 주문별 체결조회(ka10076)를
     먼저 봅니다. 주문번호·방향·수량이 맞는 전량 체결 행이 있으면 그 체결가(BROKER_FILL)로 기록하고
     수수료·세금은 체결 근거 기록(`fill_evidence.jsonl`)에 남깁니다. 조회 실패·행 없음이면 위 규칙대로
-    기록하고, 다음 폴링부터 한 폴링에 한 건씩(최대 RETRY_LIMIT회) 다시 확인해 근거 기록만 추가합니다
+    기록하고, 다음 폴링부터 한 폴링에 한 건씩(최대 RETRY_LIMIT회, 간격을 늘리며) 다시 확인해 근거 기록만 추가합니다
     (원장 사건은 다시 쓰지 않음 — 중복 BUY/SELL 없음). 재시작하면 재확인 목록은 사라지고
     `tools/paper_order.py confirm-fills`로 확인합니다. 지정가 매수의 추정가는 지정가(체결가는 그 이하).
 - event_id = "{계좌범위}|{주문 거래일}|{매수/매도}|{종목}|{주문번호}|{누적 체결수량}"
@@ -60,8 +60,15 @@ class TrackedOrder:
         return self.filled_quantity >= self.requested_quantity
 
 
+def _norm_oid(order_id) -> str:
+    return str(order_id or "").strip().lstrip("0")
+
+
 class FillRecorder:
-    RETRY_LIMIT = 5
+    RETRY_LIMIT = 5            # 체결조회 재확인 상한(사건당)
+    SAVE_RETRY_LIMIT = 10      # 근거 파일 저장 재시도 상한(사건당, API 호출 없음)
+    BACKOFF_BASE_SEC = 60      # 재시도 간격: 60·120·240… 초, 최대 BACKOFF_MAX_SEC
+    BACKOFF_MAX_SEC = 900
 
     def __init__(self, ledger_store, logger=None, *, scope: str = "default",
                  fill_lookup=None, evidence_store=None) -> None:
@@ -75,11 +82,35 @@ class FillRecorder:
         # M3 A2: fill_lookup(order_id, symbol) -> FillDetail | None (예외 가능), evidence_store.append(record)
         self.fill_lookup = fill_lookup
         self.evidence_store = evidence_store
-        self._unconfirmed: dict[str, dict] = {}     # event_id → {event, attempts}
+        self._unconfirmed: dict[str, dict] = {}     # event_id → {event, attempts, next_at} — 체결조회 다시
+        self._pending_saves: dict[str, dict] = {}   # event_id → {record, attempts, next_at, error} — 저장만 다시
+        self.last_evidence_error = ""
 
     @property
     def unconfirmed(self) -> dict[str, dict]:
         return dict(self._unconfirmed)
+
+    @property
+    def pending_saves(self) -> dict[str, dict]:
+        return dict(self._pending_saves)
+
+    def evidence_status(self) -> dict:
+        """실행기 상태 파일·관리 창용 — 실제 체결가·비용이 아직 확정되지 않은 사건."""
+        iso = lambda v: v.isoformat(timespec="seconds") if v else None      # noqa: E731
+        return {
+            "lookup_pending": [{"event_id": k, "symbol": v["event"].symbol, "side": v["event"].kind,
+                                "order_id": v["event"].order_id, "attempts": v["attempts"],
+                                "next_at": iso(v.get("next_at"))} for k, v in self._unconfirmed.items()],
+            "save_pending": [{"event_id": k, "symbol": v["record"].symbol, "side": v["record"].side,
+                              "order_id": v["record"].order_id, "attempts": v["attempts"],
+                              "next_at": iso(v.get("next_at")), "error": v.get("error", "")}
+                             for k, v in self._pending_saves.items()],
+            "last_error": self.last_evidence_error,
+        }
+
+    def _backoff(self, attempts: int, now: datetime):
+        from datetime import timedelta
+        return now + timedelta(seconds=min(self.BACKOFF_BASE_SEC * 2 ** max(attempts - 1, 0), self.BACKOFF_MAX_SEC))
 
     @property
     def tracked(self) -> dict[str, TrackedOrder]:
@@ -112,6 +143,7 @@ class FillRecorder:
         """잔고 스냅샷을 보고 새 체결 사건을 원장에 기록. 기록한 사건 목록 반환."""
         held = {p.symbol: p for p in balance.positions}
         written: list[FillEvent] = []
+        self._retry_one_save(now)                      # 저장만 다시(API 호출 없음)
         retried = self._retry_one_confirmation(now)
         for sym, order in list(self._orders.items()):
             pos = held.get(sym)
@@ -150,7 +182,9 @@ class FillRecorder:
                 if detail is not None:
                     self._save_evidence(ev, detail, "AUTO", now)
                 else:
-                    self._unconfirmed[ev.event_id] = {"event": ev, "attempts": 1 if lookup_note else 0}
+                    tries = 1 if lookup_note else 0
+                    self._unconfirmed[ev.event_id] = {"event": ev, "attempts": tries,
+                                                      "next_at": self._backoff(tries, now) if tries else now}
                     if self.logger is not None:
                         self.logger.info(f"[FILL_RECORDER] {sym} {order.side} 체결가 확인 보류"
                                          f"({lookup_note or '이번 폴링 조회 한도'}) — 다음 폴링에 다시 확인")
@@ -176,44 +210,92 @@ class FillRecorder:
         if detail is None:
             return None, "체결조회에 전량 체결 행 없음"
         side_v = getattr(detail.side, "value", detail.side)
+        # 원장에 쓰기 전에 주문 식별을 끝냄(GPT 검토 R1): 주문번호(앞자리 0 무시)·종목·방향·수량 모두 일치
+        if _norm_oid(getattr(detail, "order_id", "")) != _norm_oid(order_id) or not _norm_oid(order_id):
+            return None, f"체결조회 행의 주문번호 {getattr(detail, 'order_id', '')!r} ≠ {order_id}"
         if side_v != side or detail.quantity != quantity or detail.symbol != symbol:
             return None, f"체결조회 행 불일치(방향 {side_v}·수량 {detail.quantity})"
+        if type(detail.price) is not int or detail.price <= 0:
+            return None, f"체결조회 가격 이상 {detail.price!r}"
         return detail, ""
 
     def _save_evidence(self, ev: FillEvent, detail, origin: str, now: datetime) -> bool:
+        """근거 기록. 저장 실패면 확인한 근거를 저장 재시도 목록에 남김(다시 조회하지 않음). 성공·대기 등록이면 True."""
         rec = record_for_event(ev, detail, origin=origin, now=now)
-        if rec is None or self.evidence_store is None:
-            return rec is not None
+        if rec is None:
+            self.last_evidence_error = f"{ev.event_id}: 근거가 원장 사건과 맞지 않음"
+            return False
+        if self.evidence_store is None:
+            return True
+        return self._append_or_queue(rec, now, attempts=0)
+
+    def _append_or_queue(self, rec, now: datetime, *, attempts: int) -> bool:
+        """근거 저장. 일시 실패(디스크·잠금 등)는 저장 재시도 목록에(원장 사건은 다시 쓰지 않음).
+        같은 사건에 다른 근거가 이미 있으면(충돌) 재시도하지 않고 사람 확인."""
         try:
             self.evidence_store.append(rec)
+            self._pending_saves.pop(rec.event_id, None)
             return True
         except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            self.last_evidence_error = f"{rec.event_id}: 근거 저장 실패 — {err}"
+            if "Conflict" in type(exc).__name__:
+                self._pending_saves.pop(rec.event_id, None)
+                if self.logger is not None:
+                    self.logger.critical(f"[FILL_RECORDER] {rec.symbol} 체결 근거 충돌 — 덮어쓰지 않음, 사람 확인: {err}")
+                return False
+            attempts += 1
+            if attempts >= self.SAVE_RETRY_LIMIT:
+                self._pending_saves.pop(rec.event_id, None)
+                if self.logger is not None:
+                    self.logger.critical(f"[FILL_RECORDER] {rec.symbol} {rec.side} 체결 근거 저장 {attempts}회 실패 — "
+                                         f"포기(원장은 기록됨, 실제 비용 미확정). `paper_order.py confirm-fills`로 다시: {err}")
+                return False
+            self._pending_saves[rec.event_id] = {"record": rec, "attempts": attempts,
+                                                 "next_at": self._backoff(attempts, now), "error": err}
             if self.logger is not None:
-                self.logger.critical(f"[FILL_RECORDER] {ev.symbol} 체결 근거 기록 실패(원장은 기록됨) — "
-                                     f"{type(exc).__name__}: {exc}")
+                self.logger.critical(f"[FILL_RECORDER] {rec.symbol} 체결 근거 저장 실패(원장은 기록됨) — "
+                                     f"{attempts}/{self.SAVE_RETRY_LIMIT}, 다음 폴링 이후 다시: {err}")
             return False
 
+    def _retry_one_save(self, now: datetime) -> None:
+        """저장 재시도 시각이 된 근거 하나를 다시 저장(체결조회 없음)."""
+        if self.evidence_store is None or not self._pending_saves:
+            return
+        due = next(((k, v) for k, v in self._pending_saves.items() if v["next_at"] <= now), None)
+        if due is None:
+            return
+        eid, item = due
+        if self._append_or_queue(item["record"], now, attempts=item["attempts"]) and self.logger is not None:
+            self.logger.info(f"[FILL_RECORDER] {item['record'].symbol} 체결 근거 저장 재시도 성공")
+        elif eid in self._pending_saves:      # 뒤로 보내 다른 사건이 막히지 않게
+            self._pending_saves[eid] = self._pending_saves.pop(eid)
+
     def _retry_one_confirmation(self, now: datetime) -> bool:
-        """추정가로 기록된 사건 하나의 체결가를 다시 확인. 조회했으면 True."""
+        """추정가로 기록된 사건 하나(재시도 시각이 된 것)의 체결가를 다시 확인. 조회했으면 True."""
         if self.fill_lookup is None or not self._unconfirmed:
             return False
-        eid, item = next(iter(self._unconfirmed.items()))
+        due = next(((k, v) for k, v in self._unconfirmed.items() if (v.get("next_at") or now) <= now), None)
+        if due is None:
+            return False
+        eid, item = due
         ev: FillEvent = item["event"]
         item["attempts"] += 1
         detail, why = self._lookup(ev.order_id, ev.symbol, ev.kind, ev.quantity)
         if detail is not None:
-            if self._save_evidence(ev, detail, "AUTO_RETRY", now):
-                self._unconfirmed.pop(eid, None)
-                if self.logger is not None:
-                    self.logger.info(f"[FILL_RECORDER] {ev.symbol} {ev.kind} 체결가 확인 {detail.price:,}원 "
-                                     f"(원장 {ev.price_source} {ev.price:,}원 — 근거 기록 추가)")
+            self._unconfirmed.pop(eid, None)          # 조회는 끝 — 저장 실패면 저장 재시도 목록으로
+            if self._save_evidence(ev, detail, "AUTO_RETRY", now) and self.logger is not None:
+                self.logger.info(f"[FILL_RECORDER] {ev.symbol} {ev.kind} 체결가 확인 {detail.price:,}원 "
+                                 f"(원장 {ev.price_source} {ev.price:,}원 — 근거 기록)")
         elif item["attempts"] >= self.RETRY_LIMIT:
             self._unconfirmed.pop(eid, None)
             if self.logger is not None:
                 self.logger.warning(f"[FILL_RECORDER] {ev.symbol} {ev.kind} 체결가 확인 {self.RETRY_LIMIT}회 실패"
                                     f"({why}) — 추정가 유지, `paper_order.py confirm-fills`로 확인")
         else:
-            # 다음 폴링에 다른 사건부터 보도록 뒤로 보냄
+            # 간격을 늘리고 뒤로 보냄 — 다른 사건 확인이 막히지 않게
+            self.last_evidence_error = f"{ev.symbol} {ev.kind} {ev.order_id}: {why}"
+            item["next_at"] = self._backoff(item["attempts"], now)
             self._unconfirmed.pop(eid)
             self._unconfirmed[eid] = item
         return True

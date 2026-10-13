@@ -590,8 +590,12 @@ class SessionRunner:
                           for p in (bal.positions if bal else [])],
             "tracked_orders": [{"symbol": o.symbol, "side": o.side, "order_id": o.order_id,
                                 "requested": o.requested_quantity, "filled": o.filled_quantity,
-                                "reference_price": o.reference_price}
+                                "reference_price": o.reference_price,
+                                "order_type": "limit" if str(o.order_id).strip().lstrip("0") in self._limit_buy_orders
+                                else "market"}
                                for o in self.recorder.tracked.values()],
+            "entry_cancel_at": self.cfg.entry_cancel_at.strftime("%H:%M") if self.cfg.entry_cancel_at else None,
+            "fill_evidence": self.recorder.evidence_status() if hasattr(self.recorder, "evidence_status") else None,
             "unresolved_symbols": sorted(self.executor.unresolved_symbols()),
             "buy_cancels": [r.to_dict() for r in self.executor.buy_cancels.values()]
             if hasattr(self.executor, "buy_cancels") else [],

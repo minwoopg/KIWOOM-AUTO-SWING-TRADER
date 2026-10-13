@@ -52,6 +52,9 @@ class ReportInputs:
     reconcile_missing_reason: str = ""   # 8-E (R2): 대조를 시도했지만 최종 결과가 없음 — 이유
     close_check: str = ""                # 8-E (R2): 세션 마감 검증 결과 (VERIFIED / NEEDS_REVIEW ...)
     close_issues: list[str] = field(default_factory=list)
+    # M3 A2 보완: 체결 근거(ka10076) — event_id → (수수료, 세금). 값이 None이면 미확인
+    actual_costs: dict[str, tuple] = field(default_factory=dict)
+    evidence_notes: list[str] = field(default_factory=list)     # 근거 읽기 실패·충돌·적용 안 함
 
 
 def _won(v: float | int | None) -> str:
@@ -110,6 +113,13 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
         L.append(f"| 당일 실현손익 (Base 비용 차감) | {_signed(net_pnl(today_matches, cost_model, 'base'))} |")
         L.append(f"| 당일 실현손익 (Stress 비용 차감) | {_signed(net_pnl(today_matches, cost_model, 'stress'))} |")
     L.append(f"| 누적 실현손익 (비용 전) | {_signed(realized_all)} |")
+    day_events = [e for e in inp.events if e.trade_date == d and e.kind in ("BUY", "SELL")]
+    if day_events:
+        known = [inp.actual_costs.get(e.event_id) for e in day_events]
+        full = [c for c in known if c is not None and None not in c]
+        total = sum(a + b for a, b in full)
+        tag = "" if len(full) == len(day_events) else f" (근거 {len(full)}/{len(day_events)}건 — 나머지 미확인)"
+        L.append(f"| 당일 실제 비용 (수수료+세금, 체결 근거) | {_won(total) if full else '—'}{tag} |")
     L.append("")
     notes = []
     if excluded_after:
@@ -119,7 +129,9 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
     if est_hold:
         notes.append("보유 원가에 주문가 추정치가 섞여 있음")
     if cost_model is not None:
-        notes.append(f"비용 기준: {cost_model.describe()}")
+        notes.append(f"비용 기준: {cost_model.describe()} — Base/Stress 차감은 모델 계산(실측 순손익 아님)")
+    for n in inp.evidence_notes:
+        notes.append(f"⚠ 체결 근거: {n}")
     for n in notes:
         L.append(f"- {n}")
     if notes:

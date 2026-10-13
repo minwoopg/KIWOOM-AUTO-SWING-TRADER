@@ -11,7 +11,7 @@ from __future__ import annotations
 따라서 "목록에 없음"만으로는 취소와 주문번호 오류·조회 범위 밖을 구분할 수 없습니다. 취소 확정은
 다음을 **모두** 만족할 때만입니다.
 1. 이 프로그램이 그 원주문번호로 보낸 취소가 접수됨(return_code 0, 응답 불명 아님)
-   — 응답에 base_orig_ord_no가 있으면 원주문번호와 같아야 함
+   — 응답의 base_orig_ord_no가 원주문번호와 같고 cncl_qty가 요청 잔량과 같아야 함(누락·0이면 미확정)
 2. 원주문 체결조회 결과: 미체결(oso)·체결(cntr) 어디에도 그 주문 행이 없음, 증거 구성 오류 없음
 3. 잔고 수량이 주문 직전 수량 그대로
 그 밖:
@@ -53,8 +53,24 @@ class CancelRecord:
 
     @property
     def body_matches_order(self) -> bool:
-        base = self.body.get("base_orig_ord_no") if isinstance(self.body, dict) else None
-        return base is None or _norm(base) == _norm(self.order_id)
+        """취소 응답이 이 주문·이 수량의 취소인지(GPT 검토 — 누락·0·불일치는 확인 안 된 것으로).
+        실측 응답: base_orig_ord_no="0148913", cncl_qty="000000000001"."""
+        return not self.body_mismatch
+
+    @property
+    def body_mismatch(self) -> str:
+        body = self.body if isinstance(self.body, dict) else {}
+        base = _norm(body.get("base_orig_ord_no"))
+        if not base:
+            return "취소 응답에 원주문번호(base_orig_ord_no) 없음·0"
+        if base != _norm(self.order_id):
+            return f"취소 응답의 원주문번호 {body.get('base_orig_ord_no')} ≠ {self.order_id}"
+        raw = str(body.get("cncl_qty", "") or "").strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            return f"취소 응답의 취소 수량 {raw!r} 해석 불가·0"
+        if int(raw) != self.quantity:
+            return f"취소 응답의 취소 수량 {int(raw)} ≠ 요청 잔량 {self.quantity}"
+        return ""
 
     def to_dict(self) -> dict:
         return {"symbol": self.symbol, "order_id": self.order_id, "quantity": self.quantity,
@@ -82,8 +98,8 @@ def assess_buy_cancel(record: CancelRecord, evidence, broker_quantity: int) -> C
     # UNKNOWN 이하
     if record.ambiguous or not record.accepted:
         return CancelAssessment(UNRESOLVED, "취소 접수가 확인되지 않음(응답 불명·거절) — 목록에 없다는 것만으로 확정 안 함")
-    if not record.body_matches_order:
-        return CancelAssessment(UNRESOLVED, f"취소 응답의 원주문번호 {record.body.get('base_orig_ord_no')} ≠ {record.order_id}")
+    if record.body_mismatch:
+        return CancelAssessment(UNRESOLVED, record.body_mismatch)
     if getattr(evidence, "evidence_error", None):
         return CancelAssessment(UNRESOLVED, f"조회 근거 구성 오류: {evidence.evidence_error}")
     if evidence.matched_oso_entries or evidence.matched_cntr_entries:

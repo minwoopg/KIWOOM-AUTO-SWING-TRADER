@@ -1174,10 +1174,9 @@ class OrderExecutor:
                 f"[BUY_CANCEL_REJECTED] {symbol} | 원주문 {order_id} | {record.message} "
                 f"({record.attempts}/{self.MAX_CANCEL_ATTEMPTS}) — 체결이 먼저였을 수 있음, 체결조회로 확인")
             return "CANCEL_REJECTED"
-        if not record.body_matches_order:
+        if record.body_mismatch:
             self.app_logger.critical(
-                f"[BUY_CANCEL_MISMATCH] {symbol} | 취소 응답 원주문번호 {record.body.get('base_orig_ord_no')} ≠ "
-                f"{order_id} — 자동 확정 안 함")
+                f"[BUY_CANCEL_MISMATCH] {symbol} | {record.body_mismatch} — 자동 확정 안 함(사람 확인)")
         self.app_logger.info(f"[BUY_CANCEL] {symbol} | 원주문 {order_id} 남은 {remaining}주 취소 접수 | "
                              f"취소 주문 {record.cancel_order_id} | {reason}")
         return "CANCEL_SENT"
