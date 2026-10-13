@@ -157,6 +157,9 @@ class SessionRunner:
         should_stop: Callable[[], bool] = lambda: False,
         after_close: Callable[[date], None] | None = None,
         quote_source: QuoteSource | None = None,
+        status_file=None,
+        commands_dir: str | None = None,
+        meta: dict | None = None,
     ) -> None:
         self.broker = broker
         self.executor = executor
@@ -183,6 +186,18 @@ class SessionRunner:
         self._last_report: ReconcileReport | None = None
         self.last_balance: AccountBalance | None = None
         self.last_balance_error = ""        # 마지막 잔고 조회 실패 사유 (M1 결과 표시용)
+        # M3: 상태 파일(대시보드)·신규 매수 중단 명령
+        import os as _os
+        import uuid as _uuid
+        self.run_id = _uuid.uuid4().hex[:12]
+        self.pid = _os.getpid()
+        self.started_at = self.clock()
+        self.status_file = status_file
+        self.commands_dir = commands_dir
+        self.meta = dict(meta or {})
+        self.stage = "STARTING"
+        self._last_status_at: datetime | None = None
+        self.buy_halt: dict | None = None
 
     # ── 진입점 ──────────────────────────────────────────────
 
@@ -198,6 +213,8 @@ class SessionRunner:
         self.state.last_session_date = today.isoformat()
         self.executor.save_state()
 
+        self._refresh_buy_halt(now)
+        self._set_stage("WAITING_OPEN" if phase == MarketPhase.PRE_OPEN else "RUNNING")
         if phase == MarketPhase.PRE_OPEN:
             self.log.info("[SESSION] 장 시작 전 — 정규장 시작까지 대기")
             if not self._wait_until(lambda: self.calendar.phase(self.clock()) != MarketPhase.PRE_OPEN):
@@ -214,6 +231,7 @@ class SessionRunner:
                 return self._finish("STOPPED")
         if self.should_stop():
             return self._finish("STOPPED")
+        self._set_stage("CLOSE_RECONCILE")
         self._close_routine()
         return self._finish("COMPLETED")
 
@@ -353,9 +371,16 @@ class SessionRunner:
         return self.executor.unresolved_symbols() | frozenset(self.recorder.tracked)
 
     def _tick(self, *, allow_orders: bool, call_strategy_start: bool = False) -> TickContext | None:
+        try:
+            return self._tick_inner(allow_orders=allow_orders, call_strategy_start=call_strategy_start)
+        finally:
+            self._beat(force=True)
+
+    def _tick_inner(self, *, allow_orders: bool, call_strategy_start: bool = False) -> TickContext | None:
         now = self.clock()
         self._tick_prices = None
         self.summary.ticks += 1
+        self._refresh_buy_halt(now)
         balance = self._fetch_balance()
         if balance is None:
             return None
@@ -389,6 +414,13 @@ class SessionRunner:
         if not isinstance(intent, OrderIntent):
             self.log.critical(f"[SESSION] 전략이 OrderIntent가 아닌 값을 반환 — 무시: {intent!r}")
             self.summary.intents_denied += 1
+            return
+        if intent.side == "BUY" and self.buy_halt:
+            # M3: 신규 매수 중단 — 매도·손절·미해결 주문 확인은 그대로
+            self.summary.intents_denied += 1
+            self.summary.denied_codes["BUY_HALTED"] = self.summary.denied_codes.get("BUY_HALTED", 0) + 1
+            self.log.info(f"[GUARD] {intent.symbol} BUY {intent.quantity}주 차단 | BUY_HALTED | "
+                          f"요청 {self.buy_halt.get('request_id')}")
             return
         prices: dict[str, int] = {}
         reserve, unknown_pending = 0, False
@@ -461,6 +493,72 @@ class SessionRunner:
         except Exception as exc:
             self.log.critical(f"[STRATEGY_ERROR] {name} 예외 — 이번 폴링은 주문 없음: {type(exc).__name__}: {exc}")
             return None
+
+    # ── 상태 파일·신규 매수 중단 (M3) ───────────────────────
+
+    def _refresh_buy_halt(self, now: datetime) -> None:
+        if not self.commands_dir:
+            return
+        from infra.storage.runner_status import read_buy_halt
+        st, req = read_buy_halt(self.commands_dir)
+        if st == "NONE":
+            if self.buy_halt:
+                self.log.warning(f"[BUY_HALT] 요청 파일 없음 — 사람이 재개함(요청 {self.buy_halt.get('request_id')})")
+                self.buy_halt = None
+            return
+        if not self.buy_halt or self.buy_halt.get("request_id") != req.get("request_id"):
+            self.buy_halt = {**req, "applied_at": now.isoformat(timespec="seconds"),
+                             "applied_run_id": self.run_id}
+            self.log.critical(f"[BUY_HALT] 신규 매수 중단 반영 — 요청 {req.get('request_id')} "
+                              f"({req.get('requested_at', '?')}, {req.get('reason', req.get('error', ''))}) · 매도·손절은 계속")
+
+    def _set_stage(self, stage: str) -> None:
+        self.stage = stage
+        self._beat(force=True)
+
+    def _beat(self, force: bool = False) -> None:
+        if self.status_file is None:
+            return
+        now = self.clock()
+        if not force and self._last_status_at is not None and (now - self._last_status_at).total_seconds() < 30:
+            return
+        self._last_status_at = now
+        try:
+            from infra.storage.runner_status import write_status
+            write_status(self.status_file, self._status_dict(now))
+        except Exception as exc:          # 상태 파일은 정보용 — 매매를 멈추지 않음
+            self.log.warning(f"[RUNNER_STATUS] 상태 파일 쓰기 실패: {type(exc).__name__}: {exc}")
+
+    def _status_dict(self, now: datetime) -> dict:
+        iso = lambda v: v.isoformat(timespec="seconds") if v else None      # noqa: E731
+        bal = self.last_balance
+        psm = self.executor.position_state_machine
+        s = self.summary
+        return {
+            "schema": "rs1", "run_id": self.run_id, "pid": self.pid, "started_at": iso(self.started_at),
+            "heartbeat_at": iso(now), "stage": self.stage, "trade_date": s.trade_date.isoformat() if s.trade_date else None,
+            **self.meta,
+            "strategy_id": getattr(self.strategy, "strategy_id", ""),
+            "strategy_connected": getattr(self.strategy, "strategy_id", "null") not in ("null", ""),
+            "buy_halt": self.buy_halt, "halted_reason": self._halted_reason,
+            "last_balance_at": iso(self._last_balance_ok_at), "last_balance_error": self.last_balance_error,
+            "last_reconcile_at": iso(self._last_reconcile_at),
+            "reconcile_ok": None if self._last_report is None else self._last_report.ok,
+            "cash": bal.cash if bal else None,
+            "positions": [{"symbol": p.symbol, "quantity": p.quantity, "average_price": p.average_price}
+                          for p in (bal.positions if bal else [])],
+            "tracked_orders": [{"symbol": o.symbol, "side": o.side, "order_id": o.order_id,
+                                "requested": o.requested_quantity, "filled": o.filled_quantity,
+                                "reference_price": o.reference_price}
+                               for o in self.recorder.tracked.values()],
+            "unresolved_symbols": sorted(self.executor.unresolved_symbols()),
+            "recovery_symbols": sorted(self.executor.recovery_blocked_symbols()),
+            "lifecycle": {sym: st.lifecycle.value for sym, st in psm._states.items()},
+            "counters": {"ticks": s.ticks, "balance_failures": s.balance_failures, "intents": s.intents,
+                         "intents_denied": s.intents_denied, "orders_sent": s.orders_sent,
+                         "orders_accepted": s.orders_accepted, "fills_recorded": s.fills_recorded},
+            "denied_codes": dict(s.denied_codes),
+        }
 
     def _halt(self, reason: str) -> None:
         """신규 주문 중단 (이번 프로세스 끝까지). 대조·기록은 계속. 첫 사유를 유지."""
@@ -548,6 +646,7 @@ class SessionRunner:
 
     def _finish(self, status: str) -> SessionSummary:
         self.summary.status = status
+        self._set_stage(f"FINISHED:{status}")
         if status == "STOPPED" and not self.summary.close_check:
             self.summary.close_check = "NOT_RUN"
         self.executor.save_state()
@@ -579,4 +678,5 @@ class SessionRunner:
             if self.should_stop():
                 return False
             self.sleep(1.0)
+            self._beat()
         return True

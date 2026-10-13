@@ -304,8 +304,23 @@ def build_session_config(s) -> "SessionConfig":
     )
 
 
+def code_version_cached() -> str:
+    """시작 당시 체크아웃 정보(관리자와 같은 방식) — 한 번만 계산."""
+    global _CODE_VERSION
+    if _CODE_VERSION is None:
+        try:
+            from utils.code_version import code_version
+            _CODE_VERSION = code_version()
+        except Exception as exc:          # noqa: BLE001
+            _CODE_VERSION = f"확인 불가({type(exc).__name__})"
+    return _CODE_VERSION
+
+
+_CODE_VERSION: str | None = None
+
+
 def build_session_runner(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
-                         should_stop=None, quote_source=None):
+                         should_stop=None, quote_source=None, status_file=None, process: str = "app.main"):
     """실행기 조립 — 하루 수명주기와 M1 수동 주문 도구가 같은 OrderExecutor·FillRecorder·안전 한도를 씀 (M0 커밋 3).
 
     (runner, executor). 상태 파일 손상이면 예외(주문 경로를 만들지 않음)."""
@@ -342,6 +357,10 @@ def build_session_runner(settings: Settings, broker, app_logger, *, strategy=Non
         after_close=after_close,
         quote_source=quote_source if quote_source is not None else (
             KiwoomQuoteSource(broker, logger=app_logger) if isinstance(broker, KiwoomBroker) else None),
+        status_file=status_file, commands_dir=settings.storage.commands_dir,
+        meta={"execution_mode": resolve_execution_mode(settings.broker),
+              "account_scope": settings.broker.account_scope_id.strip() or "unscoped",
+              "code_version": code_version_cached(), "process": process},
     )
     return runner, executor
 
@@ -349,14 +368,15 @@ def build_session_runner(settings: Settings, broker, app_logger, *, strategy=Non
 def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
                 should_stop=None, quote_source=None):
     """하루 수명주기 실행. 테스트에서 clock/sleep/should_stop을 주입할 수 있음."""
+    from infra.storage.runner_status import status_path
     runner, executor = build_session_runner(settings, broker, app_logger, strategy=strategy, clock=clock, sleep=sleep,
-                                            should_stop=should_stop, quote_source=quote_source)
-    import uuid as _uuid
+                                            should_stop=should_stop, quote_source=quote_source,
+                                            status_file=status_path(settings))
     try:
         summary = runner.run()
     finally:
         executor.shutdown()
-    summary.run_id = _uuid.uuid4().hex[:12]
+    summary.run_id = runner.run_id
     summary.execution_mode = resolve_execution_mode(settings.broker)
     summary.account_scope = settings.broker.account_scope_id.strip() or "unscoped"
     if summary.status != "CLOSED_DAY":
