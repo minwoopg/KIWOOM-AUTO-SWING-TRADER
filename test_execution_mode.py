@@ -121,7 +121,8 @@ check("5) 주문 요청은 allow_redirects=False 한 번뿐 — 3xx(실전 주�
       n_redirect == 1 and calls[0]["allow_redirects"] is False and calls[0]["url"].startswith("https://mockapi.kiwoom.com/")
       and res.accepted is False and res.is_ambiguous is True)
 check("6) 모의 전용 세션은 다른 호스트 요청을 보내기 전에 거부, 설정이 실전 주소로 바뀌면 주문 직전 검사가 전송 없이 거부",
-      blocked is not None and n_after_block == n_redirect and pre is not None and len(calls) == n_redirect)
+      blocked is not None and n_after_block == n_redirect and pre is not None and "주문 직전 검사" in pre
+      and len(calls) == n_redirect)
 
 
 # 7. 기동 엄격 기준

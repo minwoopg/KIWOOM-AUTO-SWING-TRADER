@@ -122,7 +122,11 @@ class PaperKiwoomBroker(KiwoomBroker):
         self.session = PaperOnlySession()
 
     def _assert_paper(self) -> None:
-        if resolve_execution_mode(self.config) != KIWOOM_PAPER:
+        try:
+            ok = resolve_execution_mode(self.config) == KIWOOM_PAPER
+        except ExecutionModeError as exc:
+            raise ExecutionModeError(f"주문 직전 검사: {exc}") from exc
+        if not ok:
             raise ExecutionModeError("주문 직전 검사: 설정이 모의투자가 아님")
         if not isinstance(self.session, PaperOnlySession):
             raise ExecutionModeError("주문 직전 검사: HTTP 세션이 모의투자 전용이 아님")
