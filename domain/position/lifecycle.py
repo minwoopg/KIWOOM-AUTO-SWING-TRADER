@@ -811,6 +811,47 @@ class PositionStateMachine:
             raise ValueError("acknowledge_orphan에는 확인 근거(note)가 필요합니다")
         self.clear_orphan(symbol, f"ACKNOWLEDGED: {note}")
 
+    def confirm_buy_cancelled(self, symbol: str, order_id: str, broker_quantity: int, note: str) -> str | None:
+        """우리가 보낸 취소가 접수되고, 원 BUY 주문이 미체결·체결 목록 어디에도 없고, 잔고가 주문 직전
+        수량 그대로일 때(M3 A2 — 판정은 `domain/service/buy_cancel.assess_buy_cancel`) 호출합니다.
+
+        - BUY_PENDING(같은 주문번호)·잔고 = 주문 직전 수량 → 그 수량 기준 FLAT/OPEN, 주문 정보 정리
+        - 같은 주문번호의 BUY orphan·잔고 = 주문 직전 수량 → orphan 해제
+        그 밖(주문번호 다름, 잔고 변화, ERROR 등)은 아무것도 바꾸지 않고 None — 사람 확인 경로 유지.
+        """
+        if not note or not note.strip():
+            raise ValueError("confirm_buy_cancelled에는 근거(note)가 필요합니다")
+        state = self.get(symbol)
+        oid = str(order_id or "").strip().lstrip("0")
+        if not oid or broker_quantity != state.base_quantity_before_order:
+            return None
+        prev = state.lifecycle
+        if (prev == PositionLifecycle.BUY_PENDING
+                and str(state.pending_order_id or "").strip().lstrip("0") == oid):
+            state.lifecycle = PositionLifecycle.OPEN if broker_quantity > 0 else PositionLifecycle.FLAT
+            state.known_quantity = broker_quantity
+            state.observed_quantity = broker_quantity
+            state.pending_order_id = None
+            state.pending_quantity = 0
+            state.requested_quantity = 0
+            state.pending_since = None
+            state.partial_fill_since = None
+            same_orphan = str(state.orphan_order_id or "").strip().lstrip("0") == oid
+            if state.lifecycle == PositionLifecycle.FLAT:
+                self._reset_transient_block_state(state, clear_orphan=same_orphan)
+            elif same_orphan:
+                self.clear_orphan(symbol, note, terminal_quantity=broker_quantity)
+            detail = f"BUY 주문 {order_id} 취소 확인 → {state.lifecycle.value}(qty={broker_quantity}) | {note}"
+            self._log_event(symbol, "BUY_CANCEL_CONFIRMED", prev, state.lifecycle, broker_quantity, detail)
+            return detail
+        if (prev in (PositionLifecycle.FLAT, PositionLifecycle.OPEN)
+                and str(state.orphan_order_id or "").strip().lstrip("0") == oid
+                and state.orphan_expected_delta > 0 and state.known_quantity == broker_quantity):
+            detail = f"BUY orphan {order_id} 취소 확인 | {note}"
+            self.clear_orphan(symbol, detail, terminal_quantity=broker_quantity)
+            return detail
+        return None
+
     def observe_for_orphan(self, symbol: str, broker_quantity: int, *,
                            order_filled: bool = False) -> str | None:
         """잔고가 **정확히 목표에 도달**했을 때만 orphan을 자동 해소합니다.

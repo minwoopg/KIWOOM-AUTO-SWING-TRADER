@@ -52,6 +52,9 @@ class SessionConfig:
     watch_symbols: tuple[str, ...] = ()
     close_balance_retries: int = 3          # 마감 후 잔고 조회 실패 시 추가 시도 횟수
     close_balance_retry_sec: float = 15.0
+    # M3 A2: 지정가 진입 마감 — 이 시각 이후 신규 지정가 매수 거부, 이 실행이 낸 미체결 지정가 매수 취소.
+    # None이면 아무것도 하지 않음(기본 — 기존 동작 그대로).
+    entry_cancel_at: time | None = None
 
     def __post_init__(self) -> None:
         if self.poll_interval_sec < 10:
@@ -85,6 +88,7 @@ class SessionSummary:
     report: str = ""                     # OK / FAILED: ... (run_session이 채움)
     execution_mode: str = ""             # M0 커밋 1: MOCK_LOCAL / KIWOOM_PAPER (run_session이 채움)
     account_scope: str = ""              # 비민감 계좌 라벨(계좌번호 아님)
+    cancels_requested: int = 0           # M3 A2: 지정가 매수 취소 요청(접수·거절·불명 포함)
 
     def add_close_issue(self, issue: str) -> None:
         if issue not in self.close_issues:
@@ -110,7 +114,7 @@ class SessionSummary:
             "daily_bars": self.daily_bars, "report": self.report,
             "ticks": self.ticks, "balance_failures": self.balance_failures,
             "orders_sent": self.orders_sent, "orders_accepted": self.orders_accepted,
-            "fills_recorded": self.fills_recorded,
+            "fills_recorded": self.fills_recorded, "cancels_requested": self.cancels_requested,
         }
 
     def lines(self) -> list[str]:
@@ -120,7 +124,8 @@ class SessionSummary:
         out += [
             f"거래일 {self.trade_date} | 상태 {self.status} | 폴링 {self.ticks}회 (잔고 실패 {self.balance_failures})",
             f"주문 의도 {self.intents} (한도 차단 {self.intents_denied}) | 전송 {self.orders_sent} / 접수 {self.orders_accepted}"
-            f" | 원장 기록 {self.fills_recorded}건",
+            f" | 원장 기록 {self.fills_recorded}건"
+            + (f" | 지정가 취소 요청 {self.cancels_requested}" if self.cancels_requested else ""),
         ]
         if self.denied_codes:
             out.append("차단 사유: " + ", ".join(f"{k} {v}" for k, v in sorted(self.denied_codes.items())))
@@ -198,6 +203,8 @@ class SessionRunner:
         self.stage = "STARTING"
         self._last_status_at: datetime | None = None
         self.buy_halt: dict | None = None
+        self._limit_buy_orders: dict[str, str] = {}     # M3 A2: 이 실행이 낸 지정가 매수 (주문번호 → 종목)
+        self._cancel_results: dict[str, str] = {}       # 종목 → 마지막 취소 요청 결과 코드
 
     # ── 진입점 ──────────────────────────────────────────────
 
@@ -400,6 +407,8 @@ class SessionRunner:
             orders_in_flight=bool(in_flight) or self.executor.has_unresolved_orders(),
             in_flight_symbols=in_flight,
         )
+        if allow_orders:
+            self._cancel_expired_entries(now)
         if call_strategy_start:
             self._safe_strategy_call("on_session_start", ctx)
         if allow_orders and not self._halted_reason:
@@ -422,6 +431,13 @@ class SessionRunner:
             self.log.info(f"[GUARD] {intent.symbol} BUY {intent.quantity}주 차단 | BUY_HALTED | "
                           f"요청 {self.buy_halt.get('request_id')}")
             return
+        if (intent.side == "BUY" and intent.order_type == "limit" and self.cfg.entry_cancel_at is not None
+                and ctx.now.time() >= self.cfg.entry_cancel_at):
+            self.summary.intents_denied += 1
+            self.summary.denied_codes["ENTRY_WINDOW_CLOSED"] = self.summary.denied_codes.get("ENTRY_WINDOW_CLOSED", 0) + 1
+            self.log.info(f"[GUARD] {intent.symbol} 지정가 BUY 차단 | ENTRY_WINDOW_CLOSED | "
+                          f"진입 마감 {self.cfg.entry_cancel_at:%H:%M}")
+            return
         prices: dict[str, int] = {}
         reserve, unknown_pending = 0, False
         if intent.side == "BUY":
@@ -443,7 +459,11 @@ class SessionRunner:
         context = {"entry_strategy": getattr(self.strategy, "strategy_id", ""), **intent.context}
         if intent.side == "BUY":
             context.setdefault("entry_reason", intent.reason)
-            sub = self.executor.submit_buy(intent.symbol, intent.quantity, intent.reference_price, context=context)
+            if intent.order_type == "limit":
+                sub = self.executor.submit_buy(intent.symbol, intent.quantity, intent.reference_price,
+                                               context=context, order_type="limit", limit_price=intent.limit_price)
+            else:
+                sub = self.executor.submit_buy(intent.symbol, intent.quantity, intent.reference_price, context=context)
         else:
             sub = self.executor.submit_sell(intent.symbol, intent.quantity, intent.reference_price,
                                             exit_reason=intent.reason,
@@ -455,12 +475,33 @@ class SessionRunner:
             self.log.warning(f"[SESSION] {intent.symbol} {intent.side} 미접수 | {sub.block_code or (sub.result.message if sub.result else '')}")
             return
         self.summary.orders_accepted += 1
+        # 지정가 매수의 추정가는 지정가(체결가는 그 이하) — 미체결 예약금·추정 원가 모두 보수적
+        est_price = intent.limit_price if intent.order_type == "limit" else intent.reference_price
         self.recorder.track(intent.symbol, intent.side, sub.result.order_id, intent.quantity,
-                            intent.reference_price, base_quantity=base_qty, base_cost=base_cost,
+                            est_price, base_quantity=base_qty, base_cost=base_cost,
                             order_date=ctx.trade_date)
+        if intent.order_type == "limit" and str(sub.result.order_id or "").strip():
+            self._limit_buy_orders[str(sub.result.order_id).strip().lstrip("0")] = intent.symbol
         if intent.side == "BUY" and intent.symbol not in self.state.positions:
             self.state.upsert_position_meta(PositionMeta(
                 intent.symbol, strategy_id=getattr(self.strategy, "strategy_id", ""), origin="ORDER"))
+
+    def _cancel_expired_entries(self, now: datetime) -> None:
+        """진입 마감(entry_cancel_at) 이후, 이 실행이 낸 지정가 매수 중 끝나지 않은 주문의 남은 수량 취소.
+
+        신규 매수 중단·주문 중단(_halt) 중에도 취소는 함 — 노출을 줄이는 쪽. 확정은 다음 폴링의 체결조회."""
+        if self.cfg.entry_cancel_at is None or now.time() < self.cfg.entry_cancel_at or not self._limit_buy_orders:
+            return
+        for sym, order_id in self.executor.open_buy_orders().items():
+            if self._limit_buy_orders.get(str(order_id).strip().lstrip("0")) != sym:
+                continue      # 이 실행이 낸 지정가 매수가 아님(시장가·재시작 전 주문) — 건드리지 않음
+            code = self.executor.cancel_open_buy(
+                sym, reason=f"지정가 진입 마감 {self.cfg.entry_cancel_at:%H:%M} — 미체결 잔량 취소")
+            if code in ("CANCEL_SENT", "CANCEL_REJECTED", "CANCEL_AMBIGUOUS"):
+                self.summary.cancels_requested += 1
+            if self._cancel_results.get(sym) != code:
+                self._cancel_results[sym] = code
+                self.log.info(f"[SESSION] {sym} 지정가 매수 {order_id} 취소 요청 결과 {code}")
 
     def _held_prices(self, ctx: TickContext) -> dict[str, int]:
         """계좌 전체 보유(원장 ∪ 잔고) 현재가. 한 폴링에 한 번만 조회."""
@@ -552,11 +593,14 @@ class SessionRunner:
                                 "reference_price": o.reference_price}
                                for o in self.recorder.tracked.values()],
             "unresolved_symbols": sorted(self.executor.unresolved_symbols()),
+            "buy_cancels": [r.to_dict() for r in self.executor.buy_cancels.values()]
+            if hasattr(self.executor, "buy_cancels") else [],
             "recovery_symbols": sorted(self.executor.recovery_blocked_symbols()),
             "lifecycle": {sym: st.lifecycle.value for sym, st in psm._states.items()},
             "counters": {"ticks": s.ticks, "balance_failures": s.balance_failures, "intents": s.intents,
                          "intents_denied": s.intents_denied, "orders_sent": s.orders_sent,
-                         "orders_accepted": s.orders_accepted, "fills_recorded": s.fills_recorded},
+                         "orders_accepted": s.orders_accepted, "fills_recorded": s.fills_recorded,
+                         "cancels_requested": s.cancels_requested},
             "denied_codes": dict(s.denied_codes),
         }
 

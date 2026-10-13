@@ -1,0 +1,10 @@
+{
+ "api_id": "ka10075",
+ "path": "/api/dostk/acnt",
+ "status": 200,
+ "body": {
+  "oso": [],
+  "return_code": 0,
+  "return_msg": " 조회가 완료되었습니다."
+ }
+}

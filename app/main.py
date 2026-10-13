@@ -44,6 +44,7 @@ from infra.storage.execution_guard import DataModeMismatchError, commit_data_mod
 from infra.storage.run_baseline import perform_run_baseline_startup
 from domain.position.position_book import ReconcileReport, reconcile
 from domain.service.lot_ledger import LotMatchError, apply_events
+from infra.storage.fill_evidence import FillEvidenceStore, evidence_path
 from infra.storage.fill_ledger import FillLedgerCorruptError, FillLedgerStore
 from infra.storage.swing_state_store import SwingStateStore
 from infra.storage.tracked_order_journal import (
@@ -298,9 +299,14 @@ def build_session_config(s) -> "SessionConfig":
     from app.session_runner import SessionConfig
 
     hh, mm = str(s.close_reconcile_until).split(":")
+    cancel_at = str(getattr(s, "entry_cancel_at", "") or "").strip()
+    entry_cancel_at = None
+    if cancel_at:
+        ch, cm = cancel_at.split(":")
+        entry_cancel_at = _time(int(ch), int(cm))
     return SessionConfig(
         poll_interval_sec=float(s.poll_interval_sec), close_reconcile_until=_time(int(hh), int(mm)),
-        watch_symbols=tuple(str(x) for x in s.watch_symbols),
+        watch_symbols=tuple(str(x) for x in s.watch_symbols), entry_cancel_at=entry_cancel_at,
     )
 
 
@@ -350,7 +356,11 @@ def build_session_runner(settings: Settings, broker, app_logger, *, strategy=Non
     runner = SessionRunner(
         broker=broker, executor=executor, state=state, ledger_store=ledger_store,
         recorder=FillRecorder(ledger_store, logger=app_logger,
-                              scope=settings.broker.account_scope_id.strip() or "unscoped"), calendar=calendar,
+                              scope=settings.broker.account_scope_id.strip() or "unscoped",
+                              # M3 A2: 주문별 체결조회(키움만 — MockBroker는 없음 → 기존 기록 방식)
+                              fill_lookup=getattr(broker, "get_fill_detail", None),
+                              evidence_store=FillEvidenceStore(evidence_path(settings.storage.fill_ledger_file))),
+        calendar=calendar,
         strategy=strategy or NullStrategy(), guard_config=build_guard_config(settings.guard),
         session_config=build_session_config(settings.session), logger=app_logger,
         clock=clock or now_local, sleep=sleep or _time_mod.sleep, should_stop=should_stop or (lambda: False),

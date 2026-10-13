@@ -137,7 +137,9 @@ def check_intent(
         return _deny("SYMBOL_NOT_ALLOWED", "허용 종목 목록에 없음")
     if pending_buy_reserve < 0:
         return _deny("INVALID_RESERVE", f"미체결 매수 예약금이 음수: {pending_buy_reserve}")
-    buffered = int(intent.notional * (1 + config.buy_price_buffer_pct / 100))
+    # 지정가 매수는 지정가 이하로만 체결 — 시장가 변동 여유를 더하지 않음(M3 A2)
+    buffered = (intent.notional if intent.order_type == "limit"
+                else int(intent.notional * (1 + config.buy_price_buffer_pct / 100)))
     if buffered > config.max_order_amount:
         return _deny("ORDER_AMOUNT_LIMIT",
                      f"{intent.notional:,}원(+여유 {config.buy_price_buffer_pct}% = {buffered:,}) > 상한 {config.max_order_amount:,}원")

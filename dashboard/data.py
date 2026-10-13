@@ -430,11 +430,26 @@ def costs(p: Paths, settings) -> Section:
     le = ledger_events(p)
     if le.state != OK:
         return le
+    from domain.service.fill_evidence import apply_fill_evidence
     from domain.service.lot_ledger import apply_events
-    led = apply_events(le.data)
-    ev_rows = [{"거래일": e.trade_date.isoformat(), "종목": e.symbol, "구분": e.kind, "수량": e.quantity,
-                "가격": e.price, "가격 출처": PRICE_SOURCE_LABEL.get(e.price_source, e.price_source),
-                "주문번호": e.order_id, "메모": e.note} for e in le.data]
+    from infra.storage.fill_evidence import FillEvidenceStore
+    ev_file = p.fill_ledger.with_name("fill_evidence.jsonl")
+    ev_note = ""
+    try:      # M3 A2: 주문별 체결 근거(ka10076)를 원장 사건에 겹침 — 읽기 전용(파일·폴더 만들지 않음)
+        overlay = apply_fill_evidence(le.data, FillEvidenceStore(ev_file, read_only=True).load())
+    except Exception as exc:          # noqa: BLE001
+        overlay = apply_fill_evidence(le.data, [])
+        ev_note = f"체결 근거 기록 읽기 실패 — 원장 가격만 표시: {type(exc).__name__}: {exc}"
+    events = overlay.events
+    led = apply_events(events)
+    ev_rows = []
+    for e in events:
+        r = overlay.applied.get(e.event_id)
+        ev_rows.append({"거래일": e.trade_date.isoformat(), "종목": e.symbol, "구분": e.kind, "수량": e.quantity,
+                        "가격": e.price, "가격 출처": PRICE_SOURCE_LABEL.get(e.price_source, e.price_source),
+                        "수수료": "-" if r is None or r.commission is None else r.commission,
+                        "세금": "-" if r is None or r.tax is None else r.tax,
+                        "주문번호": e.order_id, "메모": e.note})
     real = [{"매도일": r.sell_date.isoformat(), "종목": r.symbol, "수량": r.quantity, "매수가": r.buy_price,
              "매도가": r.sell_price, "손익(비용 전)": r.gross_pnl,
              "구분": "추정 포함" if r.is_estimate else "브로커 근거"} for r in led.realized]
@@ -444,8 +459,15 @@ def costs(p: Paths, settings) -> Section:
         cmd = {"gross": cm.gross_roundtrip_pct, "base": cm.base_roundtrip_pct, "stress": cm.stress_roundtrip_pct}
     except Exception as exc:          # noqa: BLE001
         cmd = {"error": f"{type(exc).__name__}: {exc}"}
-    s = Section(OK, {"events": ev_rows, "realized": real, "cost_model": cmd}, source="fill_ledger.jsonl")
-    s.notes.append("실제 비용(수수료·세금)은 원장에 아직 기록하지 않음 — 비용은 모두 추정. 장부 대조 일치는 체결 가격 검증이 아님")
+    s = Section(OK, {"events": ev_rows, "realized": real, "cost_model": cmd},
+                source="fill_ledger.jsonl + fill_evidence.jsonl")
+    n_cost = sum(1 for r in overlay.applied.values() if r.commission is not None)
+    s.notes.append(f"실제 수수료·세금은 체결 근거가 있는 사건만 표시({n_cost}건) — 손익(비용 전)과 비용 모델은 추정. "
+                   "장부 대조 일치는 체결 가격 검증이 아님")
+    for m in overlay.mismatched[:5]:
+        s.notes.append(f"체결 근거 적용 안 함: {m}")
+    if ev_note:
+        s.notes.append(ev_note)
     return s
 
 

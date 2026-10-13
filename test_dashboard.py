@@ -141,6 +141,23 @@ banned = ("place_order", "KiwoomBroker(", "build_broker", "subprocess", "Popen",
 check("16) 화면 코드에 주문·인증·브로커 생성·프로세스 실행 없음(명령은 복사용 문자열로만)",
       not any(b in src.replace('"python -u tools/watch_daemon.py run', "") for b in banned[:-1]))
 
+# 7. 체결 근거(M3 A2) — 추정 매도에 ka10076 근거가 붙으면 체결가·수수료·세금 표시, 읽기만
+from domain.service.fill_evidence import FillEvidenceRecord  # noqa: E402
+from infra.storage.fill_evidence import FillEvidenceStore  # noqa: E402
+
+R7, S7, P7 = env("evidence", "normal")
+FillEvidenceStore(P7.fill_ledger.with_name("fill_evidence.jsonl")).append(FillEvidenceRecord(
+    "acct-swing|20261013|SELL|005930|0112348|1", "0112348", "005930", "SELL", 1, 229_500, 800, 457, "ka10076",
+    "CONFIRM_TOOL", NOW))
+b7 = tree_hash(R7)
+c7 = D.costs(P7, S7)
+sell7 = next(r for r in c7.data["events"] if r["구분"] == "SELL")
+check("17) 비용·체결 근거: 근거가 붙은 매도는 체결가 229,500(브로커 근거)·수수료 800·세금 457, 근거 없는 사건은 '-', "
+      "화면 읽기로 파일 변화 없음",
+      sell7["가격"] == 229_500 and sell7["가격 출처"].startswith("체결가") and (sell7["수수료"], sell7["세금"]) == (800, 457)
+      and all(r["수수료"] == "-" for r in c7.data["events"] if r["구분"] == "BUY") and tree_hash(R7) == b7
+      and any("체결 근거가 있는 사건만" in n for n in c7.notes))
+
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)
 print(f"\n총 {len(results)}건 중 통과 {passed}건, 실패 {len(results) - passed}건")

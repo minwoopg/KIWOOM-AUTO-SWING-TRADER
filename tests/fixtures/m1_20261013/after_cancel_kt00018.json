@@ -1,0 +1,18 @@
+{
+ "api_id": "kt00018",
+ "path": "/api/dostk/acnt",
+ "status": 200,
+ "body": {
+  "tot_pur_amt": "000000000000000",
+  "tot_evlt_amt": "000000000000000",
+  "tot_evlt_pl": "000000000000000",
+  "tot_prft_rt": "000000000.00",
+  "prsm_dpst_aset_amt": "000000049997943",
+  "tot_loan_amt": "000000000000000",
+  "tot_crd_loan_amt": "000000000000000",
+  "tot_crd_ls_amt": "000000000000000",
+  "acnt_evlt_remn_indv_tot": [],
+  "return_code": 0,
+  "return_msg": "모의투자 해당조회내역이 없습니다."
+ }
+}

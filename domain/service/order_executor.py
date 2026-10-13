@@ -39,6 +39,10 @@ from __future__ import annotations
 5. 조회 대상 목록은 `sync_with_balance(balance, watch_symbols=...)`로 받습니다
    (원본은 `self.targets`).
 6. `commands/` 폴더 경로를 생성자 인자로 받습니다(기본값 "commands" — 원본과 동일).
+7. (M3 A2, 스윙 추가) 지정가 매수 `submit_buy(order_type="limit", limit_price=...)`와 미체결 매수 취소
+   `cancel_open_buy()`. 취소 확정은 체결조회 결과를 `domain/service/buy_cancel.assess_buy_cancel`로 판정해
+   PSM `confirm_buy_cancelled()`로만 반영합니다. 기본값(시장가)과 취소 요청이 없는 경로는 원본과 같음
+   (동등성 비교 18/18).
 """
 
 import json
@@ -55,6 +59,9 @@ from domain.models import (
 )
 from domain.position.lifecycle import (
     PositionLifecycle, PositionStateMachine, is_trackable_order_id,
+)
+from domain.service.buy_cancel import (
+    CANCEL_CONFIRMED, FILLED_BEFORE_CANCEL, STILL_OPEN, CancelRecord, assess_buy_cancel,
 )
 from infra.broker.kiwoom_order_status import find_all_matching, normalize_order_id
 from infra.storage.order_status_observation_store import (
@@ -188,6 +195,8 @@ class OrderExecutor:
         self._last_order_status_query_at: dict[str, datetime] = {}
         self._last_order_attempt_by_symbol: dict[str, OrderResult] = {}
         self._forced_sell_failures: dict[str, int] = {}
+        # M3 A2: 지정가 매수 취소 (스윙 추가 — 단타 원본 경로에서는 쓰이지 않음)
+        self._buy_cancels: dict[str, CancelRecord] = {}
         self.restore_order_recovery_blocks()
 
     # ══════════════════════════════════════════════════════════════
@@ -405,8 +414,13 @@ class OrderExecutor:
         reference_price: int,
         *,
         context: dict | None = None,
+        order_type: str = "market",
+        limit_price: int | None = None,
     ) -> OrderSubmission:
-        """시장가 매수. 원본 _try_buy()의 주문 의도 기록 이후 흐름과 동일.
+        """매수(기본 시장가). 원본 _try_buy()의 주문 의도 기록 이후 흐름과 동일.
+
+        order_type="limit"(M3 A2): limit_price로 지정가 주문(키움 trde_tp "0", ord_uv=지정가).
+            가격 검증(호가 단위 등)은 OrderIntent에서 — 여기서는 양의 정수만 확인.
 
         reference_price: 주문 직전 시세 (ORDER_PRICE_BASED_ESTIMATE — 실제
             체결가 아님). trades.csv price 컬럼과 첫 체결 훅 ctx에 그대로 들어감.
@@ -417,14 +431,22 @@ class OrderExecutor:
             return OrderSubmission(block)
         if quantity <= 0:
             return OrderSubmission("INVALID_QUANTITY")
+        if order_type not in ("market", "limit"):
+            return OrderSubmission("INVALID_ORDER_TYPE")
+        if order_type == "limit" and (type(limit_price) is not int or limit_price <= 0):
+            return OrderSubmission("INVALID_LIMIT_PRICE")
 
         current_price = reference_price
         context = dict(context or {})
+        if order_type == "limit":
+            context.setdefault("order_type", "limit")
+            context.setdefault("limit_price", limit_price)
         order = OrderRequest(
             symbol=symbol,
             side=OrderSide.BUY,
             quantity=quantity,
-            price=current_price,
+            order_type=order_type,
+            price=limit_price if order_type == "limit" else current_price,
         )
 
         if not self._begin_order_intent(symbol, "BUY", order.quantity):
@@ -736,6 +758,9 @@ class OrderExecutor:
             self._maintain_tracked_order_journal(symbol)
             self._clear_resolved_order_intent(symbol)
 
+        if self._buy_cancels:
+            self._forget_finished_cancels()
+
     def reconcile_after_market_close(self, balance: AccountBalance, watch_symbols=()) -> None:
         """원본과 동일: 미해결 주문이 있을 때만 대조·저장, 주문은 내지 않음."""
         if self.has_unresolved_orders():
@@ -1010,6 +1035,8 @@ class OrderExecutor:
             outcome="success", failure_stage=None, error_repr=None,
             evidence=evidence,
         )
+        if kind in ("BUY_PENDING", "ORPHAN") and self._resolve_buy_cancel(symbol, order_id, evidence, broker_qty):
+            return
 
         if broker_order.status == BrokerOrderStatus.OPEN:
             return  # 살아있다는 증거일 뿐 — 상태 변경 없음
@@ -1069,6 +1096,143 @@ class OrderExecutor:
                     f"broker_qty={broker_qty} | target={target} — "
                     f"잔고 API 반영 지연일 수 있음, orphan 유지"
                 )
+
+    # ══════════════════════════════════════════════════════════════
+    # 지정가 매수 취소 (M3 A2 — 스윙 추가, 단타 원본에 없음)
+    # ══════════════════════════════════════════════════════════════
+
+    MAX_CANCEL_ATTEMPTS = 3
+
+    def open_buy_orders(self) -> dict[str, str]:
+        """종목 → 아직 끝나지 않은 BUY 주문번호(BUY_PENDING 또는 BUY orphan). 읽기 전용."""
+        out: dict[str, str] = {}
+        for sym, st in self._position_state_machine._states.items():
+            if st.lifecycle == PositionLifecycle.BUY_PENDING and is_trackable_order_id(st.pending_order_id):
+                out[sym] = str(st.pending_order_id)
+            elif st.orphan_order_id and st.orphan_expected_delta > 0 and is_trackable_order_id(st.orphan_order_id):
+                out[sym] = str(st.orphan_order_id)
+        return out
+
+    @property
+    def buy_cancels(self) -> dict[str, CancelRecord]:
+        return dict(self._buy_cancels)
+
+    def cancel_open_buy(self, symbol: str, *, reason: str) -> str:
+        """끝나지 않은 BUY 주문의 남은 수량을 취소 요청합니다(지정가 진입 마감 09:30 등).
+
+        반환 코드: CANCEL_SENT / ALREADY_REQUESTED / NO_OPEN_BUY / CANCEL_UNSUPPORTED /
+        CANCEL_REJECTED(거절 — 체결이 먼저였을 수 있음, 다음 폴링에 다시 시도 최대 3회) /
+        CANCEL_AMBIGUOUS(응답 불명 — 다시 보내지 않음, 사람 확인).
+        취소 요청은 상태를 바꾸지 않습니다. 확정은 다음 체결조회에서 `assess_buy_cancel`이 판정합니다.
+        """
+        if not reason or not reason.strip():
+            raise ValueError("cancel_open_buy에는 사유가 필요합니다")
+        order_id = self.open_buy_orders().get(symbol)
+        if not order_id:
+            return "NO_OPEN_BUY"
+        cancel = getattr(self.broker, "cancel_order", None)
+        if cancel is None:
+            return "CANCEL_UNSUPPORTED"
+        prev = self._buy_cancels.get(symbol)
+        if prev is not None and normalize_order_id(prev.order_id) == normalize_order_id(order_id):
+            if prev.accepted or prev.ambiguous or prev.resolved:
+                return "ALREADY_REQUESTED"
+            if prev.attempts >= self.MAX_CANCEL_ATTEMPTS:
+                return "ALREADY_REQUESTED"
+        st = self._position_state_machine.get(symbol)
+        # 남은 수량 = 주문 목표 잔고 − 지금 잔고(부분 체결분 제외). 요청 수량을 넘지 않게.
+        ordered = (st.requested_quantity if st.lifecycle == PositionLifecycle.BUY_PENDING
+                   else st.orphan_expected_delta)
+        remaining = min(ordered, st.expected_final_quantity - max(st.known_quantity, st.observed_quantity))
+        if remaining <= 0:
+            return "NO_OPEN_BUY"
+        record = CancelRecord(symbol=symbol, order_id=order_id, quantity=remaining,
+                              base_quantity=st.base_quantity_before_order, requested_at=self._now(),
+                              reason=reason, attempts=(prev.attempts + 1 if prev and
+                                                       normalize_order_id(prev.order_id) == normalize_order_id(order_id)
+                                                       else 1))
+        try:
+            result = cancel(order_id, symbol, remaining)
+            record.accepted = bool(result.accepted)
+            record.ambiguous = bool(result.is_ambiguous)
+            record.cancel_order_id = str(result.cancel_order_id or "")
+            record.message = str(result.message or "")
+            record.body = dict(result.body or {})
+        except Exception as exc:
+            record.ambiguous = True
+            record.message = f"{type(exc).__name__}: {exc}"
+        self._buy_cancels[symbol] = record
+        self._last_order_status_query_at.pop(symbol, None)   # 다음 폴링에 바로 확인
+        self._journal_cancel("CANCEL_REQUESTED", record)
+        if record.ambiguous:
+            self.app_logger.critical(
+                f"[BUY_CANCEL_AMBIGUOUS] {symbol} | 원주문 {order_id} | 취소 접수 여부 불명 — 다시 보내지 않음, "
+                f"계좌 확인 후 ack_orphan/ack_error 필요: {record.message}")
+            return "CANCEL_AMBIGUOUS"
+        if not record.accepted:
+            self.app_logger.warning(
+                f"[BUY_CANCEL_REJECTED] {symbol} | 원주문 {order_id} | {record.message} "
+                f"({record.attempts}/{self.MAX_CANCEL_ATTEMPTS}) — 체결이 먼저였을 수 있음, 체결조회로 확인")
+            return "CANCEL_REJECTED"
+        if not record.body_matches_order:
+            self.app_logger.critical(
+                f"[BUY_CANCEL_MISMATCH] {symbol} | 취소 응답 원주문번호 {record.body.get('base_orig_ord_no')} ≠ "
+                f"{order_id} — 자동 확정 안 함")
+        self.app_logger.info(f"[BUY_CANCEL] {symbol} | 원주문 {order_id} 남은 {remaining}주 취소 접수 | "
+                             f"취소 주문 {record.cancel_order_id} | {reason}")
+        return "CANCEL_SENT"
+
+    def _resolve_buy_cancel(self, symbol: str, order_id: str, evidence, broker_qty: int) -> bool:
+        """취소 요청이 있는 주문이면 판정. 처리를 끝냈으면 True(아래 기존 판정 생략)."""
+        record = self._buy_cancels.get(symbol)
+        if (record is None or record.resolved
+                or normalize_order_id(record.order_id) != normalize_order_id(order_id)):
+            return False
+        verdict = assess_buy_cancel(record, evidence, broker_qty)
+        if verdict.verdict == FILLED_BEFORE_CANCEL:
+            record.resolved = FILLED_BEFORE_CANCEL
+            self._journal_cancel("FILLED_BEFORE_CANCEL", record, verdict.detail)
+            self.app_logger.warning(f"[BUY_CANCEL] {symbol} | 원주문 {order_id} {verdict.detail} — 정상 체결로 처리")
+            return False     # 기존 FILLED 경로가 잔고 일치 시 확정
+        if verdict.verdict == STILL_OPEN:
+            self.app_logger.info(f"[BUY_CANCEL] {symbol} | 원주문 {order_id} 취소 반영 전 — {verdict.detail}")
+            return True
+        if verdict.verdict == CANCEL_CONFIRMED:
+            done = self._position_state_machine.confirm_buy_cancelled(symbol, order_id, broker_qty, verdict.detail)
+            if done:
+                record.resolved = CANCEL_CONFIRMED
+                self._pending_buy_side_effects.pop(symbol, None)
+                self._journal_cancel("CANCEL_CONFIRMED", record, verdict.detail)
+                self.app_logger.warning(f"[BUY_CANCEL_CONFIRMED] {symbol} | {done}")
+                self._clear_resolved_order_intent(symbol)
+                return True
+            verdict_detail = f"상태머신이 확정을 거부(주문번호·잔고·상태 불일치) — {verdict.detail}"
+        else:
+            verdict_detail = verdict.detail
+        if record.message != f"UNRESOLVED: {verdict_detail}":
+            record.message = f"UNRESOLVED: {verdict_detail}"
+            self._journal_cancel("CANCEL_UNRESOLVED", record, verdict_detail)
+            self.app_logger.critical(f"[BUY_CANCEL_UNRESOLVED] {symbol} | 원주문 {order_id} | {verdict_detail} — "
+                                     f"상태 유지(사람 확인: 계좌 확인 후 ack_orphan)")
+        return True
+
+    def _forget_finished_cancels(self) -> None:
+        """원 주문이 더 이상 열려 있지 않은(체결·취소·사람 확인으로 해소된) 취소 기록 정리."""
+        open_now = self.open_buy_orders()
+        for sym in list(self._buy_cancels):
+            rec = self._buy_cancels[sym]
+            if normalize_order_id(open_now.get(sym)) != normalize_order_id(rec.order_id):
+                self._buy_cancels.pop(sym)
+
+    def _journal_cancel(self, event: str, record: CancelRecord, detail: str = "") -> None:
+        """감사용 append-only 기록(상태 복원에는 쓰지 않음 — 재시작하면 미해결 주문은 ERROR로 복원)."""
+        try:
+            path = Path(self.settings.storage.state_file).with_name("buy_cancels.jsonl")
+            line = {"at": self._now().isoformat(), "event": event, "detail": detail, **record.to_dict()}
+            with path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            self.app_logger.warning(f"[BUY_CANCEL] 기록 실패(동작 영향 없음): {type(exc).__name__}: {exc}")
 
     # ══════════════════════════════════════════════════════════════
     # 사람 확인 파일 명령 (폴더 경로 인자화 + 8-A: BOM 허용·입력 검증·처리 파일 보관)

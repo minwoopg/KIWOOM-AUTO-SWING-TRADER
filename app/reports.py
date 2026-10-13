@@ -50,6 +50,17 @@ def generate_daily_report(
     calendar = calendar or TradingCalendar.load()
     historical = trade_date < (today or date.today())
     events = FillLedgerStore(settings.storage.fill_ledger_file).load()
+    try:   # M3 A2: 주문별 체결 근거(ka10076)로 추정가를 실제 체결가로 — 원장 파일은 그대로
+        from domain.service.fill_evidence import apply_fill_evidence
+        from infra.storage.fill_evidence import FillEvidenceStore, evidence_path
+        overlay = apply_fill_evidence(
+            events, FillEvidenceStore(evidence_path(settings.storage.fill_ledger_file), read_only=True).load())
+        events = overlay.events
+        if overlay.mismatched and logger is not None:
+            logger.warning(f"[REPORT] 체결 근거 적용 안 함 {len(overlay.mismatched)}건: {overlay.mismatched[:3]}")
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(f"[REPORT] 체결 근거 읽기 실패 — 원장 가격으로 작성: {type(exc).__name__}: {exc}")
     state, _ = SwingStateStore(settings.storage.state_file).load()
     try:
         journal = sorted(TrackedOrderJournalStore(settings.storage.tracked_order_journal_file).load_all())

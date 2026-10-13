@@ -17,7 +17,12 @@ from __future__ import annotations
     (직전 원가도 잔고 평균단가 기준이라 원장의 추정가와 섞이지 않음.)
     역산 값이 0 이하이거나 요청 수량을 넘는 변화가 섞이면 주문가 추정(ORDER_ESTIMATE).
   - 매도: 잔고로는 체결가를 알 수 없어 주문 직전 시세(ORDER_ESTIMATE).
-    체결조회 증거로 실제 체결가를 붙이는 것은 이후 과제.
+  - (M3 A2) `fill_lookup`이 있으면 **주문 전량이 한 사건으로 끝날 때** 주문별 체결조회(ka10076)를
+    먼저 봅니다. 주문번호·방향·수량이 맞는 전량 체결 행이 있으면 그 체결가(BROKER_FILL)로 기록하고
+    수수료·세금은 체결 근거 기록(`fill_evidence.jsonl`)에 남깁니다. 조회 실패·행 없음이면 위 규칙대로
+    기록하고, 다음 폴링부터 한 폴링에 한 건씩(최대 RETRY_LIMIT회) 다시 확인해 근거 기록만 추가합니다
+    (원장 사건은 다시 쓰지 않음 — 중복 BUY/SELL 없음). 재시작하면 재확인 목록은 사라지고
+    `tools/paper_order.py confirm-fills`로 확인합니다. 지정가 매수의 추정가는 지정가(체결가는 그 이하).
 - event_id = "{계좌범위}|{주문 거래일}|{매수/매도}|{종목}|{주문번호}|{누적 체결수량}"
   → 같은 주문의 재폴링은 같은 id라 두 번 기록되지 않고(원장이 같은 id를 무시),
   다른 날·다른 계좌에서 같은 주문번호가 다시 나와도 다른 사건으로 구분됨
@@ -34,6 +39,7 @@ from datetime import date, datetime
 
 from domain.models import AccountBalance
 from domain.position.fill_event import FillEvent
+from domain.service.fill_evidence import record_for_event
 
 
 @dataclass
@@ -55,7 +61,10 @@ class TrackedOrder:
 
 
 class FillRecorder:
-    def __init__(self, ledger_store, logger=None, *, scope: str = "default") -> None:
+    RETRY_LIMIT = 5
+
+    def __init__(self, ledger_store, logger=None, *, scope: str = "default",
+                 fill_lookup=None, evidence_store=None) -> None:
         scope = str(scope or "").strip()
         if not scope or any(c in scope for c in "|\r\n"):
             raise ValueError(f"체결 원장 계좌 범위(scope)가 비었거나 '|'·줄바꿈 포함: {scope!r}")
@@ -63,6 +72,14 @@ class FillRecorder:
         self.logger = logger
         self.scope = scope
         self._orders: dict[str, TrackedOrder] = {}
+        # M3 A2: fill_lookup(order_id, symbol) -> FillDetail | None (예외 가능), evidence_store.append(record)
+        self.fill_lookup = fill_lookup
+        self.evidence_store = evidence_store
+        self._unconfirmed: dict[str, dict] = {}     # event_id → {event, attempts}
+
+    @property
+    def unconfirmed(self) -> dict[str, dict]:
+        return dict(self._unconfirmed)
 
     @property
     def tracked(self) -> dict[str, TrackedOrder]:
@@ -95,6 +112,7 @@ class FillRecorder:
         """잔고 스냅샷을 보고 새 체결 사건을 원장에 기록. 기록한 사건 목록 반환."""
         held = {p.symbol: p for p in balance.positions}
         written: list[FillEvent] = []
+        retried = self._retry_one_confirmation(now)
         for sym, order in list(self._orders.items()):
             pos = held.get(sym)
             broker_qty = pos.quantity if pos else 0
@@ -113,13 +131,29 @@ class FillRecorder:
                 derived = (pos.average_price * broker_qty - prev_cost) / delta
                 if broker_qty == prev_qty + delta and derived > 0:
                     price, source = int(round(derived)), "BROKER_AVG"
+            whole_order = delta == order.requested_quantity     # 주문 전량이 이 사건 하나
+            detail, lookup_note = None, ""
+            if whole_order and self.fill_lookup is not None and not retried:
+                detail, lookup_note = self._lookup(order.order_id, sym, order.side, delta)
+                retried = True     # 한 폴링에 체결조회 한 번(조회 한도 보호)
+            if detail is not None:
+                price, source = detail.price, "BROKER_FILL"
             ev = FillEvent(
                 event_id=self.event_id(order, filled_now, trade_date), kind=order.side, symbol=sym,
                 quantity=delta, price=price, price_source=source, trade_date=trade_date,
                 occurred_at=now, order_id=order.order_id,
-                note=f"잔고 변화 기록 ({order.base_quantity}→{broker_qty}주)",
+                note=f"잔고 변화 기록 ({order.base_quantity}→{broker_qty}주)"
+                     + (" · 체결조회 ka10076" if detail is not None else ""),
             )
             self.ledger_store.append(ev)
+            if whole_order and self.fill_lookup is not None:
+                if detail is not None:
+                    self._save_evidence(ev, detail, "AUTO", now)
+                else:
+                    self._unconfirmed[ev.event_id] = {"event": ev, "attempts": 1 if lookup_note else 0}
+                    if self.logger is not None:
+                        self.logger.info(f"[FILL_RECORDER] {sym} {order.side} 체결가 확인 보류"
+                                         f"({lookup_note or '이번 폴링 조회 한도'}) — 다음 폴링에 다시 확인")
             order.filled_quantity = filled_now
             if order.side == "BUY":
                 order.recorded_cost += price * delta
@@ -130,3 +164,56 @@ class FillRecorder:
             if order.done:
                 self._orders.pop(sym, None)
         return written
+
+    # ── M3 A2: 주문별 체결 근거 ─────────────────────────────
+
+    def _lookup(self, order_id: str, symbol: str, side: str, quantity: int):
+        """(FillDetail 또는 None, 실패 사유). 주문번호·방향·수량이 맞지 않으면 None."""
+        try:
+            detail = self.fill_lookup(order_id, symbol)
+        except Exception as exc:
+            return None, f"체결조회 실패 {type(exc).__name__}: {exc}"
+        if detail is None:
+            return None, "체결조회에 전량 체결 행 없음"
+        side_v = getattr(detail.side, "value", detail.side)
+        if side_v != side or detail.quantity != quantity or detail.symbol != symbol:
+            return None, f"체결조회 행 불일치(방향 {side_v}·수량 {detail.quantity})"
+        return detail, ""
+
+    def _save_evidence(self, ev: FillEvent, detail, origin: str, now: datetime) -> bool:
+        rec = record_for_event(ev, detail, origin=origin, now=now)
+        if rec is None or self.evidence_store is None:
+            return rec is not None
+        try:
+            self.evidence_store.append(rec)
+            return True
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.critical(f"[FILL_RECORDER] {ev.symbol} 체결 근거 기록 실패(원장은 기록됨) — "
+                                     f"{type(exc).__name__}: {exc}")
+            return False
+
+    def _retry_one_confirmation(self, now: datetime) -> bool:
+        """추정가로 기록된 사건 하나의 체결가를 다시 확인. 조회했으면 True."""
+        if self.fill_lookup is None or not self._unconfirmed:
+            return False
+        eid, item = next(iter(self._unconfirmed.items()))
+        ev: FillEvent = item["event"]
+        item["attempts"] += 1
+        detail, why = self._lookup(ev.order_id, ev.symbol, ev.kind, ev.quantity)
+        if detail is not None:
+            if self._save_evidence(ev, detail, "AUTO_RETRY", now):
+                self._unconfirmed.pop(eid, None)
+                if self.logger is not None:
+                    self.logger.info(f"[FILL_RECORDER] {ev.symbol} {ev.kind} 체결가 확인 {detail.price:,}원 "
+                                     f"(원장 {ev.price_source} {ev.price:,}원 — 근거 기록 추가)")
+        elif item["attempts"] >= self.RETRY_LIMIT:
+            self._unconfirmed.pop(eid, None)
+            if self.logger is not None:
+                self.logger.warning(f"[FILL_RECORDER] {ev.symbol} {ev.kind} 체결가 확인 {self.RETRY_LIMIT}회 실패"
+                                    f"({why}) — 추정가 유지, `paper_order.py confirm-fills`로 확인")
+        else:
+            # 다음 폴링에 다른 사건부터 보도록 뒤로 보냄
+            self._unconfirmed.pop(eid)
+            self._unconfirmed[eid] = item
+        return True

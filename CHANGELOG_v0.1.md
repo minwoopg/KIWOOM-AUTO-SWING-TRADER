@@ -1866,4 +1866,44 @@ GPT 자동 모의매매 최소판 요청(main `5c3cac8`)과 사용자 관리 화
 ### 전달 파일
 - 패치 — check-orders(1), limit-cancel(1), 이번 묶음(중단 계약·관리 창·문서)
 
+## 2026-10-13 — M3 A2: 지정가 매수·09:30 미체결 취소 확정·주문별 체결 근거 (실측 원문 `m1-lc-1013` 기반)
+
+### 배경
+limit-cancel·check-orders 실측(주문 0148913 → 취소 0148928)으로 취소 응답 모양과 "체결 없이 취소된 주문은 미체결·체결 목록 어디에도
+남지 않음"을 확인. ka10076 체결 행에 주문별 실제 체결가·수수료·세금이 있음을 확인. 이를 근거로 A2(지정가 경로·취소 해소·체결 근거)를 구현.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `domain/strategy/interface.py`, `domain/risk/account_guard.py` | `OrderIntent.order_type/limit_price`(매수만·호가 단위), 지정가 한도 금액 = 지정가×수량 |
+| `domain/service/order_executor.py` | `submit_buy(order_type, limit_price)`, `open_buy_orders()`, `cancel_open_buy()`(중복 없음·거절 3회·불명 재전송 없음), 체결조회 때 취소 판정 |
+| `domain/service/buy_cancel.py` (신규) | 취소 확정 판정(우리 취소 접수 + 원주문 행 없음 + 잔고 그대로), FILLED·STILL_OPEN·UNRESOLVED |
+| `domain/position/lifecycle.py` | `confirm_buy_cancelled()` — 같은 주문번호·잔고 = 주문 직전일 때만 |
+| `app/session_runner.py`, `app/main.py`, `config/settings.py` | `session.entry_cancel_at`(기본 09:30): 이후 지정가 매수 거부, 이 실행이 낸 미체결 지정가 취소(중단 중에도), 요약·상태 파일에 취소 |
+| `domain/service/fill_recorder.py`, `domain/service/fill_evidence.py`·`infra/storage/fill_evidence.py`·`infra/broker/fill_detail.py` (신규) | 주문 전량 체결이면 ka10076 체결가로 원장 기록(BROKER_FILL), 실패 시 추정가 기록 후 다음 폴링 재확인 → 근거 기록만 추가. 근거 겹치기(보고서·관리 창) |
+| `infra/broker/execution_mode.py` | `PaperKiwoomBroker.get_fill_detail`(ka10076 한 번), 취소 응답 실측 주석 |
+| `tools/paper_order.py` | `confirm-fills [--confirm]` — 오늘 원장 체결의 실제 체결가·수수료·세금(미리보기 기본, 원장 불변) |
+| `app/reports.py`, `dashboard/data.py` | 체결 근거를 겹쳐 실제 체결가로 손익, 관리 창 비용 탭에 수수료·세금 |
+| `tests/fixtures/m1_20261013/` (신규) | 실측 응답 7건(계좌번호 가림, 토큰 없음) |
+| `docs/m3_a2_limit_cancel.md` (신규), README, `provenance.json`(lifecycle 비고) | 규칙·사용법 |
+
+### 테스트 및 검증
+- 새 시험: `test_m1_measured.py` 13(실측 판정·취소 응답·확정/미확정 6가지·체결 근거·겹치기·저장소), `test_limit_cancel_flow.py` 15
+  (지정가 요청 모양, 09:30 취소 1회·확정·계좌 매수 재허용, 마감 뒤 거부, 취소 전 체결, 취소·체결 경합, 거절 3회, 응답 불명, 부분 체결,
+  중단 중 취소, 매도 체결가 429 뒤 재확인, 재시작 뒤 자동 취소 안 함), `test_paper_order.py` 20번(confirm-fills), `test_dashboard.py` 17번.
+- 변이 확인: 취소 접수 조건·중복 취소 방지·이 실행 주문만 취소·잔고 조건·체결 행 방향/수량 검사를 하나씩 끄면 해당 시험 실패.
+- 회귀 42/42(`test_broker_order_status.py` 제외 — 단타 실측 fixture 없음, 이번 실측으로 대신하지 않음, 통과로 세지 않음),
+  OrderExecutor 동등성 18/18, 출처 기록 경계(원본 그대로 파일 unchanged 유지). Python 3.11·3.14rc2. 관리 창 동작 3/3(Xvfb, 3.12).
+- **미실측**: 부분 체결 행 모양, 취소 거절 응답 문구, 취소 직후 체결 경합의 실제 순서, 전날 주문의 ka10076 조회 범위.
+
+### 변경하지 않은 것
+- 전략(NullStrategy — 자동 지정가 주문 없음), S1·관리자, 시장가 경로, `kiwoom_order_status.py`·`kiwoom_broker.py`, `config/settings.yaml`.
+
+### 다음 작업
+- 오늘(10/13) M1 체결가 확인: `confirm-fills` 미리보기 → `--confirm`.
+- B(20:30 임시 스캔·08:40 입력 재확인·후보 adapter·S1 그림자) → C(E1·손실 한도·비용 프로파일·전송 전환).
+
+### 전달 파일
+- 패치 1개 — 기준 `687e019`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

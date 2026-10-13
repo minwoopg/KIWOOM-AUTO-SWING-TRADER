@@ -26,6 +26,8 @@
 - **실행 모드(M0)**: `use_mock: true` = MOCK_LOCAL(가짜 브로커), `use_mock: false` = KIWOOM_PAPER(mockapi 주소·paper 플래그일 때만).
   실전 주소·실전 플래그는 기동 거부. 데이터 폴더는 한 모드·계좌 라벨에만 씀(`data/execution_mode.json`).
   M1 1주 수동 주문 실측·원장 정정: [`docs/mock_order_m0_m1.md`](docs/mock_order_m0_m1.md).
+  지정가 매수·09:30 미체결 취소·실제 체결가 근거(M3 A2, 전략 미연결): [`docs/m3_a2_limit_cancel.md`](docs/m3_a2_limit_cancel.md)
+  — 오늘 체결가 확인 `python tools/paper_order.py confirm-fills [--confirm]`.
 - **관리 창**: `scripts\run_dashboard.bat`(Tkinter 데스크톱, 추가 설치 없음) — 읽기 전용 + 신규 매수 중단 요청. [`docs/dashboard.md`](docs/dashboard.md).
 
 ## 프로젝트 구조

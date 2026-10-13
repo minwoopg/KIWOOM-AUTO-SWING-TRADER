@@ -1,0 +1,53 @@
+{
+ "api_id": "ka10076",
+ "path": "/api/dostk/acnt",
+ "status": 200,
+ "body": {
+  "cntr": [
+   {
+    "ord_no": "0112348",
+    "stk_nm": "삼성전자",
+    "io_tp_nm": "-매도",
+    "ord_pric": "0",
+    "ord_qty": "1",
+    "cntr_pric": "229000",
+    "cntr_qty": "1",
+    "oso_qty": "0",
+    "tdy_trde_cmsn": "800",
+    "tdy_trde_tax": "457",
+    "ord_stt": "체결",
+    "trde_tp": "시장가",
+    "orig_ord_no": "0000000",
+    "ord_tm": "120759",
+    "stk_cd": "005930",
+    "stex_tp": "1",
+    "stex_tp_txt": "KRX",
+    "sor_yn": "N",
+    "stop_pric": "0"
+   },
+   {
+    "ord_no": "0112293",
+    "stk_nm": "삼성전자",
+    "io_tp_nm": "+매수",
+    "ord_pric": "0",
+    "ord_qty": "1",
+    "cntr_pric": "229000",
+    "cntr_qty": "1",
+    "oso_qty": "0",
+    "tdy_trde_cmsn": "800",
+    "tdy_trde_tax": "0",
+    "ord_stt": "체결",
+    "trde_tp": "시장가",
+    "orig_ord_no": "0000000",
+    "ord_tm": "120747",
+    "stk_cd": "005930",
+    "stex_tp": "1",
+    "stex_tp_txt": "KRX",
+    "sor_yn": "N",
+    "stop_pric": "0"
+   }
+  ],
+  "return_code": 0,
+  "return_msg": " 조회가 완료되었습니다."
+ }
+}

@@ -1,0 +1,11 @@
+{
+ "api_id": "kt10000",
+ "path": "/api/dostk/ordr",
+ "status": 200,
+ "body": {
+  "ord_no": "0148913",
+  "dmst_stex_tp": "KRX",
+  "return_code": 0,
+  "return_msg": "모의투자 매수주문완료"
+ }
+}

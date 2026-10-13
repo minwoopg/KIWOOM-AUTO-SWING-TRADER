@@ -125,6 +125,9 @@ class SessionSettings:
     close_reconcile_until: str = "15:45"
     watch_symbols: tuple = ()
     update_daily_bars_after_close: bool = False
+    # M3 A2: 지정가 진입 마감(HH:MM). 이후 신규 지정가 매수 거부 + 이 실행이 낸 미체결 지정가 매수 취소.
+    # ""면 끔. 시장가 주문·재시작 전 주문은 건드리지 않음.
+    entry_cancel_at: str = "09:30"
 
 
 @dataclass(frozen=True)

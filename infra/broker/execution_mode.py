@@ -145,8 +145,18 @@ class PaperKiwoomBroker(KiwoomBroker):
         self._assert_paper()
         return super().place_order(order)
 
+    def get_fill_detail(self, order_id: str, symbol: str):
+        """주문 하나의 실제 체결가·수수료·세금 (M3 A2, read-only — ka10076 한 번).
+
+        전량 체결 행이 정확히 하나일 때만 `FillDetail`, 그 밖은 None(`infra/broker/fill_detail.py`).
+        조회 실패는 예외 그대로 — 호출부(FillRecorder)가 추정가로 기록하고 나중에 다시 확인합니다.
+        """
+        from infra.broker.fill_detail import extract_fill_detail
+        return extract_fill_detail(order_id, symbol, self._fetch_fill_history_raw(symbol))
+
     def cancel_order(self, orig_order_id: str, symbol: str, quantity: int) -> "CancelResult":
-        """주식 취소주문 kt10003 (M3 A1 — **응답 형식 미실측**, 첫 실측은 `paper_order.py limit-cancel`).
+        """주식 취소주문 kt10003 (M3 A1). 2026-10-13 실측 응답: `{"ord_no":"0148928",
+        "base_orig_ord_no":"0148913","cncl_qty":"000000000001","return_code":0,"return_msg":"모의투자 취소주문완료"}`.
 
         cncl_qty는 남은 수량을 명시(키움 문서상 '0'=잔량 전부 취소지만 그 의미에 기대지 않음).
         응답이 취소 완료의 증거는 아님 — 원주문의 실제 잔량·체결은 ka10075/ka10076·잔고로 따로 확인.

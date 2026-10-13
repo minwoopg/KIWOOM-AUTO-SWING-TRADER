@@ -12,7 +12,7 @@ import json
 import shutil
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -318,6 +318,58 @@ check("19) ack-limit-cancel(근거 필수)로 사람 확인을 기록한 뒤에�
 check("18) KRX 호가 단위: 경계(1,999→1 / 2,000→5 / 19,990→10 / 50,000→100 / 200,000→500 / 500,000→1,000), 내림은 원가 이하",
       [krx_tick(x) for x in (1999, 2000, 19990, 50000, 200000, 500000)] == [1, 5, 10, 100, 500, 1000]
       and floor_to_tick(206_100) == 206_000 and floor_to_tick(199_999) == 199_900 and floor_to_tick(50_049) == 50_000)
+
+# 20. confirm-fills — 오늘 원장 체결의 실제 체결가·수수료·세금 (ka10076만, 원장은 그대로)
+from domain.position.fill_event import FillEvent  # noqa: E402
+from infra.storage.fill_evidence import FillEvidenceStore, evidence_path  # noqa: E402
+
+FX_CNTR = json.loads(Path("tests/fixtures/m1_20261013/after_cancel_ka10076.json").read_text(encoding="utf-8"))["body"]["cntr"]
+
+
+class CF(Sim):
+    def __init__(self):
+        super().__init__()
+        self.q = []
+
+    def _fetch_fill_history_raw(self, sym):
+        self.q.append(("ka10076", sym))
+        return list(FX_CNTR)
+
+    def _fetch_open_orders_raw(self, sym):
+        self.q.append(("ka10075", sym))
+        return []
+
+
+s20 = env("confirm")
+D13 = datetime(2026, 10, 13, 15, 0)
+led20 = FillLedgerStore(s20.storage.fill_ledger_file)
+for ev in (FillEvent("acct|20261013|BUY|005930|0112293|1", "BUY", "005930", 1, 229_000, "BROKER_AVG", D13.date(),
+                     datetime(2026, 10, 13, 12, 7, 50), order_id="0112293"),
+           FillEvent("acct|20261013|SELL|005930|0112348|1", "SELL", "005930", 1, 228_750, "ORDER_ESTIMATE", D13.date(),
+                     datetime(2026, 10, 13, 12, 8, 1), order_id="0112348"),
+           FillEvent("acct|20261013|BUY|000660|0100001|1", "BUY", "000660", 1, 180_000, "ORDER_ESTIMATE", D13.date(),
+                     datetime(2026, 10, 13, 13, 0), order_id="0100001"),
+           FillEvent("acct|20261012|BUY|005930|0112293|1", "BUY", "005930", 1, 220_000, "ORDER_ESTIMATE",
+                     date(2026, 10, 12), datetime(2026, 10, 12, 10, 0), order_id="0112293")):
+    led20.append(ev)
+ledger_before = Path(s20.storage.fill_ledger_file).read_bytes()
+b20 = CF()
+rc20p, out20p, _ = run(s20, ["confirm-fills"], b20, D13)
+ev_path = evidence_path(s20.storage.fill_ledger_file)
+preview_wrote = ev_path.exists()
+b20c = CF()
+rc20c, out20c, _ = run(s20, ["confirm-fills", "--confirm"], b20c, D13)
+recs = FillEvidenceStore(ev_path).load()
+b20d = CF()
+rc20d, out20d, _ = run(s20, ["confirm-fills", "--confirm"], b20d, D13)
+check("20) confirm-fills: 오늘 원장 체결만(전날 같은 주문번호는 제외 — 주문번호는 날마다 다시 씀), 종목당 ka10076 한 번, "
+      "미리보기는 아무것도 안 씀, --confirm이면 매도 228,750→229,000·세금 457 근거 추가, 행 없는 주문은 '근거 없음'(종료 1), "
+      "원장 바이트 그대로, 다시 돌리면 남은 것만 조회",
+      rc20p == 0 and not preview_wrote and "→ 체결 229,000 (+250)" in out20p
+      and ("ka10076", "005930") in b20.q and all(api == "ka10076" for api, _ in b20.q)
+      and rc20c == 1 and sorted((r.side, r.price, r.tax) for r in recs) == [("BUY", 229_000, 0), ("SELL", 229_000, 457)]
+      and "[근거 없음] BUY 000660" in out20c and Path(s20.storage.fill_ledger_file).read_bytes() == ledger_before
+      and b20d.q == [("ka10076", "000660")] and len(FillEvidenceStore(ev_path).load()) == 2)
 
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)

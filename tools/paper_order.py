@@ -4,6 +4,8 @@
     python tools/paper_order.py check-orders                      # 오늘 M1 주문들의 주문·체결 조회(읽기 전용)
     python tools/paper_order.py limit-cancel 005930 --command-id m1-lc-1013 --execute   # 지정가·취소 경로 실측
     python tools/paper_order.py check-orders --order 0112293:005930 --order 0112348:005930
+    python tools/paper_order.py confirm-fills                     # 오늘 원장 체결의 실제 체결가·수수료·세금 미리보기
+    python tools/paper_order.py confirm-fills --confirm           # 체결 근거 기록(data/fill_evidence.jsonl)에 추가
     python tools/paper_order.py buy-one 005930 --command-id m1-buy-1014            # 미리보기(네트워크 없음)
     python tools/paper_order.py buy-one 005930 --command-id m1-buy-1014 --execute  # 실제 모의 주문
     python tools/paper_order.py sell-held 005930 --command-id m1-sell-1014 --execute
@@ -89,6 +91,8 @@ def main(argv=None, *, settings=None, broker=None, clock=None, sleep=None, logge
     co = sub.add_parser("check-orders", help="주문번호별 미체결(ka10075)·체결(ka10076) 조회 — 읽기 전용, 원문 저장")
     co.add_argument("--order", action="append", default=[], help="주문번호:종목코드 (여러 번). 없으면 기록의 그날 주문")
     co.add_argument("--date", help="기록에서 고를 날짜 YYYY-MM-DD(기본 오늘)")
+    cf = sub.add_parser("confirm-fills", help="오늘 원장 체결의 실제 체결가·수수료·세금(ka10076) — 기본 미리보기")
+    cf.add_argument("--confirm", action="store_true", help="체결 근거 기록에 추가(원장은 바꾸지 않음)")
     ak = sub.add_parser("ack-limit-cancel", help="확인되지 않은 limit-cancel을 사람이 HTS로 확인했다고 기록")
     ak.add_argument("command_id")
     ak.add_argument("--note", required=True)
@@ -137,6 +141,21 @@ def main(argv=None, *, settings=None, broker=None, clock=None, sleep=None, logge
                                    "note": a.note.strip(), "at": clock().isoformat(timespec="seconds")})
         print(f"[확인 기록] {a.command_id} — 원장·상태는 바꾸지 않음(체결이 있었다면 ledger_review.py correct)")
         return 0
+
+    if a.cmd == "confirm-fills":
+        if broker is None and mode != KIWOOM_PAPER:
+            print(f"[중단] 실행 모드 {mode} — 체결 조회는 키움 모의투자(KIWOOM_PAPER)에서만")
+            return 2
+        if not a.confirm:
+            return _confirm_fills(a, settings, broker=broker, clock=clock, sleep=sleep)
+        try:
+            with order_path_locks(settings):
+                return _confirm_fills(a, settings, broker=broker, clock=clock, sleep=sleep)
+        except RuntimeError as exc:
+            if "중복 실행 차단" in str(exc):
+                print(f"[중단] 실행기·정정 도구가 돌고 있음(잠금) — 끝난 뒤 다시: {exc}")
+                return 2
+            raise
 
     if a.cmd == "check-orders":
         if broker is None and mode != KIWOOM_PAPER:
@@ -484,6 +503,80 @@ def _check_orders(a, settings, *, broker, clock, sleep) -> int:
         except Exception as exc:         # noqa: BLE001
             print(f"  [경고] 원문 저장 실패: {type(exc).__name__}: {exc}")
     return 0 if ok and all(r["status"] in ("FILLED",) for r in out) else 1
+
+
+def _confirm_fills(a, settings, *, broker, clock, sleep) -> int:
+    """오늘 원장 체결(BUY/SELL, 주문번호 있음) 중 체결 근거가 없는 것의 실제 체결가·수수료·세금.
+
+    ka10076(체결요청)만, 종목마다 한 번(1.2초 간격). 원장은 바꾸지 않음. `--confirm`이면 근거 기록에 추가
+    (같은 내용은 한 번만, 다른 내용은 충돌로 거부). ka10076은 당일 체결 조회로만 실측 — 오늘 사건만 다룸."""
+    from domain.service.fill_evidence import record_for_event
+    from infra.broker.fill_detail import extract_fill_detail
+    from infra.storage.fill_evidence import (
+        FillEvidenceConflictError, FillEvidenceCorruptError, FillEvidenceStore, evidence_path,
+    )
+    today = clock().date()
+    try:
+        events = FillLedgerStore(settings.storage.fill_ledger_file).load()
+        store = FillEvidenceStore(evidence_path(settings.storage.fill_ledger_file), read_only=not a.confirm)
+        have = {r.event_id for r in store.load()}
+    except (FillLedgerCorruptError, FillEvidenceCorruptError) as exc:
+        print(f"[중단] 원장·근거 기록 읽기 실패: {exc}")
+        return 2
+    todo = [e for e in events if e.kind in ("BUY", "SELL") and e.order_id and e.trade_date == today
+            and e.event_id not in have]
+    if not todo:
+        print(f"[체결 확인] {today} 확인할 원장 체결 없음(근거 기록 {len(have)}건)")
+        return 0
+    recording = broker is None
+    if recording:
+        from infra.broker.response_recorder import RecordingPaperKiwoomBroker
+        broker = RecordingPaperKiwoomBroker(settings.broker)
+    pause = sleep or _time.sleep
+    broker.authenticate()
+    now = clock()
+    found, missing, failed = [], [], False
+    for i, sym in enumerate(sorted({e.symbol for e in todo})):
+        if i:
+            pause(1.2)
+        try:
+            cntr = broker._fetch_fill_history_raw(sym)
+        except Exception as exc:         # noqa: BLE001
+            print(f"[조회 실패] {sym}: {type(exc).__name__}: {exc}")
+            failed = True
+            continue
+        for e in (x for x in todo if x.symbol == sym):
+            rec = record_for_event(e, extract_fill_detail(e.order_id, sym, cntr), origin="CONFIRM_TOOL", now=now)
+            if rec is None:
+                missing.append(e)
+                print(f"[근거 없음] {e.kind} {sym} 주문 {e.order_id} {e.quantity}주 — 전량 체결 행 1개가 아님"
+                      f"(부분 체결·여러 행·조회 범위 밖) · 원장 {e.price:,}({e.price_source}) 유지")
+                continue
+            found.append(rec)
+            diff = rec.price - e.price
+            print(f"[체결 확인] {e.kind} {sym} 주문 {e.order_id} {e.quantity}주 · 원장 {e.price:,}({e.price_source}) → "
+                  f"체결 {rec.price:,}" + (f" ({diff:+,})" if diff else "") +
+                  f" · 수수료 {rec.commission if rec.commission is not None else '?'} · 세금 "
+                  f"{rec.tax if rec.tax is not None else '?'}")
+    if recording and getattr(broker, "recorded", None):
+        folder = Path(settings.storage.state_file).resolve().parent / "m1_fixtures" / f"confirm-{now:%Y%m%d_%H%M%S}"
+        try:
+            broker.save_fixtures(folder)
+            print(f"  응답 원문(비밀값 제거): {folder}")
+        except Exception as exc:         # noqa: BLE001
+            print(f"  [경고] 원문 저장 실패: {type(exc).__name__}: {exc}")
+    if not a.confirm:
+        print(f"[미리보기] 근거 {len(found)}건 · 없음 {len(missing)}건 — 기록하려면 --confirm (원장은 바꾸지 않음)")
+        return 0 if not failed else 1
+    added = 0
+    for rec in found:
+        try:
+            added += 1 if store.append(rec) else 0
+        except FillEvidenceConflictError as exc:
+            print(f"[충돌] {exc} — 덮어쓰지 않음, 사람 확인")
+            failed = True
+    print(f"[기록] 체결 근거 {added}건 추가: {store.path}")
+    return 0 if not failed and not missing else 1
 
 
 def _price(broker, sym: str, log) -> int:
