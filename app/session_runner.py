@@ -287,6 +287,7 @@ class SessionRunner:
             return None
         blocked = set(report.blocking_symbols)
         blocked |= {s for s, m in self.state.positions.items() if m.needs_review}
+        blocked |= self.executor.recovery_blocked_symbols()      # M0 커밋 2: ERROR·orphan 이중 차단
         self._unreconciled = report.blocking_symbols
         in_flight = self._in_flight_symbols()
         ctx = TickContext(
@@ -319,7 +320,8 @@ class SessionRunner:
         decision = check_intent(intent, config=self.guard, now=ctx.now, phase=ctx.phase, balance=ctx.balance,
                                 positions=ctx.positions, prices=prices, blocked_symbols=ctx.blocked_symbols,
                                 unreconciled_symbols=self._unreconciled, pending_buy_reserve=reserve,
-                                unknown_pending_orders=unknown_pending)
+                                unknown_pending_orders=unknown_pending,
+                                recovery_symbols=self.executor.recovery_blocked_symbols())
         if not decision.allowed:
             self.summary.intents_denied += 1
             self.summary.denied_codes[decision.code] = self.summary.denied_codes.get(decision.code, 0) + 1

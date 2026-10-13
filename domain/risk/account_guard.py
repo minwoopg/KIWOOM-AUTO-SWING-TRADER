@@ -9,6 +9,8 @@ from __future__ import annotations
 |---|---|---|
 | 신규 주문 가능 시간대 | 적용 | 적용 (단, forced 매도는 장중 전체 허용) |
 | 장부 불일치·검토 필요 종목 | 차단 | 차단 (사람 확인 전 자동 매매 금지) |
+| 복구 필요 종목(ERROR·orphan, M0 커밋 2) | 차단 | 차단 — forced 매도도 (주문 실행부 게이트와 이중) |
+| 계좌 어디든 복구 필요 종목이 있으면 (M0 커밋 2) | 전 종목 차단 | — |
 | 계좌 어디든 장부 불일치가 있으면 (8-B) | 전 종목 차단 | — (불일치 없는 종목 매도는 허용) |
 | 1회 주문 금액 상한 | 적용 | — |
 | 최대 보유 종목 수 | 신규 종목이면 적용 | — |
@@ -85,6 +87,7 @@ def check_intent(
     unreconciled_symbols: frozenset[str] | set[str] = frozenset(),
     pending_buy_reserve: int = 0,
     unknown_pending_orders: bool = False,
+    recovery_symbols: frozenset[str] | set[str] = frozenset(),
 ) -> GuardDecision:
     """주문 의도 하나를 한도에 비춰 허용/차단.
 
@@ -95,6 +98,7 @@ def check_intent(
     pending_buy_reserve: 아직 체결되지 않은 매수 주문의 예상 금액 합계.
     unknown_pending_orders: 금액을 알 수 없는 미해결 주문(재시작 전 주문 등)이 있음 —
       예약금을 계산할 수 없으므로 신규 매수 보류.
+    recovery_symbols: 주문 실행부가 ERROR·orphan으로 둔 종목. 그 종목은 매수·매도(강제 포함) 모두, 계좌의 신규 매수는 전부 보류.
     """
     if phase not in (MarketPhase.REGULAR,):
         if not (intent.forced and phase == MarketPhase.CLOSING_AUCTION):
@@ -104,6 +108,8 @@ def check_intent(
     if not in_window and not (intent.side == "SELL" and intent.forced):
         return _deny("OUTSIDE_ORDER_WINDOW",
                      f"{t.strftime('%H:%M')} (허용 {config.new_orders_start:%H:%M}~{config.new_orders_end:%H:%M})")
+    if intent.symbol in recovery_symbols:
+        return _deny("RECOVERY_REQUIRED", "ERROR·orphan 종목 — 복구 명령(ack_error/ack_orphan) 전 매수·매도(강제 포함) 금지")
     if intent.symbol in blocked_symbols or intent.symbol in unreconciled_symbols:
         return _deny("SYMBOL_BLOCKED", "장부 불일치 또는 검토 필요 종목 — 사람 확인 전 자동 매매 금지")
 
@@ -119,6 +125,9 @@ def check_intent(
         return GuardDecision(True)
 
     # ── BUY ──
+    if recovery_symbols:
+        return _deny("ACCOUNT_RECOVERY_REQUIRED",
+                     f"복구 필요 종목 {sorted(recovery_symbols)} — 계좌 상태를 확정할 수 없어 신규 매수 보류")
     if unreconciled_symbols:
         return _deny("ACCOUNT_RECONCILE_BLOCKED",
                      f"장부 불일치 종목 {sorted(unreconciled_symbols)} — 계좌 노출을 확정할 수 없어 신규 매수 보류")

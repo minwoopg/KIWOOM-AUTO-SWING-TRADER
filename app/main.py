@@ -40,7 +40,7 @@ from infra.broker.execution_mode import (
 from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.market_data.quote_source import KiwoomQuoteSource
 from infra.storage.logger import build_app_logger
-from infra.storage.process_lock import single_instance_lock
+from infra.storage.execution_guard import DataModeMismatchError, commit_data_mode, decide_data_mode, order_path_locks
 from infra.storage.run_baseline import perform_run_baseline_startup
 from domain.position.position_book import ReconcileReport, reconcile
 from domain.service.lot_ledger import LotMatchError, apply_events
@@ -112,6 +112,7 @@ class StartupReport:
     journal_error: str = ""
     ledger_error: str = ""
     reconcile: ReconcileReport | None = None
+    data_mode_action: str = ""          # M0 커밋 2: CREATE / SAME / SWITCH (execution_mode.json)
 
     @property
     def has_unresolved_orders(self) -> bool:
@@ -188,6 +189,16 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
         if strict:
             raise StartupBlockedError(f"{report.mode} — 체결 원장 손상으로 시작하지 않습니다.") from exc
         return report
+    # M0 커밋 2: 데이터 폴더의 실행 모드 표식 — 다른 모드·계좌 라벨의 원장·미해결 주문과 섞지 않음
+    if exec_mode:
+        try:
+            report.data_mode_action = decide_data_mode(
+                settings, exec_mode, ledger_empty=not ledger_store.load(), unresolved=report.has_unresolved_orders)
+        except DataModeMismatchError as exc:
+            app_logger.critical(f"[STARTUP_BLOCK] 데이터 폴더 실행 모드 불일치: {exc}")
+            raise StartupBlockedError(str(exc)) from exc
+        if report.data_mode_action == "SWITCH":
+            app_logger.warning(f"[STARTUP] 데이터 폴더 실행 모드 전환 → {exec_mode} (원장 비어 있음·미해결 주문 없음)")
     for torn in ledger_store.torn_tail_paths:
         app_logger.critical(f"[STARTUP_LEDGER] 끊긴 마지막 줄 격리: {torn} — 잔고와 대조 필요")
     if report.balance is not None and state is not None:
@@ -206,7 +217,8 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
 async def async_main(check_only: bool = False):
     load_dotenv()
     settings = load_settings()
-    with single_instance_lock(Path(settings.storage.state_file).with_suffix(".lock")):
+    # M0 커밋 2: 상태 파일 잠금 + 계좌 라벨 잠금(M1 수동 주문 도구·원장 정정 도구와 동시 실행 차단)
+    with order_path_locks(settings):
         return await _run_application(settings, check_only=check_only)
 
 
@@ -255,6 +267,8 @@ async def _run_application(settings: Settings, check_only: bool = False):
     if check_only:
         app_logger.info("[STARTUP] 기반 점검 완료 — --check-only로 종료합니다.")
         return
+    if report.data_mode_action:
+        commit_data_mode(settings, report.execution_mode, report.data_mode_action)
     summary = run_session(settings, broker, app_logger)
     print("-" * 50)
     for line in summary.lines():

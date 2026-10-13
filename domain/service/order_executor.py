@@ -218,6 +218,15 @@ class OrderExecutor:
             or state.orphan_order_id
         )
 
+    def recovery_blocked_symbols(self) -> frozenset[str]:
+        """사람 확인이 필요한 종목(ERROR·orphan) — 계좌 안전 한도에서도 한 번 더 막기 위해 (M0 커밋 2).
+
+        주문 실행부 자체의 ERROR 게이트와 별개로 쓰는 읽기 전용 조회입니다(단타 원본에 없는 추가 메서드, 동작 무변경)."""
+        return frozenset(
+            sym for sym, st in self._position_state_machine._states.items()
+            if st.lifecycle == PositionLifecycle.ERROR or st.orphan_order_id
+        )
+
     def last_order_attempt(self, symbol: str) -> OrderResult | None:
         return self._last_order_attempt_by_symbol.get(symbol)
 

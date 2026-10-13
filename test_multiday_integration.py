@@ -311,9 +311,10 @@ check("D3-4) 재시작: 미해결 주문 ERROR 복원 + 새 recovery_id 발급",
       "[STARTUP_ORDER_RECOVERY] 005930" in crit3 and "[RECOVERY_REQUIRED] 005930 | ERROR" in crit3)
 check("D3-5) 재시작 후 사람 확인 전 재매도·매수 전송 0회 (중복 주문 없음)",
       len(BROKER.place_calls) == calls_before_restart)
-check("D3-5b) 차단 경로: 재매도는 주문 실행부 ERROR 게이트, 매수는 금액 모르는 미해결 주문으로 보류",
-      any("SELL 미접수 | BLOCK_SELL_ERROR_STATE" in m for m in logs(lg3, "warning"))
-      and s3.denied_codes.get("PENDING_AMOUNT_UNKNOWN") == 1)
+check("D3-5b) 차단 경로(M0 커밋 2 이중 차단): ERROR 종목의 재매도·매수 모두 계좌 안전 한도가 먼저 RECOVERY_REQUIRED로 막음 "
+      "— 주문 실행부까지 가지 않음(실행부 ERROR 게이트는 그대로 뒤에 있음)",
+      s3.denied_codes.get("RECOVERY_REQUIRED") == 2
+      and not any("SELL 미접수 | BLOCK_SELL_ERROR_STATE" in m for m in logs(lg3, "warning")))
 check("D3-6) 복구 명령 확보 1회 실패(CRITICAL) → 30초 뒤 재확보 성공 → 1회 적용",
       crit3.count("명령 확보 실패") == 1 and any("명령 확보 재시도 성공" in m for m in logs(lg3, "warning"))
       and len(list((CMDS / "processed").glob("ack_error_005930.*.json"))) == 1)
