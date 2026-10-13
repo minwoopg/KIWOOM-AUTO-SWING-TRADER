@@ -1797,4 +1797,41 @@ UNKNOWN 1), ② 진단 `--as-of`에 시간대가 붙으면 비교 오류·신호
 ### 전달 파일
 - 패치 0003 — 0001·0002 위
 
+## 2026-10-13 — M0 커밋 1~3: 실행 모드·모의 전용 브로커, 복구 이중 차단·원장 최소 정정, M1 1주 수동 주문 도구 (GPT 지시서 `88686b9`)
+
+### 배경
+GPT 지시서(main `88686b9` 검토): 모의 주문 연결로 진행, 데이터 검증과 주문 경로 검증을 분리. 먼저 커밋 1~3(모의 환경·계좌 gate,
+복구·원장 최소 정정, 1주 수동 주문 실측 도구)으로 M1을 시작할 수 있게. 추가 결함: `diag --out`이 DB 하드링크면 원본 DB를 자름(P1).
+사용자 PC 설정 확인: `use_mock: true` — 지금까지 주문 실행기는 가짜 브로커로만 돌았음.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `diag_w2.py` | `--out` 새 파일만(`open(..., 'x')`) — 기존 파일·하드링크 거부(2) |
+| `infra/broker/execution_mode.py` (신규) | MOCK_LOCAL / KIWOOM_PAPER 판정, 실전·다른 주소 거부, 계좌 식별, `PaperKiwoomBroker`(요청마다 주소 검사·리다이렉트 금지·주문 직전 재검사) |
+| `app/main.py` | `build_broker` 모드별, KIWOOM_PAPER 엄격 기동, 주문 경로 잠금, 데이터 모드 표식, `build_session_runner` 분리 |
+| `app/session_runner.py` | 요약·상태 파일에 실행 모드·계좌 라벨, ERROR·orphan을 차단 목록·안전 한도에, `run_probe`(M1 한 번 전송·대조) |
+| `domain/risk/account_guard.py` | `RECOVERY_REQUIRED`(그 종목 매수·매도·강제 매도), `ACCOUNT_RECOVERY_REQUIRED`(계좌 신규 매수) |
+| `domain/service/order_executor.py` | `recovery_blocked_symbols()` 읽기 전용 조회 추가(동작 무변경, 동등성 18/18) |
+| `infra/storage/execution_guard.py` (신규) | 주문 경로 잠금(상태 파일 + 계좌 라벨), `execution_mode.json` 표식 |
+| `infra/storage/ledger_review.py`, `tools/ledger_review.py` (신규) | 원장 검토·최소 정정(근거 있는 빠진 체결 추가만, 미리보기 기본, append-only 기록) |
+| `infra/broker/response_recorder.py`, `tools/paper_order.py` (신규) | M1: buy-one·sell-held·status, 1주 시장가, 명령 ID 한 번, 응답 원문 비밀값 제거 저장 |
+| `docs/mock_order_m0_m1.md` (신규), README | 사용법·규칙 |
+
+### 테스트 및 검증
+- 새 시험: 실행 모드 8, 복구·잠금·표식·정정 8, M1 도구 13, 진단 9번(하드링크). 이전 코드에서: 진단 9 실패(연구 DB가 잘려 `no such table`),
+  M1·정정·모드 시험은 해당 모듈 없음. `test_multiday_integration` D3-5b는 차단 경로가 안전 한도 `RECOVERY_REQUIRED`로 바뀐 것을 반영(기대값 변경).
+- 변이 확인: 리다이렉트 금지·주문 직전 검사·엄격 기동·복구 차단 2곳·모드 표식 전환 조건·명령 ID 중복·미해결 흔적 REFUSED를 하나씩 끄면 해당 시험 실패.
+- 회귀 37/37(`test_broker_order_status.py` 제외 — 실측 fixture 없음, 통과로 세지 않음), OrderExecutor 동등성 18/18.
+- **미실측**: 키움 모의 서버 주문·체결·주문조회 응답 전부(M1에서 처음). 리다이렉트·모의 계좌 식별은 가짜 응답으로만 시험.
+
+### 변경하지 않은 것
+- 전략(`NullStrategy`), S1·게이트·관리자(W2), 단타 원본 경로 코드 동작, 일봉 수집 시각(커밋 4에서).
+
+### 다음 작업
+- 커밋 4 일봉 정책·원천 실측(시장 기준 라벨·잠정 finality·20:30 / 08:40), 5 읽기 전용 후보 adapter + S1Strategy 그림자, 6 전송 전환·운영 제어.
+
+### 전달 파일
+- 패치 0001~0006 — 기준 `88686b9`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

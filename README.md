@@ -23,6 +23,9 @@
 
   `app/main.py`가 상시 실행으로 바뀐 것은 아닙니다. 연구 수집 `tools/research_collect.py`도 실행할 때만 도는 별도 프로세스입니다.
 - **시장가 주문만 사용** (취소 주문 API 미구현)
+- **실행 모드(M0)**: `use_mock: true` = MOCK_LOCAL(가짜 브로커), `use_mock: false` = KIWOOM_PAPER(mockapi 주소·paper 플래그일 때만).
+  실전 주소·실전 플래그는 기동 거부. 데이터 폴더는 한 모드·계좌 라벨에만 씀(`data/execution_mode.json`).
+  M1 1주 수동 주문 실측·원장 정정: [`docs/mock_order_m0_m1.md`](docs/mock_order_m0_m1.md).
 
 ## 프로젝트 구조
 
