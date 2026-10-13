@@ -249,6 +249,76 @@ check("15) check-orders: 그날 기록의 주문번호를 종목당 ka10075·ka1
       and FillLedgerStore(s15.storage.fill_ledger_file).load() == []
       and rc15b == 1 and "0099999 005930 UNKNOWN" in out15b)
 
+# 16. limit-cancel — 지정가(호가 단위 내림) → 미체결 → 취소 → 확인
+from domain.market_data.tick_size import floor_to_tick, krx_tick  # noqa: E402
+from infra.broker.execution_mode import CancelResult  # noqa: E402
+
+
+class LC(Sim):
+    def __init__(self, cancel_ok=True, fill=False):
+        super().__init__()
+        self.fill = fill
+        self.cancel_ok = cancel_ok
+        self.orders = []
+        self.cancels = []
+        self.live = set()
+
+    def get_market_price(self, symbol):
+        from domain.models import MarketPrice
+        return MarketPrice(symbol, 229_000, 229_000, 229_000, datetime.now())
+
+    def place_order(self, order):
+        self.orders.append((order.symbol, order.side.value, order.quantity, order.order_type, order.price))
+        res = super().place_order(order)
+        if res.accepted and not self.fill:
+            self.live.add(res.order_id)
+        return res
+
+    def cancel_order(self, oid, sym, qty):
+        self.cancels.append((oid, sym, qty))
+        if self.cancel_ok:
+            self.live.discard(oid)
+            return CancelResult(True, False, "9000001", "모의투자 취소주문완료", {})
+        return CancelResult(False, True, "", "timeout", {})
+
+    def _fetch_open_orders_raw(self, sym):
+        return [{"ord_no": o, "stk_cd": sym, "ord_stt": "접수", "ord_qty": "1", "oso_qty": "1", "cntr_qty": "0",
+                 "io_tp_nm": "+매수", "trde_tp": "보통"} for o in sorted(self.live)]
+
+    def _fetch_fill_history_raw(self, sym):
+        return []
+
+
+s16 = env("lc")
+b16 = LC()
+rc16, out16, _ = run(s16, ["limit-cancel", "005930", "--command-id", "m1-lc", "--execute"], b16, T)
+r16 = reg(s16)
+check("16) limit-cancel: 지정가 = (현재가 229,000 × 0.9) 호가 단위 내림 206,000 · 1주 'limit' 주문 1회 → 미체결(OPEN) 확인 → "
+      "취소 1회(남은 1주) → 미체결 없음·잔고 0 → CANCEL_CONFIRMED, 기록 STARTED·PLACED·CANCEL·FINISHED, 원장 기록 없음",
+      rc16 == 0 and b16.orders == [("005930", "BUY", 1, "limit", 206_000)] and len(b16.cancels) == 1
+      and b16.cancels[0][1:] == ("005930", 1) and [r["event"] for r in r16] == ["STARTED", "PLACED", "CANCEL", "FINISHED"]
+      and r16[-1]["status"] == "CANCEL_CONFIRMED" and r16[-1]["before"]["status"] == "OPEN"
+      and FillLedgerStore(s16.storage.fill_ledger_file).load() == [])
+s17 = env("lc_amb")
+b17 = LC(cancel_ok=False)
+rc17, out17, _ = run(s17, ["limit-cancel", "005930", "--command-id", "m1-lc2", "--execute"], b17, T)
+rc17b, out17b, _ = run(s17, ["limit-cancel", "005930", "--command-id", "m1-lc3", "--execute"], b17, T + timedelta(minutes=5))
+s18 = env("lc_fill")
+b18 = LC(fill=True)
+rc18, out18, _ = run(s18, ["limit-cancel", "005930", "--command-id", "m1-lc4", "--execute"], b18, T)
+check("17) 취소 응답 불명 → CANCEL_UNCONFIRMED(재전송 없음·취소 1회), 그 계좌 다음 limit-cancel은 기동 점검·기록에서 거부 — "
+      "체결이 생기면 UNEXPECTED_FILL로 원장 정정 안내",
+      rc17 == 1 and reg(s17)[-1]["status"] == "CANCEL_UNCONFIRMED" and len(b17.cancels) == 1
+      and rc17b == 2 and "확인되지 않은" in out17b and len(b17.orders) == 1
+      and rc18 == 1 and reg(s18)[-1]["status"] == "UNEXPECTED_FILL" and "원장 정정" in out18)
+rc19, out19, _ = run(s17, ["ack-limit-cancel", "m1-lc2", "--note", "HTS: 취소 확인"], b17, T + timedelta(minutes=6))
+rc19b, out19b, _ = run(s17, ["limit-cancel", "005930", "--command-id", "m1-lc5", "--execute"], b17, T + timedelta(minutes=7))
+check("19) ack-limit-cancel(근거 필수)로 사람 확인을 기록한 뒤에만 다음 limit-cancel 실행",
+      rc19 == 0 and rc19b == 1 and len(b17.orders) == 2 and reg(s17)[-1]["command_id"] == "m1-lc5")
+check("18) KRX 호가 단위: 경계(1,999→1 / 2,000→5 / 19,990→10 / 50,000→100 / 200,000→500 / 500,000→1,000), 내림은 원가 이하",
+      [krx_tick(x) for x in (1999, 2000, 19990, 50000, 200000, 500000)] == [1, 5, 10, 100, 500, 1000]
+      and floor_to_tick(206_100) == 206_000 and floor_to_tick(199_999) == 199_900 and floor_to_tick(50_049) == 50_000)
+
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)
 print(f"\n총 {len(results)}건 중 통과 {passed}건, 실패 {len(results) - passed}건")

@@ -162,6 +162,34 @@ check("8) 세션 요약 줄·상태 파일에 실행 모드와 계좌 라벨(계
       sm.lines()[0] == "실행 모드 KIWOOM_PAPER | 계좌 라벨 acct-swing"
       and d["execution_mode"] == "KIWOOM_PAPER" and d["account_scope"] == "acct-swing" and "12345678" not in str(d))
 
+# 9. 취소 주문 kt10003 (응답 형식 미실측 — 요청 모양과 실패 분류만)
+sent9 = []
+
+
+def fake9(self, method, url, *a, **kw):
+    sent9.append({"url": url, "json": kw.get("json"), "api": (kw.get("headers") or {}).get("api-id")})
+    r = requests.Response()
+    r.status_code = 200 if len(sent9) == 1 else 500
+    r._content = (b'{"return_code": 0, "ord_no": "0000009", "return_msg": "ok"}' if len(sent9) == 1 else b'{"x":1}')
+    r.url = url
+    return r
+
+
+requests.Session.request = fake9
+try:
+    br9 = build_broker(paper())
+    br9.access_token = "t"
+    c1 = br9.cancel_order("0112293", "005930", 1)
+    c2 = br9.cancel_order("0112293", "005930", 1)
+finally:
+    requests.Session.request = _orig
+check("9) 취소: kt10003 · /api/dostk/ordr · {KRX, 원주문번호, 종목, 남은 수량 명시} — 200·return_code 0이면 접수(완료 아님), "
+      "HTTP 오류는 응답 불명",
+      sent9[0]["api"] == "kt10003" and sent9[0]["url"].endswith("/api/dostk/ordr")
+      and sent9[0]["json"] == {"dmst_stex_tp": "KRX", "orig_ord_no": "0112293", "stk_cd": "005930", "cncl_qty": "1"}
+      and c1.accepted and not c1.is_ambiguous and c1.cancel_order_id == "0000009"
+      and not c2.accepted and c2.is_ambiguous)
+
 import shutil  # noqa: E402
 
 shutil.rmtree(TMP, ignore_errors=True)

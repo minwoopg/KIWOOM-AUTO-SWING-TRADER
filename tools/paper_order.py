@@ -2,6 +2,7 @@
 
     python tools/paper_order.py status
     python tools/paper_order.py check-orders                      # 오늘 M1 주문들의 주문·체결 조회(읽기 전용)
+    python tools/paper_order.py limit-cancel 005930 --command-id m1-lc-1013 --execute   # 지정가·취소 경로 실측
     python tools/paper_order.py check-orders --order 0112293:005930 --order 0112348:005930
     python tools/paper_order.py buy-one 005930 --command-id m1-buy-1014            # 미리보기(네트워크 없음)
     python tools/paper_order.py buy-one 005930 --command-id m1-buy-1014 --execute  # 실제 모의 주문
@@ -88,13 +89,19 @@ def main(argv=None, *, settings=None, broker=None, clock=None, sleep=None, logge
     co = sub.add_parser("check-orders", help="주문번호별 미체결(ka10075)·체결(ka10076) 조회 — 읽기 전용, 원문 저장")
     co.add_argument("--order", action="append", default=[], help="주문번호:종목코드 (여러 번). 없으면 기록의 그날 주문")
     co.add_argument("--date", help="기록에서 고를 날짜 YYYY-MM-DD(기본 오늘)")
-    for name in ("buy-one", "sell-held"):
+    ak = sub.add_parser("ack-limit-cancel", help="확인되지 않은 limit-cancel을 사람이 HTS로 확인했다고 기록")
+    ak.add_argument("command_id")
+    ak.add_argument("--note", required=True)
+    for name in ("buy-one", "sell-held", "limit-cancel"):
         p = sub.add_parser(name)
         p.add_argument("symbol")
         p.add_argument("--command-id", required=True)
         p.add_argument("--execute", action="store_true", help="실제 모의 주문(없으면 미리보기 — 네트워크 없음)")
         p.add_argument("--max-wait", type=float, default=180.0, help="체결·종료 확인 최대 대기(초)")
         p.add_argument("--poll", type=float, default=3.0, help="확인 간격(초, 2 이상)")
+        if name == "limit-cancel":
+            p.add_argument("--discount", type=float, default=10.0,
+                           help="현재가보다 몇 %% 낮은 지정가(체결되지 않게, 5~20)")
     a = ap.parse_args(argv)
 
     if settings is None:
@@ -118,6 +125,19 @@ def main(argv=None, *, settings=None, broker=None, clock=None, sleep=None, logge
                   f"{r.get('status', '')} {r.get('order_id', '') or ''}")
         return 0
 
+    if a.cmd == "ack-limit-cancel":
+        reg = load_registry(settings)
+        if a.command_id not in unresolved_limit_cancels(reg):
+            print(f"[거부] {a.command_id}는 확인 대기 limit-cancel이 아님")
+            return 2
+        if not a.note.strip():
+            print("[사용법 오류] --note 확인 근거")
+            return 2
+        append_registry(settings, {"command_id": a.command_id, "kind": "limit-cancel", "event": "ACK",
+                                   "note": a.note.strip(), "at": clock().isoformat(timespec="seconds")})
+        print(f"[확인 기록] {a.command_id} — 원장·상태는 바꾸지 않음(체결이 있었다면 ledger_review.py correct)")
+        return 0
+
     if a.cmd == "check-orders":
         if broker is None and mode != KIWOOM_PAPER:
             print(f"[중단] 실행 모드 {mode} — 주문 조회는 키움 모의투자(KIWOOM_PAPER)에서만")
@@ -133,11 +153,24 @@ def main(argv=None, *, settings=None, broker=None, clock=None, sleep=None, logge
     if a.poll < 2:
         print("[사용법 오류] --poll은 2초 이상(호출 빈도)")
         return 2
-    side = "BUY" if a.cmd == "buy-one" else "SELL"
+    side = "SELL" if a.cmd == "sell-held" else "BUY"
     sym = a.symbol.strip()
     if not re.fullmatch(r"\d{6}", sym):
         print("[사용법 오류] 종목코드 6자리")
         return 2
+    if a.cmd == "limit-cancel":
+        if not 5 <= a.discount <= 20:
+            print("[사용법 오류] --discount 5~20")
+            return 2
+        try:
+            with order_path_locks(settings):
+                return _limit_cancel(a, settings, mode, scope, sym, broker=broker, clock=clock, sleep=sleep,
+                                     logger=logger)
+        except RuntimeError as exc:
+            if "중복 실행 차단" in str(exc):
+                print(f"[중단] 실행기·정정 도구가 돌고 있음(잠금) — 끝난 뒤 다시: {exc}")
+                return 2
+            raise
 
     try:
         with order_path_locks(settings):
@@ -223,6 +256,168 @@ def _run(a, settings, mode, scope, side, sym, *, broker, clock, sleep, logger) -
     if result.get("status") == "UNRESOLVED":
         print("  주문 종료를 확인하지 못함 — 재전송하지 않음. HTS에서 체결 확인 → 다음 기동의 복구 안내(ack_error)·원장 정정 도구")
     return 0 if result.get("status") == "FILLED" else 1
+
+
+def _limit_cancel(a, settings, mode, scope, sym, *, broker, clock, sleep, logger) -> int:
+    """지정가 1주(체결되지 않을 가격) → 미체결 확인 → 취소(kt10003) → 원주문 상태·잔고 재확인. 원문 저장.
+
+    주문 실행부를 거치지 않는 **경로 실측 전용**: 원장·포지션 상태에 기록하지 않음(체결이 없어야 정상).
+    단 명령 기록에 STARTED → PLACED(주문번호) → CANCEL(결과) → FINISHED를 남기고, 끝나지 않은 limit-cancel 기록이 있으면
+    다음 실행을 거부(원주문이 살아 있을 수 있음). 체결이 생기면 UNEXPECTED_FILL — HTS 확인 후 원장 정정·sell-held.
+    """
+    from domain.market_data.tick_size import floor_to_tick
+    from domain.models import OrderRequest, OrderSide
+    from utils.trading_calendar import MarketPhase, TradingCalendar
+    reg = load_registry(settings)
+    if any(r.get("command_id") == a.command_id for r in reg):
+        print(f"[거부] 명령 ID {a.command_id}는 이미 기록됨 — 새 ID로")
+        return 2
+    open_lc = unresolved_limit_cancels(reg)
+    if open_lc:
+        print(f"[거부] 확인되지 않은 limit-cancel {sorted(open_lc)} — 원주문이 살아 있거나 체결됐을 수 있음. "
+              f"HTS 확인 후 `ack-limit-cancel <명령 ID> --note \"확인 근거\"`")
+        return 2
+    try:
+        positions = apply_events(FillLedgerStore(settings.storage.fill_ledger_file).load()).positions()
+    except (FillLedgerCorruptError, LotMatchError) as exc:
+        print(f"[중단] 원장을 신뢰할 수 없음: {exc}")
+        return 2
+    if positions:
+        print(f"[거부] 원장 보유 {sorted(positions)} — 취소 실측은 보유 없는 계좌에서만")
+        return 2
+    now = clock()
+    cal = TradingCalendar.load()
+    from app.main import build_guard_config
+    g = build_guard_config(settings.guard)
+    if cal.phase(now) != MarketPhase.REGULAR or not (g.new_orders_start <= now.time() < g.new_orders_end):
+        print(f"[거부] 정규장 신규 주문 시간({g.new_orders_start:%H:%M}~{g.new_orders_end:%H:%M})에만")
+        return 2
+    print(f"[M1 취소 실측] {'실행' if a.execute else '미리보기'} · 모드 {mode} · {sym} 지정가 매수 1주(현재가 −{a.discount:g}%) → 취소 · "
+          f"명령 {a.command_id}")
+    if not a.execute:
+        print("  --execute 없이 네트워크·주문 없음")
+        return 0
+
+    pause = sleep or _time.sleep
+    base = {"command_id": a.command_id, "kind": "limit-cancel", "side": "BUY", "symbol": sym, "quantity": PROBE_QTY,
+            "execution_mode": mode, "account_scope": scope}
+
+    def rec(event, **kw):
+        append_registry(settings, {**base, "event": event, "at": clock().isoformat(timespec="seconds"), **kw})
+
+    rec("STARTED")
+    from app.main import StartupBlockedError, run_startup_checks
+    log = logger or _logger(settings)
+    recording = broker is None
+    if recording:
+        from infra.broker.response_recorder import RecordingPaperKiwoomBroker
+        broker = RecordingPaperKiwoomBroker(settings.broker)
+    result: dict = {}
+    try:
+        rep_ = asyncio.run(run_startup_checks(settings, broker, log))
+        if rep_.has_unresolved_orders or rep_.ledger_error or rep_.reconcile is None or not rep_.reconcile.ok \
+                or (rep_.balance and rep_.balance.positions):
+            result = {"status": "REFUSED", "reason": "미해결 주문·원장 오류·장부 불일치 또는 계좌 보유 있음"}
+            return _finish_lc(rec, result, broker, settings, a, recording)
+        price = _price(broker, sym, log)
+        limit = floor_to_tick(price * (1 - a.discount / 100))
+        if limit * PROBE_QTY > g.max_order_amount or rep_.balance.cash - limit < g.min_cash_buffer:
+            result = {"status": "REFUSED", "reason": f"금액 한도·현금 버퍼({limit:,}원)"}
+            return _finish_lc(rec, result, broker, settings, a, recording)
+        pause(1.5)
+        res = broker.place_order(OrderRequest(symbol=sym, side=OrderSide.BUY, quantity=PROBE_QTY,
+                                              order_type="limit", price=limit))
+        rec("PLACED", order_id=res.order_id, accepted=res.accepted, ambiguous=res.is_ambiguous,
+            message=res.message, limit_price=limit, reference_price=price)
+        print(f"  지정가 {limit:,}원(현재가 {price:,}) 주문 → 접수 {res.accepted} · 주문번호 {res.order_id or '-'} · {res.message}")
+        if not res.accepted or not res.order_id:
+            result = {"status": "NOT_ACCEPTED", "ambiguous": res.is_ambiguous, "reason": res.message,
+                      "limit_price": limit}
+            return _finish_lc(rec, result, broker, settings, a, recording)
+        oid = res.order_id
+        pause(2.0)
+        before = _order_snapshot(broker, oid, sym, pause)
+        print(f"  취소 전 조회: {before['status']} · 미체결행 {before['oso']} · 체결행 {before['cntr']}")
+        pause(1.5)
+        cres = broker.cancel_order(oid, sym, PROBE_QTY)
+        rec("CANCEL", order_id=oid, cancel_accepted=cres.accepted, cancel_ambiguous=cres.is_ambiguous,
+            cancel_order_id=cres.cancel_order_id, message=cres.message)
+        print(f"  취소 요청 → 접수 {cres.accepted} · 취소 주문번호 {cres.cancel_order_id or '-'} · {cres.message}")
+        after = None
+        for _ in range(3):
+            pause(max(a.poll, 2.0))
+            after = _order_snapshot(broker, oid, sym, pause)
+            if after["oso"] == 0:
+                break
+        pause(1.5)
+        bal = broker.get_account_balance()
+        held = {p.symbol: p.quantity for p in bal.positions if p.quantity > 0}
+        print(f"  취소 뒤 조회: {after['status']} · 미체결행 {after['oso']} · 체결행 {after['cntr']} · 잔고 {held.get(sym, 0)}주")
+        status = ("UNEXPECTED_FILL" if held.get(sym, 0) > 0 else
+                  "CANCEL_CONFIRMED" if cres.accepted and after["oso"] == 0 else "CANCEL_UNCONFIRMED")
+        result = {"status": status, "order_id": oid, "limit_price": limit, "reference_price": price,
+                  "cancel_order_id": cres.cancel_order_id, "before": before, "after": after,
+                  "balance_qty": held.get(sym, 0)}
+    except StartupBlockedError as exc:
+        result = {"status": "REFUSED", "reason": str(exc)}
+    except Exception as exc:              # noqa: BLE001
+        result = {"status": "ERROR", "reason": f"{type(exc).__name__}: {exc}"}
+        _finish_lc(rec, result, broker, settings, a, recording)
+        raise
+    return _finish_lc(rec, result, broker, settings, a, recording)
+
+
+SAFE_LC_END = {"CANCEL_CONFIRMED", "REFUSED"}
+
+
+def unresolved_limit_cancels(reg: list[dict]) -> set[str]:
+    """끝나지 않았거나(FINISHED 없음) 취소 확정이 아닌 limit-cancel 명령 — 사람이 ack하기 전까지 다음 실행 거부."""
+    lc = [r for r in reg if r.get("kind") == "limit-cancel"]
+    ids = {r["command_id"] for r in lc}
+    acked = {r["command_id"] for r in lc if r.get("event") == "ACK"}
+    out = set()
+    for cid in ids - acked:
+        fin = [r for r in lc if r["command_id"] == cid and r.get("event") == "FINISHED"]
+        if not fin:
+            out.add(cid)
+            continue
+        f = fin[-1]
+        safe = f.get("status") in SAFE_LC_END or (f.get("status") == "NOT_ACCEPTED" and not f.get("ambiguous"))
+        if not safe:
+            out.add(cid)
+    return out
+
+
+def _order_snapshot(broker, oid: str, sym: str, pause) -> dict:
+    from infra.broker.kiwoom_order_status import build_order_status_evidence
+    oso = broker._fetch_open_orders_raw(sym)
+    pause(1.2)
+    cntr = broker._fetch_fill_history_raw(sym)
+    ev = build_order_status_evidence(oid, sym, oso, cntr)
+    return {"status": ev.broker_order.status.value, "oso": len(ev.matched_oso_entries),
+            "cntr": len(ev.matched_cntr_entries), "oso_rows": ev.matched_oso_entries,
+            "cntr_rows": ev.matched_cntr_entries}
+
+
+def _finish_lc(rec, result, broker, settings, a, recording) -> int:
+    slim = {k: v for k, v in result.items() if k not in ("before", "after")}
+    for k in ("before", "after"):
+        if result.get(k):
+            slim[k] = {kk: result[k][kk] for kk in ("status", "oso", "cntr")}
+    rec("FINISHED", **slim)
+    saved = _save(broker, settings, a.command_id, recording)
+    if recording and saved:
+        from infra.broker.response_recorder import redact
+        (saved[0].parent / "result.json").write_text(
+            json.dumps(redact(result, broker.secrets()), ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        print(f"  응답 원문(비밀값 제거) {len(saved)}개 + result.json: {saved[0].parent}")
+    st = result.get("status")
+    print(f"[M1 취소 실측] 결과 {st} · {result.get('reason', '') or ''}")
+    if st == "UNEXPECTED_FILL":
+        print("  체결이 생김 — 원장에 없는 보유. HTS 확인 → 원장 정정(ledger_review.py correct, 근거·주문번호) → sell-held")
+    elif st in ("CANCEL_UNCONFIRMED", "ERROR") or result.get("ambiguous"):
+        print("  취소·주문 상태를 확인하지 못함 — 재전송하지 않음. HTS에서 주문 확인 후 결과를 보내주세요")
+    return 0 if st == "CANCEL_CONFIRMED" else 1
 
 
 def _check_orders(a, settings, *, broker, clock, sleep) -> int:

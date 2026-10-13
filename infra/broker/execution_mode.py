@@ -21,6 +21,7 @@ from __future__ import annotations
 (계좌번호 자체로 모의/실전을 구분하는 규칙은 확인하지 못해 쓰지 않음).
 """
 
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import requests
@@ -94,6 +95,15 @@ def mode_label(mode: str) -> str:
     return MODE_LABELS.get(mode, mode)
 
 
+@dataclass(frozen=True)
+class CancelResult:
+    accepted: bool            # 취소 요청이 접수됨(취소 완료 아님)
+    is_ambiguous: bool        # 접수 여부 모름 — 원주문 상태를 조회로 확인
+    cancel_order_id: str
+    message: str
+    body: dict
+
+
 class PaperOnlySession(requests.Session):
     """요청마다 주소 검사 + 리다이렉트 금지."""
 
@@ -134,6 +144,30 @@ class PaperKiwoomBroker(KiwoomBroker):
     def place_order(self, order):
         self._assert_paper()
         return super().place_order(order)
+
+    def cancel_order(self, orig_order_id: str, symbol: str, quantity: int) -> "CancelResult":
+        """주식 취소주문 kt10003 (M3 A1 — **응답 형식 미실측**, 첫 실측은 `paper_order.py limit-cancel`).
+
+        cncl_qty는 남은 수량을 명시(키움 문서상 '0'=잔량 전부 취소지만 그 의미에 기대지 않음).
+        응답이 취소 완료의 증거는 아님 — 원주문의 실제 잔량·체결은 ka10075/ka10076·잔고로 따로 확인.
+        HTTP 오류·응답 없음·형식 이상은 is_ambiguous=True(취소됐는지 모름) — 다시 보내지 않음.
+        """
+        from infra.broker.kiwoom_broker import KiwoomHttpError, KiwoomTransportError
+        self._assert_paper()
+        if not str(orig_order_id).strip() or type(quantity) is not int or quantity <= 0:
+            raise ValueError("cancel_order: 원주문번호·양의 정수 수량 필요")
+        payload = {"dmst_stex_tp": "KRX", "orig_ord_no": str(orig_order_id).strip(), "stk_cd": symbol,
+                   "cncl_qty": str(quantity)}
+        try:
+            resp = self._post(endpoint="/api/dostk/ordr", api_id="kt10003", payload=payload,
+                              cont_yn="N", next_key="", raise_on_business_error=False)
+        except (KiwoomHttpError, KiwoomTransportError) as exc:
+            return CancelResult(False, True, "", str(exc), {})
+        body = resp.body if isinstance(resp.body, dict) else {}
+        if type(body.get("return_code")) is not int:
+            return CancelResult(False, True, "", "Malformed cancel response", body)
+        return CancelResult(body["return_code"] == 0, False, str(body.get("ord_no", "") or ""),
+                            str(body.get("return_msg", "")), body)
 
 
 def build_execution_broker(settings):
