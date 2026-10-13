@@ -213,6 +213,42 @@ check("14) 시험 직전 잔고 조회가 429면 간격을 두고 다시 조회(
       and rc14b == 1 and b14b.place_calls == [] and reg(s14b)[-1]["status"] == "REFUSED"
       and "429" in reg(s14b)[-1]["reason"] and "3회" in reg(s14b)[-1]["reason"])
 
+# 15. check-orders — 읽기 전용 주문·체결 조회
+class Q(Sim):
+    def __init__(self):
+        super().__init__()
+        self.q = []
+
+    def _fetch_open_orders_raw(self, sym):
+        self.q.append(("ka10075", sym))
+        return []
+
+    def _fetch_fill_history_raw(self, sym):
+        self.q.append(("ka10076", sym))
+        return [{"ord_no": "0112293", "stk_cd": "005930", "io_tp_nm": "+매수", "ord_stt": "체결", "ord_qty": "1",
+                 "cntr_qty": "1", "oso_qty": "0", "cntr_pric": "229000", "trde_tp": "시장가"},
+                {"ord_no": "0112348", "stk_cd": "005930", "io_tp_nm": "-매도", "ord_stt": "체결", "ord_qty": "1",
+                 "cntr_qty": "1", "oso_qty": "0", "cntr_pric": "229000", "trde_tp": "시장가"}]
+
+
+s15 = env("check")
+PO.append_registry(s15, {"command_id": "a", "event": "FINISHED", "order_id": "0112293", "symbol": "005930",
+                         "at": "2026-10-14T10:00:05"})
+PO.append_registry(s15, {"command_id": "b", "event": "FINISHED", "order_id": "0112348", "symbol": "005930",
+                         "at": "2026-10-14T10:01:05"})
+before15 = (Path(s15.storage.state_file).parent / "paper_orders.jsonl").read_bytes()
+b15 = Q()
+rc15, out15, _ = run(s15, ["check-orders"], b15, T)
+b15b = Q()
+rc15b, out15b, _ = run(s15, ["check-orders", "--order", "0099999:005930"], b15b, T)
+check("15) check-orders: 그날 기록의 주문번호를 종목당 ka10075·ka10076 한 번씩 조회 → 주문번호별 FILLED·체결가, "
+      "주문·원장·기록 변경 없음, 없는 주문번호는 다른 주문에 붙이지 않음(UNKNOWN, 종료 1)",
+      rc15 == 0 and b15.q == [("ka10075", "005930"), ("ka10076", "005930")] and b15.place_calls == []
+      and "0112293 005930 FILLED BUY 요청 1 체결 1 @ 229000" in out15 and "0112348 005930 FILLED SELL" in out15
+      and (Path(s15.storage.state_file).parent / "paper_orders.jsonl").read_bytes() == before15
+      and FillLedgerStore(s15.storage.fill_ledger_file).load() == []
+      and rc15b == 1 and "0099999 005930 UNKNOWN" in out15b)
+
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)
 print(f"\n총 {len(results)}건 중 통과 {passed}건, 실패 {len(results) - passed}건")

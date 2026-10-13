@@ -1,6 +1,8 @@
 """M1 주문 경로 실측 — 키움 모의투자 계좌 1주 수동 주문 (M0 커밋 3, GPT 지시서 2026-10-13).
 
     python tools/paper_order.py status
+    python tools/paper_order.py check-orders                      # 오늘 M1 주문들의 주문·체결 조회(읽기 전용)
+    python tools/paper_order.py check-orders --order 0112293:005930 --order 0112348:005930
     python tools/paper_order.py buy-one 005930 --command-id m1-buy-1014            # 미리보기(네트워크 없음)
     python tools/paper_order.py buy-one 005930 --command-id m1-buy-1014 --execute  # 실제 모의 주문
     python tools/paper_order.py sell-held 005930 --command-id m1-sell-1014 --execute
@@ -83,6 +85,9 @@ def main(argv=None, *, settings=None, broker=None, clock=None, sleep=None, logge
     ap = argparse.ArgumentParser(description="M1: 키움 모의투자 1주 수동 주문 경로 실측")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
+    co = sub.add_parser("check-orders", help="주문번호별 미체결(ka10075)·체결(ka10076) 조회 — 읽기 전용, 원문 저장")
+    co.add_argument("--order", action="append", default=[], help="주문번호:종목코드 (여러 번). 없으면 기록의 그날 주문")
+    co.add_argument("--date", help="기록에서 고를 날짜 YYYY-MM-DD(기본 오늘)")
     for name in ("buy-one", "sell-held"):
         p = sub.add_parser(name)
         p.add_argument("symbol")
@@ -112,6 +117,12 @@ def main(argv=None, *, settings=None, broker=None, clock=None, sleep=None, logge
             print(f"  [{r.get('at')}] {r.get('command_id')} {r.get('event')} {r.get('side', '')} {r.get('symbol', '')} "
                   f"{r.get('status', '')} {r.get('order_id', '') or ''}")
         return 0
+
+    if a.cmd == "check-orders":
+        if broker is None and mode != KIWOOM_PAPER:
+            print(f"[중단] 실행 모드 {mode} — 주문 조회는 키움 모의투자(KIWOOM_PAPER)에서만")
+            return 2
+        return _check_orders(a, settings, broker=broker, clock=clock, sleep=sleep)
 
     if broker is None and mode != KIWOOM_PAPER:
         print(f"[중단] 실행 모드 {mode} — M1은 키움 모의투자(KIWOOM_PAPER)에서만. settings.yaml `use_mock: false`(mockapi 주소) 확인")
@@ -212,6 +223,72 @@ def _run(a, settings, mode, scope, side, sym, *, broker, clock, sleep, logger) -
     if result.get("status") == "UNRESOLVED":
         print("  주문 종료를 확인하지 못함 — 재전송하지 않음. HTS에서 체결 확인 → 다음 기동의 복구 안내(ack_error)·원장 정정 도구")
     return 0 if result.get("status") == "FILLED" else 1
+
+
+def _check_orders(a, settings, *, broker, clock, sleep) -> int:
+    """주문번호별 주문·체결 조회(읽기 전용). 원장·상태·명령 기록을 바꾸지 않음. 종목마다 ka10075·ka10076 한 번씩."""
+    from infra.broker.kiwoom_order_status import build_order_status_evidence, normalize_order_id
+    targets: list[tuple[str, str]] = []
+    for item in a.order:
+        oid, _, sym = item.partition(":")
+        if not oid.strip() or not re.fullmatch(r"\d{6}", sym.strip()):
+            print(f"[사용법 오류] --order 주문번호:종목코드 — {item!r}")
+            return 2
+        targets.append((oid.strip(), sym.strip()))
+    if not targets:
+        day = a.date or clock().date().isoformat()
+        for r in load_registry(settings):
+            if r.get("event") == "FINISHED" and r.get("order_id") and str(r.get("at", "")).startswith(day):
+                targets.append((str(r["order_id"]), str(r["symbol"])))
+    if not targets:
+        print("[조회] 대상 주문 없음 — --order 주문번호:종목코드로 지정")
+        return 2
+    recording = broker is None
+    if recording:
+        from infra.broker.response_recorder import RecordingPaperKiwoomBroker
+        broker = RecordingPaperKiwoomBroker(settings.broker)
+    pause = sleep or _time.sleep
+    broker.authenticate()
+    out, ok = [], True
+    symbols = sorted({s for _, s in targets})
+    for i, sym in enumerate(symbols):
+        if i:
+            pause(1.2)                   # 같은 TR 1초 1회(실측 유량=1)
+        try:
+            oso = broker._fetch_open_orders_raw(sym)
+            pause(1.2)
+            cntr = broker._fetch_fill_history_raw(sym)
+        except Exception as exc:         # noqa: BLE001
+            print(f"[조회 실패] {sym}: {type(exc).__name__}: {exc}")
+            ok = False
+            continue
+        for oid, s in targets:
+            if s != sym:
+                continue
+            ev = build_order_status_evidence(oid, sym, oso, cntr)
+            bo = ev.broker_order
+            rec = {"order_id": oid, "normalized": normalize_order_id(oid), "symbol": sym, "status": bo.status.value,
+                   "side": bo.side.value if bo.side else None, "requested": bo.requested_quantity,
+                   "open": bo.open_quantity, "filled": bo.filled_quantity, "filled_price": bo.filled_price,
+                   "order_type_raw": bo.order_type_raw, "matched_cntr": len(ev.matched_cntr_entries),
+                   "matched_oso": len(ev.matched_oso_entries), "evidence_error": ev.evidence_error,
+                   "cntr_rows": ev.matched_cntr_entries}
+            out.append(rec)
+            print(f"[조회] {oid} {sym} {rec['status']} {rec['side'] or '-'} 요청 {rec['requested']} 체결 {rec['filled']} "
+                  f"@ {rec['filled_price']} 미체결 {rec['open']} · 체결행 {rec['matched_cntr']}개 · 유형 {rec['order_type_raw']}")
+            if len(ev.matched_cntr_entries) > 1:
+                print(f"  여러 체결 행(분할 체결 가능) — 원문 확인: {ev.matched_cntr_entries}")
+    folder = Path(settings.storage.state_file).resolve().parent / "m1_fixtures" / f"check-{clock():%Y%m%d_%H%M%S}"
+    if recording and getattr(broker, "recorded", None):
+        try:
+            saved = broker.save_fixtures(folder)
+            from infra.broker.response_recorder import redact
+            (folder / "orders.json").write_text(json.dumps(redact(out, broker.secrets()), ensure_ascii=False, indent=2),
+                                               encoding="utf-8")
+            print(f"  응답 원문(비밀값 제거) {len(saved)}개 + orders.json: {folder}")
+        except Exception as exc:         # noqa: BLE001
+            print(f"  [경고] 원문 저장 실패: {type(exc).__name__}: {exc}")
+    return 0 if ok and all(r["status"] in ("FILLED",) for r in out) else 1
 
 
 def _price(broker, sym: str, log) -> int:
