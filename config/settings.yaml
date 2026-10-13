@@ -12,7 +12,7 @@ broker:
   provider: kiwoom
   # true  -> 가짜 MockBroker 사용
   # false -> 실제 Kiwoom REST API 사용
-  use_mock: true
+  use_mock: false
   # 키움 모의투자 REST 서버
   # 실전투자로 바꿀 때는 https://api.kiwoom.com 으로 변경합니다.
   base_url: https://mockapi.kiwoom.com
