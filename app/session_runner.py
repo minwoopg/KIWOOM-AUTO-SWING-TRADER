@@ -182,6 +182,7 @@ class SessionRunner:
         self._halted_reason = ""
         self._last_report: ReconcileReport | None = None
         self.last_balance: AccountBalance | None = None
+        self.last_balance_error = ""        # 마지막 잔고 조회 실패 사유 (M1 결과 표시용)
 
     # ── 진입점 ──────────────────────────────────────────────
 
@@ -250,14 +251,24 @@ class SessionRunner:
                 return [intent]
 
         self.strategy = _Once()
+        ctx = None
         try:
-            ctx = self._tick(allow_orders=True)
+            # 잔고 조회 실패(예: 직전 호출과 붙어 429)면 주문 의도가 만들어지기 전이라 다시 해도 중복 전송이 없음 —
+            # poll 간격(최소 2초)을 두고 최대 3번. 원장 오류(중단)면 다시 하지 않음.
+            for attempt in range(3):
+                if attempt and not self._sleep_seconds(max(poll_sec, 2.0)):
+                    break
+                ctx = self._tick(allow_orders=True)
+                if ctx is not None or sent or self._halted_reason:
+                    break
         finally:
             self.strategy = original
         s = self.summary
         base = {"denied": dict(s.denied_codes), "orders_sent": s.orders_sent, "halted": s.halted_reason}
         if ctx is None or not sent:
-            return {"status": "REFUSED", "reason": s.halted_reason or "잔고 조회·원장 확인 실패", **base}
+            why = s.halted_reason or (f"잔고 조회 실패 {s.balance_failures}회 — {self.last_balance_error}"
+                                      if self.last_balance_error else "잔고 조회·원장 확인 실패")
+            return {"status": "REFUSED", "reason": why, **base}
         if s.intents_denied:
             return {"status": "DENIED", "reason": ", ".join(s.denied_codes), **base}
         if not s.orders_accepted:
@@ -294,6 +305,7 @@ class SessionRunner:
         except Exception as exc:
             self._consecutive_balance_failures += 1
             self.summary.balance_failures += 1
+            self.last_balance_error = f"{type(exc).__name__}: {exc}"
             level = (self.log.critical if self._consecutive_balance_failures
                      >= self.cfg.max_consecutive_balance_failures_warn else self.log.warning)
             level(f"[SESSION] 잔고 조회 실패 {self._consecutive_balance_failures}회 연속 — 이번 폴링은 주문 없음: "

@@ -186,6 +186,33 @@ check("13) 응답 원문 저장: 토큰·앱키·계좌번호는 어디에 있�
       and "A005930" in blob and "rmnd_qty" in blob
       and redact({"x": "APPKEY123456"}, rb.secrets()) == {"x": "***"})
 
+# 14. 첫 잔고 조회 429 → 다시 조회(주문 의도 전이라 중복 없음) → 정상 체결
+class Flaky(Sim):
+    def __init__(self):
+        super().__init__()
+        self.balance_calls = 0
+        self.fail_on = {3}            # 기동 점검 1회 + 시세 뒤 첫 폴링 조회에서 429
+
+    def get_account_balance(self):
+        self.balance_calls += 1
+        if self.balance_calls in self.fail_on:
+            raise RuntimeError("kiwoom request failed: api_id=kt00001, http=429, body={'return_code': 5}")
+        return super().get_account_balance()
+
+
+s14 = env("flaky")
+b14 = Flaky()
+b14.fail_on = {2}
+rc14, out14, _ = run(s14, ["buy-one", "005930", "--command-id", "m1-flaky", "--execute"], b14, T)
+s14b = env("flaky_all")
+b14b = Flaky()
+b14b.fail_on = {2, 3, 4}
+rc14b, out14b, _ = run(s14b, ["buy-one", "005930", "--command-id", "m1-flaky2", "--execute"], b14b, T)
+check("14) 시험 직전 잔고 조회가 429면 간격을 두고 다시 조회(최대 3번) → 정상 체결·전송 1회, 계속 실패하면 REFUSED에 실제 오류(429) 표시·전송 0",
+      rc14 == 0 and b14.place_calls == [("005930", "BUY", 1)] and reg(s14)[-1]["status"] == "FILLED"
+      and rc14b == 1 and b14b.place_calls == [] and reg(s14b)[-1]["status"] == "REFUSED"
+      and "429" in reg(s14b)[-1]["reason"] and "3회" in reg(s14b)[-1]["reason"])
+
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)
 print(f"\n총 {len(results)}건 중 통과 {passed}건, 실패 {len(results) - passed}건")

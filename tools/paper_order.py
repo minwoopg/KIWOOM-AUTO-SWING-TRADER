@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import time as _time
 import asyncio
 import json
 import os
@@ -188,6 +189,7 @@ def _run(a, settings, mode, scope, side, sym, *, broker, clock, sleep, logger) -
             runner, executor = build_session_runner(settings, broker, log, clock=clock, sleep=sleep)
             try:
                 price = _price(broker, sym, log)
+                (sleep or _time.sleep)(1.5)      # 시세 조회 직후 잔고 조회가 붙지 않게(요청 간격)
                 result = runner.run_probe(OrderIntent(sym, side, PROBE_QTY, price, reason="M1 수동 주문 경로 실측",
                                                       context={"m1_command_id": a.command_id}),
                                           max_wait_sec=a.max_wait, poll_sec=a.poll)
