@@ -7,3 +7,6 @@
 *.png binary
 *.jpg binary
 *.xlsx binary
+
+# 대시보드 실행 배치 파일은 Windows cmd용 CRLF
+*.bat text eol=crlf

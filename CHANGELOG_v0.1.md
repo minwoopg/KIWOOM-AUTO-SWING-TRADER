@@ -1834,4 +1834,36 @@ GPT 지시서(main `88686b9` 검토): 모의 주문 연결로 진행, 데이터 
 ### 전달 파일
 - 패치 0001~0006 — 기준 `88686b9`
 
+## 2026-10-13 — M1 주문조회·지정가 취소 실측 도구, 신규 매수 중단 계약·실행기 상태 파일, 관리 창 (GPT 최소판 요청 `5c3cac8`)
+
+### 배경
+GPT 자동 모의매매 최소판 요청(main `5c3cac8`)과 사용자 관리 화면 요청(브라우저 대신 Python 데스크톱 창으로 결정). 최소판 본체(입력 승인·후보 연결·지정가 매수·취소 해소·E1)는
+주문조회·취소 응답 실측이 먼저 필요해 단계로 나눔. 이번 묶음은 실측 도구 2개와, 창의 '신규 매수 중단'이 실제로 동작하도록
+실행기 쪽 계약을 먼저 구현.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `tools/paper_order.py` | `check-orders`(주문번호별 ka10075·ka10076 읽기 전용 조회·원문 저장), `limit-cancel`(현재가 −10% 지정가 1주 → 미체결 확인 → 취소 → 재확인), `ack-limit-cancel` |
+| `infra/broker/execution_mode.py` | `PaperKiwoomBroker.cancel_order` kt10003(남은 수량 명시, 오류는 응답 불명) |
+| `domain/market_data/tick_size.py` (신규) | KRX 호가 단위·내림 |
+| `infra/storage/runner_status.py` (신규), `app/session_runner.py`, `app/main.py` | `data/runner_status.json`(heartbeat·모드·코드 버전·전략 연결·중단 반영·보유·추적 주문), `commands/halt_new_buys.json` 신규 매수 중단(BUY_HALTED, 매도 유지, 자동 재개 없음) |
+| `tools/buy_halt.py` (신규) | request·status·resume(--confirm) |
+| `dashboard/` (신규), `scripts/run_dashboard.bat`, `docs/dashboard.md` | Tkinter 관리 창(추가 설치 없음, 읽기 전용, 중단 요청만 씀). 자료 계층 `dashboard/data.py`, 검증용 임시 자료 `dashboard/sample_data.py` |
+
+### 테스트 및 검증
+- 새 시험: M1 도구 15~19, 실행 모드 9(취소 요청 모양), 신규 매수 중단 5, 관리 창 자료 16, 관리 창 동작 3(화면 없는 환경은 SKIP — 이 경우
+  통과로 세지 않음). 회귀 40/40(`test_broker_order_status.py` 제외 — 실측 fixture 없음, 통과로 세지 않음). 창은 Xvfb 화면에서 Python 3.12·
+  3.14rc2(Tk 8.6)로 정상·오래됨·자료 없음·각 탭 캡처, 반복 새로고침 뒤 자료 바이트 동일, 중단 요청 두 번 → 하나·요청됨 확인.
+- **미실측**: 키움 취소 응답·취소 뒤 주문조회 모양(limit-cancel이 첫 실측), Windows Python 3.14.4에서 관리 창 실행.
+
+### 변경하지 않은 것
+- 전략(NullStrategy), S1·관리자, 단타 원본 경로 코드 동작, 시장가 주문 경로.
+
+### 다음 작업
+- 실측 원문으로 A2(체결 근거 연결·지정가 주문 경로·취소 해소) → B(20:30/08:40 입력 승인·후보 연결·S1 그림자) → C(E1·손실 한도·비용 프로파일·전송 전환).
+
+### 전달 파일
+- 패치 — check-orders(1), limit-cancel(1), 이번 묶음(중단 계약·관리 창·문서)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->
