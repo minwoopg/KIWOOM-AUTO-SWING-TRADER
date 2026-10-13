@@ -34,8 +34,10 @@ from pathlib import Path
 
 from config.settings import Settings, load_settings
 from domain.models import AccountBalance
+from infra.broker.execution_mode import (
+    KIWOOM_PAPER, PaperKiwoomBroker, build_execution_broker, mode_label, resolve_execution_mode,
+)
 from infra.broker.kiwoom_broker import KiwoomBroker
-from infra.broker.mock_broker import MockBroker
 from infra.market_data.quote_source import KiwoomQuoteSource
 from infra.storage.logger import build_app_logger
 from infra.storage.process_lock import single_instance_lock
@@ -66,10 +68,9 @@ def load_dotenv(path: str = ".env") -> None:
 
 
 def build_broker(settings: Settings):
-    """단타 레포 app/main.py와 동일."""
-    if settings.broker.use_mock:
-        return MockBroker()
-    return KiwoomBroker(settings.broker)
+    """실행 모드별 브로커 (M0 커밋 1): MOCK_LOCAL → MockBroker, KIWOOM_PAPER → PaperKiwoomBroker,
+    실전·알 수 없는 주소 → ExecutionModeError(브로커를 만들지 않음). 단타 원본은 KiwoomBroker를 그대로 만들었음."""
+    return build_execution_broker(settings)
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -103,6 +104,7 @@ class StartupBlockedError(RuntimeError):
 @dataclass
 class StartupReport:
     mode: str
+    execution_mode: str = ""
     balance: AccountBalance | None = None
     balance_error: str = ""
     unresolved_intent_symbols: list[str] = field(default_factory=list)
@@ -119,7 +121,14 @@ class StartupReport:
 async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=asyncio.sleep) -> StartupReport:
     """인증 → 잔고 → 미해결 주문 흔적 확인. 주문은 절대 내지 않습니다."""
     is_live = not settings.broker.is_paper_trading
-    report = StartupReport(mode="실전투자" if is_live else "모의투자")
+    # M0 커밋 1: 키움 모의투자 서버 모드도 실전과 같은 엄격 기준(잔고·주문 기록·원장을 모르면 시작 안 함).
+    # 로컬 가짜 브로커(MOCK_LOCAL)만 예전처럼 경고 후 계속. 실전 조합은 build_broker에서 이미 거부됨.
+    exec_mode = resolve_execution_mode(settings.broker) if not is_live else ""
+    strict = is_live or exec_mode == KIWOOM_PAPER
+    if exec_mode == KIWOOM_PAPER and not isinstance(broker, PaperKiwoomBroker):
+        raise StartupBlockedError("KIWOOM_PAPER 설정인데 브로커가 모의투자 전용(PaperKiwoomBroker)이 아님")
+    report = StartupReport(mode="실전투자" if is_live else f"모의투자 · {mode_label(exec_mode)}",
+                           execution_mode=exec_mode)
 
     await retry_on_429(broker.authenticate, "인증", app_logger, sleep=sleep)
 
@@ -136,9 +145,9 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
     except Exception as exc:
         report.balance_error = f"{type(exc).__name__}: {exc}"
         app_logger.warning(f"[STARTUP] 잔고 조회 실패: {report.balance_error}")
-        if is_live:
-            app_logger.critical("[STARTUP_BLOCK] 실전투자 — 잔고 조회 실패로 시작하지 않습니다.")
-            raise StartupBlockedError("실전투자 시작 시 잔고 조회 실패") from exc
+        if strict:
+            app_logger.critical(f"[STARTUP_BLOCK] {report.mode} — 잔고 조회 실패로 시작하지 않습니다.")
+            raise StartupBlockedError(f"{report.mode} 시작 시 잔고 조회 실패") from exc
 
     # ── 이전 프로세스의 미해결 주문 흔적 (읽기 전용) ───────────
     # OrderExecutor.restore_order_recovery_blocks()가 보는 두 출처와 동일.
@@ -158,8 +167,8 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
 
     if report.journal_error:
         app_logger.critical(f"[STARTUP_ORDER_RECOVERY] 주문 기록 확인 실패: {report.journal_error}")
-        if is_live:
-            raise StartupBlockedError("실전투자 — 주문 기록을 확인할 수 없어 시작하지 않습니다.")
+        if strict:
+            raise StartupBlockedError(f"{report.mode} — 주문 기록을 확인할 수 없어 시작하지 않습니다.")
     elif report.has_unresolved_orders:
         app_logger.critical(
             f"[STARTUP_ORDER_RECOVERY] 이전 프로세스의 미해결 주문 흔적 | "
@@ -176,8 +185,8 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
     except (FillLedgerCorruptError, LotMatchError) as exc:
         report.ledger_error = f"{type(exc).__name__}: {exc}"
         app_logger.critical(f"[STARTUP_LEDGER] 체결 원장을 신뢰할 수 없음: {report.ledger_error}")
-        if is_live:
-            raise StartupBlockedError("실전투자 — 체결 원장 손상으로 시작하지 않습니다.") from exc
+        if strict:
+            raise StartupBlockedError(f"{report.mode} — 체결 원장 손상으로 시작하지 않습니다.") from exc
         return report
     for torn in ledger_store.torn_tail_paths:
         app_logger.critical(f"[STARTUP_LEDGER] 끊긴 마지막 줄 격리: {torn} — 잔고와 대조 필요")
@@ -324,6 +333,8 @@ def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=
     finally:
         executor.shutdown()
     summary.run_id = _uuid.uuid4().hex[:12]
+    summary.execution_mode = resolve_execution_mode(settings.broker)
+    summary.account_scope = settings.broker.account_scope_id.strip() or "unscoped"
     if summary.status != "CLOSED_DAY":
         missing = ""
         if summary.final_reconcile is None:

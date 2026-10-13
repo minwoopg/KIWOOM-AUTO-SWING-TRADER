@@ -83,6 +83,8 @@ class SessionSummary:
     final_reconcile_at: datetime | None = None
     daily_bars: str = "SKIPPED"          # SKIPPED / OK / FAILED: ...
     report: str = ""                     # OK / FAILED: ... (run_session이 채움)
+    execution_mode: str = ""             # M0 커밋 1: MOCK_LOCAL / KIWOOM_PAPER (run_session이 채움)
+    account_scope: str = ""              # 비민감 계좌 라벨(계좌번호 아님)
 
     def add_close_issue(self, issue: str) -> None:
         if issue not in self.close_issues:
@@ -99,6 +101,7 @@ class SessionSummary:
         iso = lambda v: v.isoformat(timespec="seconds") if v else None
         return {
             "run_id": self.run_id, "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "execution_mode": self.execution_mode, "account_scope": self.account_scope,
             "trade_date": self.trade_date.isoformat() if self.trade_date else None,
             "status": self.status, "close_check": self.close_check, "close_issues": list(self.close_issues),
             "final_balance_at": iso(self.final_balance_at), "final_reconcile_at": iso(self.final_reconcile_at),
@@ -111,7 +114,10 @@ class SessionSummary:
         }
 
     def lines(self) -> list[str]:
-        out = [
+        out = []
+        if self.execution_mode:
+            out.append(f"실행 모드 {self.execution_mode} | 계좌 라벨 {self.account_scope or '-'}")
+        out += [
             f"거래일 {self.trade_date} | 상태 {self.status} | 폴링 {self.ticks}회 (잔고 실패 {self.balance_failures})",
             f"주문 의도 {self.intents} (한도 차단 {self.intents_denied}) | 전송 {self.orders_sent} / 접수 {self.orders_accepted}"
             f" | 원장 기록 {self.fills_recorded}건",
