@@ -26,6 +26,7 @@ NEEDS_REVIEW입니다. 이전 폴링의 대조 결과를 최종 결과로 쓰지
 테스트를 위해 clock/sleep/should_stop을 주입할 수 있습니다.
 """
 
+import math
 import time as _time
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
@@ -413,6 +414,7 @@ class SessionRunner:
         blocked |= self.executor.recovery_blocked_symbols()      # M0 커밋 2: ERROR·orphan 이중 차단
         self._unreconciled = report.blocking_symbols
         in_flight = self._in_flight_symbols()
+        self._sync_entry_dates(ledger.positions())
         ctx = TickContext(
             now=now, phase=self.calendar.phase(now), trade_date=now.date(), balance=balance,
             positions=ledger.positions(), metas=dict(self.state.positions),
@@ -451,11 +453,51 @@ class SessionRunner:
                 self.log.warning(f"[SHADOW] 기록 실패: {type(exc).__name__}: {exc}")
 
     def _handle_intent(self, intent: OrderIntent, ctx: TickContext) -> None:
+        """의도 하나 처리 + 결과를 전략에 알림(C2 — 신호 키 상태 줄).
+
+        SHADOW / GUARD_REJECTED:<사유> / SUBMITTED / NOT_ACCEPTED[:<차단>] / UNKNOWN(응답 불명·예외)."""
         self.summary.intents += 1
         if not isinstance(intent, OrderIntent):
             self.log.critical(f"[SESSION] 전략이 OrderIntent가 아닌 값을 반환 — 무시: {intent!r}")
             self.summary.intents_denied += 1
             return
+        try:
+            status, detail = self._handle_intent_inner(intent, ctx)
+        except Exception as exc:
+            self._report_intent(intent, "UNKNOWN", f"{type(exc).__name__}: {exc}")
+            raise
+        self._report_intent(intent, status, detail)
+
+    def _report_intent(self, intent: OrderIntent, status: str, detail: str) -> None:
+        hook = getattr(self.strategy, "on_intent_result", None)
+        if hook is None:
+            return
+        try:
+            hook(intent, status, detail)
+        except Exception as exc:                          # noqa: BLE001 — 기록 실패가 실행을 멈추지 않음
+            self.log.warning(f"[SESSION] 전략 결과 통지 실패: {type(exc).__name__}: {exc}")
+
+    def _entry_meta(self, intent: OrderIntent) -> PositionMeta | None:
+        """전략 의도의 진입 정보 → 포지션 메타(C2). 손절 기준이 없으면 None(일반 전략 — 기존 동작)."""
+        c = intent.context or {}
+        stop_ref = c.get("stop_ref")
+        if stop_ref is None:
+            return None
+        try:
+            stop = int(math.floor(float(stop_ref)))
+        except (TypeError, ValueError):
+            return None
+        if stop <= 0:
+            return None
+        keep = ("signal_id", "signal_key", "signal_date", "contract_hash", "scan_run_id", "entry_cap", "stop_ref",
+                "strategy_mode", "pre_order_price", "pre_order_ask")
+        info = {k: c[k] for k in keep if k in c}
+        info.update({"limit_price": intent.limit_price, "order_type": intent.order_type, "entry_status": "SUBMITTING",
+                     "run_id": self.run_id})
+        return PositionMeta(intent.symbol, strategy_id=getattr(self.strategy, "strategy_id", ""), stop_price=stop,
+                            origin="ORDER", meta=info)
+
+    def _handle_intent_inner(self, intent: OrderIntent, ctx: TickContext) -> tuple[str, str]:
         if intent.side == "BUY" and self.buy_halt:
             # M3: 신규 매수 중단 — 매도·손절·미해결 주문 확인은 그대로
             self.summary.intents_denied += 1
@@ -463,7 +505,7 @@ class SessionRunner:
             self.log.info(f"[GUARD] {intent.symbol} BUY {intent.quantity}주 차단 | BUY_HALTED | "
                           f"요청 {self.buy_halt.get('request_id')}")
             self._shadow(intent, ctx, allowed=False, code="BUY_HALTED")
-            return
+            return "GUARD_REJECTED:BUY_HALTED", ""
         if (intent.side == "BUY" and self.cfg.max_buy_quantity is not None
                 and intent.quantity > self.cfg.max_buy_quantity):
             self.summary.intents_denied += 1
@@ -471,7 +513,7 @@ class SessionRunner:
             self.log.critical(f"[GUARD] {intent.symbol} BUY {intent.quantity}주 차단 | QTY_LIMIT | "
                               f"최소판 상한 {self.cfg.max_buy_quantity}주")
             self._shadow(intent, ctx, allowed=False, code="QTY_LIMIT")
-            return
+            return "GUARD_REJECTED:QTY_LIMIT", ""
         if (intent.side == "BUY" and intent.order_type == "limit" and self.cfg.entry_cancel_at is not None
                 and ctx.now.time() >= self.cfg.entry_cancel_at):
             self.summary.intents_denied += 1
@@ -479,7 +521,7 @@ class SessionRunner:
             self.log.info(f"[GUARD] {intent.symbol} 지정가 BUY 차단 | ENTRY_WINDOW_CLOSED | "
                           f"진입 마감 {self.cfg.entry_cancel_at:%H:%M}")
             self._shadow(intent, ctx, allowed=False, code="ENTRY_WINDOW_CLOSED")
-            return
+            return "GUARD_REJECTED:ENTRY_WINDOW_CLOSED", ""
         prices: dict[str, int] = {}
         reserve, unknown_pending = 0, False
         if intent.side == "BUY":
@@ -495,16 +537,23 @@ class SessionRunner:
             self.summary.denied_codes[decision.code] = self.summary.denied_codes.get(decision.code, 0) + 1
             self.log.info(f"[GUARD] {intent.symbol} {intent.side} {intent.quantity}주 차단 | {decision.code} | {decision.detail}")
             self._shadow(intent, ctx, allowed=False, code=decision.code, detail=decision.detail)
-            return
+            return f"GUARD_REJECTED:{decision.code}", decision.detail or ""
         if not self.send_orders:
             self._shadow(intent, ctx, allowed=True)
-            return
+            return "SHADOW", ""
         held = next((p for p in ctx.balance.positions if p.symbol == intent.symbol), None)
         base_qty = held.quantity if held else 0
         base_cost = held.quantity * held.average_price if held else 0
         context = {"entry_strategy": getattr(self.strategy, "strategy_id", ""), **intent.context}
+        new_meta = None
         if intent.side == "BUY":
             context.setdefault("entry_reason", intent.reason)
+            # C2: 진입 정보(신호·계약·손절가)를 전송 **전에** 메타로 — 실행기의 주문 의도 기록과 같은 저장에 실림.
+            #     전송 직후 꺼져도 재시작 때 손절가가 남아 있음. 기존 보유 메타는 덮지 않음(최대 보유 1이라 정상은 없음).
+            if intent.symbol not in self.state.positions:
+                new_meta = self._entry_meta(intent)
+                if new_meta is not None:
+                    self.state.upsert_position_meta(new_meta)
             if intent.order_type == "limit":
                 sub = self.executor.submit_buy(intent.symbol, intent.quantity, intent.reference_price,
                                                context=context, order_type="limit", limit_price=intent.limit_price)
@@ -518,9 +567,21 @@ class SessionRunner:
         if sub.sent:
             self.summary.orders_sent += 1
         if not sub.accepted:
-            self.log.warning(f"[SESSION] {intent.symbol} {intent.side} 미접수 | {sub.block_code or (sub.result.message if sub.result else '')}")
-            return
+            why = sub.block_code or (sub.result.message if sub.result else '')
+            self.log.warning(f"[SESSION] {intent.symbol} {intent.side} 미접수 | {why}")
+            if sub.block_code == "ORDER_PLACEMENT_AMBIGUOUS":
+                if new_meta is not None:              # 접수됐을 수 있음 — 메타 유지(체결되면 손절가 필요)
+                    new_meta.meta["entry_status"] = "UNKNOWN"
+                    self.executor.save_state()
+                return "UNKNOWN", why
+            if new_meta is not None and not self._holds(intent.symbol, ctx):
+                self.state.remove_position_meta(intent.symbol)
+                self.executor.save_state()
+            return ("NOT_ACCEPTED:" + sub.block_code) if sub.block_code else "NOT_ACCEPTED", why
         self.summary.orders_accepted += 1
+        if new_meta is not None:
+            new_meta.meta["entry_status"] = "ACCEPTED"
+            new_meta.meta["order_id"] = str(sub.result.order_id or "")
         # 지정가 매수의 추정가는 지정가(체결가는 그 이하) — 미체결 예약금·추정 원가 모두 보수적
         est_price = intent.limit_price if intent.order_type == "limit" else intent.reference_price
         self.recorder.track(intent.symbol, intent.side, sub.result.order_id, intent.quantity,
@@ -531,6 +592,25 @@ class SessionRunner:
         if intent.side == "BUY" and intent.symbol not in self.state.positions:
             self.state.upsert_position_meta(PositionMeta(
                 intent.symbol, strategy_id=getattr(self.strategy, "strategy_id", ""), origin="ORDER"))
+        return "SUBMITTED", str(sub.result.order_id or "")
+
+    @staticmethod
+    def _holds(symbol: str, ctx: TickContext) -> bool:
+        p = ctx.positions.get(symbol)
+        return bool((p and p.quantity > 0) or any(b.symbol == symbol and b.quantity > 0 for b in ctx.balance.positions))
+
+    def _sync_entry_dates(self, positions: dict) -> None:
+        """C2: 메타의 진입 거래일 = 원장 첫 체결일(재시작 후에도 원장에서 다시 맞춤). 바뀔 때만 갱신."""
+        for sym, pos in positions.items():
+            m = self.state.positions.get(sym)
+            if m is None or pos.quantity <= 0:
+                continue
+            d = pos.first_entry_date.isoformat()
+            if m.meta.get("entry_trade_date") != d or m.meta.get("entry_status", "FILLED") != "FILLED":
+                m.meta["entry_trade_date"] = d
+                if "entry_status" in m.meta:
+                    m.meta["entry_status"] = "FILLED"
+                self.state.upsert_position_meta(m)
 
     def _cancel_expired_entries(self, now: datetime) -> None:
         """진입 마감(entry_cancel_at) 이후, 이 실행이 낸 지정가 매수 중 끝나지 않은 주문의 남은 수량 취소.

@@ -124,7 +124,7 @@ class StartupReport:
 async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=asyncio.sleep) -> StartupReport:
     """인증 → 잔고 → 미해결 주문 흔적 확인. 주문은 절대 내지 않습니다."""
     if getattr(settings, "swing_strategy", None) is not None and settings.swing_strategy.mode == "paper":
-        raise StartupBlockedError("swing_strategy.mode=paper — C(E1 손절·시간 청산·일일 손실 한도) 전에는 그림자(shadow)만 허용")
+        raise StartupBlockedError("swing_strategy.mode=paper — C3(일일 손실 한도·모의 전송 사전 점검) 전에는 그림자(shadow)만 허용")
     is_live = not settings.broker.is_paper_trading
     # M0 커밋 1: 키움 모의투자 서버 모드도 실전과 같은 엄격 기준(잔고·주문 기록·원장을 모르면 시작 안 함).
     # 로컬 가짜 브로커(MOCK_LOCAL)만 예전처럼 경고 후 계속. 실전 조합은 build_broker에서 이미 거부됨.
@@ -364,7 +364,7 @@ def build_session_runner(settings: Settings, broker, app_logger, *, strategy=Non
     send_orders, shadow_sink = True, None
     if strategy is None and mode != "off":
         if mode == "paper":
-            raise StartupBlockedError("swing_strategy.mode=paper — C(E1 손절·시간 청산·일일 손실 한도) 전에는 그림자(shadow)만 "
+            raise StartupBlockedError("swing_strategy.mode=paper — C3(일일 손실 한도·모의 전송 사전 점검) 전에는 그림자(shadow)만 "
                                       "허용. settings.yaml swing_strategy.mode를 shadow 또는 off로")
         strategy = build_s1_strategy(settings, broker, calendar, quote_source, session_cfg, candidates=candidates)
         send_orders, shadow_sink = False, _jsonl_sink(Path(settings.storage.state_file).with_name("shadow_intents.jsonl"))
@@ -403,7 +403,7 @@ def _jsonl_sink(path: Path):
 
 
 def build_s1_strategy(settings: Settings, broker, calendar, quote_source, session_cfg, *, candidates=None):
-    """S1 진입 전략(M3 B) — 후보 승인(읽기 전용)·주문 직전 가격(현재가·최우선 매도호가)·신호 키."""
+    """S1 전략(M3 B 진입·C2 E1 청산) — 후보 승인(읽기 전용)·주문 직전 가격(현재가·최우선 매도호가)·신호 키·손절/시간 청산."""
     from datetime import time as _time
     from app.candidates import CandidateReader
     from app.s1_strategy import S1EntryStrategy
@@ -417,6 +417,14 @@ def build_s1_strategy(settings: Settings, broker, calendar, quote_source, sessio
         def quote(sym):
             px = broker.get_market_price(sym).current_price
             return px, px
+    if quote_source is not None and hasattr(quote_source, "get_prices"):
+        def price(sym):                 # E1 손절 판단용 현재가 — 실패·0은 None(매도 안 함)
+            v = quote_source.get_prices([sym]).get(sym)
+            return v if type(v) is int and v > 0 else None
+    else:
+        def price(sym):
+            v = broker.get_market_price(sym).current_price
+            return v if type(v) is int and v > 0 else None
     hh, mm = st.entry_start.split(":")
     entry_end = session_cfg.entry_cancel_at or _time(9, 30)
     return S1EntryStrategy(
@@ -424,7 +432,8 @@ def build_s1_strategy(settings: Settings, broker, calendar, quote_source, sessio
         candidates=candidates or reader.read, quote=quote,
         keys=SignalKeyStore(keys_path(settings.storage.state_file, st.mode)),
         decisions=_jsonl_sink(Path(settings.storage.state_file).with_name("strategy_decisions.jsonl")),
-        entry_start=_time(int(hh), int(mm)), entry_end=entry_end, quantity=st.quantity)
+        entry_start=_time(int(hh), int(mm)), entry_end=entry_end, quantity=st.quantity,
+        calendar=calendar, price=price)
 
 
 def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,
