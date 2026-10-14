@@ -181,11 +181,10 @@ C2.run(D1, time(9, 0), time(9, 40), events=[(time(9, 6), C2.fill_buy(10_000))])
 nxt = CAL.add_trading_days(EXIT_DAY, 1)
 C2.run(nxt, time(8, 50), time(9, 10), events=[(time(9, 7), C2.fill_sell(10_000))])
 c2_res = [d for d in C2.decisions if d["event"] == "RESULT_SELL"]
-check("3-2) 시간 청산 시각에 실행기가 꺼져 있었으면 다음 날 정규장에 매도 — 시간 청산은 forced가 아니라 주문 가능 시각(09:05)부터, "
-      "그 전 차단 결과는 판단 기록에 한 번만",
+check("3-2) 시간 청산 시각에 실행기가 꺼져 있었으면 다음 날 정규장 첫 폴링(09:00)에 매도 — C4부터 시간 청산도 forced",
       [o["side"] for o in C2.broker.orders] == ["BUY", "SELL"]
-      and [d["status"] for d in c2_res] == ["GUARD_REJECTED:OUTSIDE_ORDER_WINDOW", "SUBMITTED"]
-      and c2_res[-1]["at"] >= f"{nxt.isoformat()}T09:05" and C2.events("E1_TIME")[0]["at"] >= f"{nxt.isoformat()}T09:00" and C2.ledger_qty() == 0)
+      and [d["status"] for d in c2_res] == ["SUBMITTED"] and c2_res[0]["at"] == f"{nxt.isoformat()}T09:00:00"
+      and C2.events("E1_TIME")[0]["at"] == f"{nxt.isoformat()}T09:00:00" and C2.ledger_qty() == 0)
 
 # 4. 신규 매수 중단·가격 실패·수량 불일치·메타 없음
 D = Case("halt")

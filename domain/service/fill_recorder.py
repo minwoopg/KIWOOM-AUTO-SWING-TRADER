@@ -71,7 +71,7 @@ class FillRecorder:
     BACKOFF_MAX_SEC = 900
 
     def __init__(self, ledger_store, logger=None, *, scope: str = "default",
-                 fill_lookup=None, evidence_store=None) -> None:
+                 fill_lookup=None, evidence_store=None, spool=None) -> None:
         scope = str(scope or "").strip()
         if not scope or any(c in scope for c in "|\r\n"):
             raise ValueError(f"체결 원장 계좌 범위(scope)가 비었거나 '|'·줄바꿈 포함: {scope!r}")
@@ -82,6 +82,8 @@ class FillRecorder:
         # M3 A2: fill_lookup(order_id, symbol) -> FillDetail | None (예외 가능), evidence_store.append(record)
         self.fill_lookup = fill_lookup
         self.evidence_store = evidence_store
+        self.spool = spool          # C4: 저장 대기 근거 내구 대기열(infra/storage/fill_evidence.EvidenceSpool), None이면 메모리만
+        self.spool_error = ""
         self._unconfirmed: dict[str, dict] = {}     # event_id → {event, attempts, next_at} — 체결조회 다시
         self._pending_saves: dict[str, dict] = {}   # event_id → {record, attempts, next_at, error} — 저장만 다시
         self.last_evidence_error = ""
@@ -106,7 +108,61 @@ class FillRecorder:
                               "next_at": iso(v.get("next_at")), "error": v.get("error", "")}
                              for k, v in self._pending_saves.items()],
             "last_error": self.last_evidence_error,
+            "spool_error": self.spool_error,
         }
+
+    def _spool_put(self, rec, attempts: int, next_at, err: str, now: datetime) -> None:
+        if self.spool is None:
+            return
+        try:
+            self.spool.put(rec, attempts=attempts, next_at=next_at.isoformat(timespec="seconds"), error=err,
+                           at=now.isoformat(timespec="seconds"))
+        except Exception as exc:                       # noqa: BLE001
+            self.spool_error = f"{rec.event_id}: 저장 대기 근거 보관 실패 — 근거 미확정(재시작하면 잃음): {type(exc).__name__}: {exc}"
+            if self.logger is not None:
+                self.logger.critical(f"[FILL_RECORDER] {rec.symbol} {self.spool_error}")
+
+    def _spool_mark(self, event_id: str, op: str, note: str, now: datetime) -> None:
+        if self.spool is None:
+            return
+        try:
+            self.spool.mark(event_id, op, note=note, at=now.isoformat(timespec="seconds"))
+        except Exception as exc:                       # noqa: BLE001
+            self.spool_error = f"{event_id}: 대기열 {op} 기록 실패: {type(exc).__name__}: {exc}"
+            if self.logger is not None:
+                self.logger.warning(f"[FILL_RECORDER] {self.spool_error}")
+
+    def restore_spool(self, now: datetime) -> int:
+        """재시작 복구(C4, GPT R3): 대기열의 미해결 근거를 다시 조회하지 않고 저장 재시도 목록에. 날짜와 무관.
+        근거 파일에 이미 같은 사건이 있으면 DONE으로 닫음."""
+        if self.spool is None or self.evidence_store is None:
+            return 0
+        try:
+            pend = self.spool.unresolved()
+        except Exception as exc:                       # noqa: BLE001
+            self.spool_error = f"저장 대기 근거 대기열 읽기 실패 — 사람 확인: {type(exc).__name__}: {exc}"
+            if self.logger is not None:
+                self.logger.critical(f"[FILL_RECORDER] {self.spool_error}")
+            return 0
+        if not pend:
+            return 0
+        try:
+            have = {r.event_id for r in self.evidence_store.load()}
+        except Exception:                              # noqa: BLE001 — 못 읽으면 저장 시도에서 다시 판정
+            have = set()
+        from domain.service.fill_evidence import FillEvidenceRecord
+        n = 0
+        for eid, item in pend.items():
+            if eid in have:
+                self._spool_mark(eid, "DONE", "근거 파일에 이미 있음", now)
+                continue
+            self._pending_saves[eid] = {"record": FillEvidenceRecord.from_dict(item["record"]), "attempts": 0,
+                                        "next_at": now, "error": item.get("error", ""),
+                                        "restored_from": item.get("at"), "prior_attempts": item.get("attempts")}
+            n += 1
+        if n and self.logger is not None:
+            self.logger.warning(f"[FILL_RECORDER] 재시작 복구 — 저장 대기 근거 {n}건 저장부터 다시(재조회 없음)")
+        return n
 
     def recover_unconfirmed(self, events, trade_date: date, now: datetime) -> int:
         """재시작 복구(C3): 오늘 원장 매수·매도 사건 중 체결 근거가 없는 것을 체결조회 재확인 목록에 다시 올림.
@@ -257,25 +313,30 @@ class FillRecorder:
         같은 사건에 다른 근거가 이미 있으면(충돌) 재시도하지 않고 사람 확인."""
         try:
             self.evidence_store.append(rec)
-            self._pending_saves.pop(rec.event_id, None)
+            if self._pending_saves.pop(rec.event_id, None) is not None:
+                self._spool_mark(rec.event_id, "DONE", "저장 성공", now)
             return True
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
             self.last_evidence_error = f"{rec.event_id}: 근거 저장 실패 — {err}"
             if "Conflict" in type(exc).__name__:
-                self._pending_saves.pop(rec.event_id, None)
+                if self._pending_saves.pop(rec.event_id, None) is not None:
+                    self._spool_mark(rec.event_id, "DONE", f"충돌 — 사람 확인: {err}", now)
                 if self.logger is not None:
                     self.logger.critical(f"[FILL_RECORDER] {rec.symbol} 체결 근거 충돌 — 덮어쓰지 않음, 사람 확인: {err}")
                 return False
             attempts += 1
             if attempts >= self.SAVE_RETRY_LIMIT:
                 self._pending_saves.pop(rec.event_id, None)
+                self._spool_mark(rec.event_id, "GAVE_UP", f"이번 실행 {attempts}회 실패 — 재시작 때 다시: {err}", now)
                 if self.logger is not None:
                     self.logger.critical(f"[FILL_RECORDER] {rec.symbol} {rec.side} 체결 근거 저장 {attempts}회 실패 — "
                                          f"포기(원장은 기록됨, 실제 비용 미확정). `paper_order.py confirm-fills`로 다시: {err}")
                 return False
             self._pending_saves[rec.event_id] = {"record": rec, "attempts": attempts,
                                                  "next_at": self._backoff(attempts, now), "error": err}
+            if attempts == 1:
+                self._spool_put(rec, attempts, self._pending_saves[rec.event_id]["next_at"], err, now)
             if self.logger is not None:
                 self.logger.critical(f"[FILL_RECORDER] {rec.symbol} 체결 근거 저장 실패(원장은 기록됨) — "
                                      f"{attempts}/{self.SAVE_RETRY_LIMIT}, 다음 폴링 이후 다시: {err}")

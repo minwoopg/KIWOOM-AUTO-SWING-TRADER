@@ -8,7 +8,9 @@ E1 청산 (C2 — GPT 최소판 요청 4, B 검토 C3)
   META_MISSING 기록(사람 확인 — 진입은 최대 보유 1이라 어차피 없음).
 - 손절: 유효한 현재가(양의 정수) ≤ 손절가 → 원장·잔고 보유 전량 시장가 매도(forced). 가격 조회 실패·0(거래정지 등)은 매도하지 않음.
 - 시간 청산: 진입 거래일(원장 첫 체결일)을 0일로 세어 10번째 거래일의 마감 20분 전(일반 15:10)부터 전량 시장가 매도.
-  그 시각을 지나쳤으면(실행기가 꺼져 있었음) 다음 정규장 폴링에서 바로.
+  그 시각을 지나쳤으면(실행기가 꺼져 있었음) 다음 정규장 폴링에서 바로. C4부터 forced(09:00부터·15:15 이후 정규장도).
+- C4: 손절·시간 청산 모두 유효한 현재가(양의 정수)가 있어야 매도 — 조회 실패·0이면 보류하고 다음 폴링에 다시.
+  미접수 매도는 종목별로 60초부터 두 배씩(최대 15분) 기다렸다 다시 냄.
 - 중복 매도 방지: 미해결 주문·복구 필요(ERROR·orphan)·장부 불일치 종목은 건너뜀(실행기 안전 한도와 PSM이 한 번 더 막음).
   원장 수량 ≠ 잔고 수량이면 매도하지 않음(QTY_MISMATCH 기록).
 - 신규 매수 중단·신호 키 손상·후보 오류는 청산을 막지 않음(청산을 먼저 판단).
@@ -40,6 +42,8 @@ class S1EntryStrategy:
 
     TIME_EXIT_SESSIONS = 10           # 진입일 0 → 10번째 거래일
     TIME_EXIT_BEFORE_CLOSE_MIN = 20   # 그날 마감 20분 전(일반 15:10)
+    EXIT_BACKOFF_BASE_SEC = 60        # C4: 청산 매도 미접수 뒤 재전송 간격
+    EXIT_BACKOFF_MAX_SEC = 900
 
     def __init__(self, *, mode: str, scope: str, candidates: Callable[[date, datetime], object],
                  quote: Callable[[str], tuple[int | None, int | None]], keys, decisions: Callable[[dict], None],
@@ -55,6 +59,8 @@ class S1EntryStrategy:
         self.price = price or (lambda sym: quote(sym)[0])
         self.book = None
         self._now: datetime | None = None
+        # C4: forced 매도가 미접수면 종목별 재전송 간격(60·120·240…초, 최대 900초). 메모리 — 재시작하면 처음부터
+        self._exit_wait: dict[str, tuple[int, datetime]] = {}
         self._last_note: dict[str, str] = {}
 
     # ── 기록 ────────────────────────────────────────────────
@@ -80,6 +86,15 @@ class S1EntryStrategy:
 
     def on_intent_result(self, intent: OrderIntent, status: str, detail: str = "") -> None:
         """실행기가 의도를 처리한 결과(C2) — 신호 키에 상태 줄(SHADOW·GUARD_REJECTED·SUBMITTED·NOT_ACCEPTED·UNKNOWN)."""
+        if intent.side == "SELL":
+            from datetime import timedelta
+            if status.startswith("NOT_ACCEPTED"):
+                n = self._exit_wait.get(intent.symbol, (0, None))[0] + 1
+                at = (self._now or datetime.now()) + timedelta(seconds=min(self.EXIT_BACKOFF_BASE_SEC * 2 ** (n - 1),
+                                                                            self.EXIT_BACKOFF_MAX_SEC))
+                self._exit_wait[intent.symbol] = (n, at)
+            elif status == "SUBMITTED":
+                self._exit_wait.pop(intent.symbol, None)
         key = (intent.context or {}).get("signal_key")
         if key:
             try:
@@ -127,23 +142,33 @@ class S1EntryStrategy:
                 continue
             due = self.time_exit_at(pos.first_entry_date)
             time_due = due is not None and ctx.now >= due
+            wait = self._exit_wait.get(sym)
+            if wait is not None and ctx.now < wait[1]:
+                self._note(ctx, f"exit:{sym}", "EXIT_BACKOFF", {"failures": wait[0],
+                                                                "next_at": wait[1].isoformat(timespec="seconds")})
+                continue
             try:
                 px = self.price(sym)
             except Exception as exc:                       # noqa: BLE001
                 px = None
-                self._note(ctx, f"exit:{sym}", "PRICE_FAILED", {"error": f"{type(exc).__name__}: {exc}"})
-            stop_hit = type(px) is int and px > 0 and px <= meta.stop_price
+                self._note(ctx, f"exit:{sym}", "PRICE_FAILED", {"error": f"{type(exc).__name__}: {exc}",
+                                                                "time_due": time_due})
+            if not (type(px) is int and px > 0):
+                # C4(GPT R2): 손절·시간 청산 모두 유효한 현재가가 있어야 함 — 손절가를 관측가 대신 쓰지 않음.
+                # 시간 청산 기한은 그대로 남아 다음 유효 조회에서 실행.
+                self._note(ctx, f"exit:{sym}", "NO_PRICE", {"price": px, "time_due": time_due})
+                continue
+            stop_hit = px <= meta.stop_price
             if not stop_hit and not time_due:
-                if not (type(px) is int and px > 0):
-                    self._note(ctx, f"exit:{sym}", "NO_PRICE", {"price": px})
                 continue
             reason = "E1_STOP" if stop_hit else "E1_TIME"
-            ref = px if (type(px) is int and px > 0) else int(meta.stop_price)
             self._note(ctx, f"exit:{sym}", reason, {"price": px, "stop_price": meta.stop_price,
                                                     "entry_date": pos.first_entry_date.isoformat(),
                                                     "time_exit_at": due.isoformat(timespec="minutes") if due else None,
                                                     "quantity": pos.quantity})
-            out.append(OrderIntent(sym, "SELL", pos.quantity, ref, reason=reason, forced=stop_hit,
+            # C4(GPT Q1): 시간 청산도 forced — 기한을 놓친 보유는 다음 날 09:00부터, 15:15 이후 정규장에서도.
+            # 복구 필요·장부 불일치·잔고 초과 매도 차단은 안전 한도에 그대로.
+            out.append(OrderIntent(sym, "SELL", pos.quantity, px, reason=reason, forced=True,
                                    context={"exit_rule": reason, "stop_price": meta.stop_price, "exit_price_seen": px,
                                             "entry_date": pos.first_entry_date.isoformat(),
                                             "signal_id": (meta.meta or {}).get("signal_id"), "strategy_mode": self.mode}))

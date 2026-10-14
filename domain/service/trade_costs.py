@@ -27,13 +27,20 @@ ACTUAL, ESTIMATE = "ACTUAL", "ESTIMATE"
 class CostProfile:
     commission_rate: float = PAPER_COMMISSION_RATE
     sell_tax_rate: float = PAPER_SELL_TAX_RATE
-    label: str = "모의 실측(10/13) 기준 추정 — 수수료 0.35%·매도세 0.20%, 원 단위 올림"
+    label: str = ""          # 비우면 실제 적용 비율로 만듦(C4 — 설정을 바꾸면 표시도 따라감)
+
+    VERSION = "ops-est-v1"   # 운영 추정 모델(연구용 Gross/Base/Stress와 별개)
 
     def __post_init__(self) -> None:
         for name in ("commission_rate", "sell_tax_rate"):
             v = getattr(self, name)
             if not isinstance(v, (int, float)) or isinstance(v, bool) or not (0 <= v < 0.05):
                 raise ValueError(f"{name}={v!r} — 0 이상 0.05 미만")
+        if not self.label:
+            base = " (모의 실측 10/13 기준값)" if (self.commission_rate, self.sell_tax_rate) == (
+                PAPER_COMMISSION_RATE, PAPER_SELL_TAX_RATE) else " (설정값)"
+            object.__setattr__(self, "label", f"{self.VERSION}: 수수료 {self.commission_rate * 100:.3g}%·매도세 "
+                                              f"{self.sell_tax_rate * 100:.3g}%, 원 단위 올림{base}")
 
 
 @dataclass(frozen=True)

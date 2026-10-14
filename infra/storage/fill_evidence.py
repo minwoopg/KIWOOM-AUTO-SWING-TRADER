@@ -90,3 +90,63 @@ class FillEvidenceStore:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, self.path)
+
+
+# ── C4(GPT R3): 저장 대기 근거 spool ─────────────────────────────
+
+class EvidenceSpoolCorruptError(RuntimeError):
+    pass
+
+
+def spool_path(fill_ledger_file: str | Path) -> Path:
+    return Path(fill_ledger_file).with_name("fill_evidence_spool.jsonl")
+
+
+class EvidenceSpool:
+    """체결조회로 **이미 확인한** 근거가 근거 파일 저장에 실패했을 때의 내구 대기열 (append-only JSON Lines).
+
+    op: PENDING(근거·시도 횟수·다음 시각·오류) / DONE(저장 성공·이미 있음·충돌로 사람 확인) / GAVE_UP(이번 실행 재시도 한도).
+    사건의 상태 = 마지막 줄. PENDING·GAVE_UP은 미해결 — 재시작하면 다시 조회하지 않고 저장부터 재개, 날짜가 바뀌어도 버리지 않음.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def _append(self, rec: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def put(self, record: FillEvidenceRecord, *, attempts: int, next_at: str, error: str, at: str) -> None:
+        self._append({"op": "PENDING", "event_id": record.event_id, "order_id": record.order_id,
+                      "record": record.to_dict(), "attempts": attempts, "next_at": next_at, "error": error[:300],
+                      "at": at})
+
+    def mark(self, event_id: str, op: str, *, note: str = "", at: str) -> None:
+        self._append({"op": op, "event_id": event_id, "note": note[:300], "at": at})
+
+    def unresolved(self) -> dict[str, dict]:
+        """event_id → 마지막 PENDING 줄(+ 마지막 op). DONE으로 끝난 사건은 없음."""
+        if not self.path.exists():
+            return {}
+        last: dict[str, dict] = {}
+        pending: dict[str, dict] = {}
+        for i, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                if not isinstance(rec, dict) or rec.get("op") not in ("PENDING", "DONE", "GAVE_UP") \
+                        or not rec.get("event_id"):
+                    raise ValueError("op·event_id 없음")
+                if rec["op"] == "PENDING":
+                    FillEvidenceRecord.from_dict(rec["record"])
+            except (ValueError, KeyError, TypeError) as exc:
+                raise EvidenceSpoolCorruptError(f"{self.path.name}:{i} 읽을 수 없는 줄: {exc}") from exc
+            last[rec["event_id"]] = rec
+            if rec["op"] == "PENDING":
+                pending[rec["event_id"]] = rec
+        return {eid: {**pending[eid], "last_op": r["op"]} for eid, r in last.items()
+                if r["op"] != "DONE" and eid in pending}

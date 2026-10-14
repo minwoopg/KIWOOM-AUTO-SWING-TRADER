@@ -637,6 +637,7 @@ def download_bundle(p: Paths, day: date, red: Redactor, summary: dict) -> bytes:
                         (p.state_file.with_name("buy_cancels.jsonl"), "buy_cancels.jsonl"),
                         # C3: 실행 모드 표식·일일 위험·전략 판단(번들과 같은 재현 범위)
                         (p.fill_ledger.with_name("execution_mode.json"), "execution_mode.json"),
+                        (p.fill_ledger.with_name("fill_evidence_spool.jsonl"), "fill_evidence_spool.jsonl"),
                         (p.state_file.with_name("daily_risk.jsonl"), "daily_risk.jsonl"),
                         (p.state_file.with_name("strategy_decisions.jsonl"), "strategy_decisions.jsonl")):
             if f.exists() and f.is_file():

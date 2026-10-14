@@ -19,6 +19,7 @@ from domain.risk.daily_loss import DayPnl, day_pnl
 from domain.service.trade_costs import CostProfile, event_costs
 
 BLOCK_UNKNOWN = "DAILY_RISK_UNKNOWN"
+BLOCK_BASELINE = "BASELINE_MISSING_WITH_TRADES"
 BLOCK_HALTED = "DAILY_RISK_HALTED"
 
 
@@ -54,6 +55,16 @@ class DailyRiskGuard:
             start, failures, halts = self.store.day(d)
             qty_now = {s: p.quantity for s, p in ledger_positions.items() if p.quantity > 0}
             if start is None:
+                # C4(GPT R1): 오늘 체결 사건이 이미 있으면 지금 보유로 시작 기준을 만들 수 없음(오늘 매수가 기준과 사건에
+                # 두 번 들어감). 그날 신규 매수 보류 — 기준을 추정하지 않고, 사건을 빼서 손실을 지우지도 않음. 청산은 계속.
+                today_events = [e for e in self.ledger_store.load()
+                                if e.trade_date == trade_date and e.kind in ("BUY", "SELL", "OPENING")]
+                if today_events:
+                    self.last = {"trade_date": d, "state": BLOCK_BASELINE,
+                                 "note": f"시작 기준 전에 오늘 체결 {len(today_events)}건 — 그날 신규 매수 보류(다음 거래일 새 기준)"}
+                    self._say("critical", f"시작 기준 없이 오늘 체결 {len(today_events)}건이 있음 — 그날 신규 매수 보류, "
+                                          "청산은 계속(기준을 추정하지 않음)")
+                    return BLOCK_BASELINE
                 missing = [s for s in qty_now if type(prices.get(s)) is not int or prices.get(s, 0) <= 0]
                 if missing:
                     self.last = {"trade_date": d, "state": "NO_START", "note": f"시작 기준가 없음: {missing}"}
@@ -74,6 +85,7 @@ class DailyRiskGuard:
             return BLOCK_UNKNOWN
         n_fail = len(failures)
         self.last = {"trade_date": d, "state": "OK" if pnl.pnl is not None else "UNKNOWN", **pnl.to_dict(),
+                     "label": "시작 기준 이후 거래 손익(비용 후, 입출금 제외)", "start_at": start.get("at"),
                      "limit": self.limit, "failed_orders": n_fail, "max_failed_orders": self.max_failures,
                      "start_equity": start.get("start_equity"), "halted": bool(halts), "enforce": self.enforce,
                      "cost_profile": self.profile.label}

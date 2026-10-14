@@ -9,6 +9,7 @@ from __future__ import annotations
 - 체결가는 체결 근거가 있으면 실제 체결가(원장 추정가는 겹쳐서 바꿈 — 호출부가 overlay된 사건을 넘김).
 - 보유가 있는데 현재가가 없으면 None(알 수 없음) — 호출부는 신규 매수를 보류(손실 한도를 모르는 채 사지 않음).
 - OPENING(기존 보유 인수)은 그 가격으로 산 것처럼(비용 0).
+- C4: 지금 수량 ≠ 시작 수량 + 오늘 순체결이면 None(계산 구간이 맞지 않음 — 신규 매수 보류).
 """
 
 from dataclasses import dataclass, field
@@ -21,11 +22,13 @@ class DayPnl:
     costs: int = 0
     estimated_costs: int = 0
     missing_prices: list = field(default_factory=list)
+    qty_mismatch: list = field(default_factory=list)
     note: str = ""
 
     def to_dict(self) -> dict:
         return {"pnl": self.pnl, "by_symbol": self.by_symbol, "costs": self.costs,
-                "estimated_costs": self.estimated_costs, "missing_prices": self.missing_prices, "note": self.note}
+                "estimated_costs": self.estimated_costs, "missing_prices": self.missing_prices,
+                "qty_mismatch": self.qty_mismatch, "note": self.note}
 
 
 def day_pnl(start: dict, events_today: list, qty_now: dict[str, int], prices_now: dict[str, int],
@@ -40,6 +43,11 @@ def day_pnl(start: dict, events_today: list, qty_now: dict[str, int], prices_now
         buy = sum(e.quantity * e.price for e in events_today if e.symbol == s and e.kind in ("BUY", "OPENING"))
         sell = sum(e.quantity * e.price for e in events_today if e.symbol == s and e.kind == "SELL")
         q0, q1 = start_qty.get(s, 0), int(qty_now.get(s, 0))
+        net = sum(e.quantity for e in events_today if e.symbol == s and e.kind in ("BUY", "OPENING")) \
+            - sum(e.quantity for e in events_today if e.symbol == s and e.kind == "SELL")
+        if q0 + net != q1:             # C4(GPT R1): 지금 수량 = 시작 수량 + 오늘 순체결이 아니면 계산 구간이 어긋남
+            out.qty_mismatch.append(f"{s}: 시작 {q0} + 오늘 {net:+d} ≠ 지금 {q1}")
+            continue
         if q0 and s not in marks:
             out.missing_prices.append(s)
             continue
@@ -59,9 +67,11 @@ def day_pnl(start: dict, events_today: list, qty_now: dict[str, int], prices_now
             out.costs += c.amount
             if c.source != "ACTUAL":
                 out.estimated_costs += c.amount
-    if out.missing_prices:
+    if out.missing_prices or out.qty_mismatch:
         out.pnl = None
-        out.note = f"현재가·기준가 없음: {', '.join(out.missing_prices)}"
+        out.note = "; ".join(x for x in (
+            f"현재가·기준가 없음: {', '.join(out.missing_prices)}" if out.missing_prices else "",
+            f"수량 구간 불일치: {'; '.join(out.qty_mismatch)}" if out.qty_mismatch else "") if x)
         return out
     out.pnl = total - out.costs
     return out

@@ -2076,4 +2076,37 @@ GPT 최소판 마지막 코드 단계: 일일 손실 한도(시작 기준 저장
 ### 전달 파일
 - 패치 1개 — 기준 C2 `1ea5a47`(C1·C2 먼저 적용)
 
+## 2026-10-14 — C4: 시작 기준 전 당일 거래 보류, 청산 가격 실패 보류·시간 청산 forced, 저장 대기 근거 spool (GPT C 검토, 기준 `de35cd4`)
+
+### 배경
+GPT C 검토: R1(당일 거래 뒤 시작 기준을 만들면 매수 금액 중복 — 229,000원 1주가 가격 그대로인데 −229,802원·중단 재현),
+R2(시간 청산이 가격 실패에도 손절가를 참고가로 매도 의도 — 보고서와 다름), R3(저장 대기 근거가 메모리뿐). Q1 답: 시간 청산도 forced.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `app/daily_risk.py`, `domain/risk/daily_loss.py` | R1: 시작 기준이 없는데 오늘 체결 사건이 있으면 기준을 만들지 않고 그날 신규 매수 보류(BASELINE_MISSING_WITH_TRADES, 청산 계속). 지금 수량 = 시작 + 오늘 순체결 검증(아니면 모름 → 보류). 표시 이름 "시작 기준 이후 거래 손익" |
+| `app/s1_strategy.py` | R2: 손절·시간 청산 모두 유효한 현재가 필요(손절가 대체 없음, 기한 유지). 시간 청산 forced. 미접수 청산 매도 종목별 재전송 간격 60초→최대 15분(EXIT_BACKOFF) |
+| `infra/storage/fill_evidence.py`, `domain/service/fill_recorder.py`, `app/session_runner.py`, `app/main.py` | R3: `EvidenceSpool`(`data/fill_evidence_spool.jsonl`) — 저장 실패 근거 보관, 성공 시 DONE, 재시작 때 재조회 없이 저장부터(날짜 무관), 이미 저장됐으면 DONE, 보관 실패는 `spool_error` |
+| `domain/service/trade_costs.py` | 비용 표시를 실제 적용 비율로(`ops-est-v1`) |
+| `app/reports.py`, `dashboard/data.py` | 번들·zip에 spool |
+| `docs/m3_c2_e1_exit.md`, `docs/m3_c3_daily_risk_paper.md` | 규칙 갱신, 계좌 점검 범위(전역 오류는 기동 거부), paper 전환 순서 |
+
+### 테스트 및 검증
+- 새 시험 `test_c4.py` 14건: GPT 재현(매수 뒤 첫 기준) 보류, 매도 뒤·OPENING·기준 지연 뒤 체결, 정상 기준·재시작, 수량 구간 불일치,
+  실행기 통합(오늘 수동 왕복 뒤 매수 없음), 시간 청산 가격 예외·None·0 보류 → 복구 가격에 forced, 손절 가격 실패 보류,
+  15:16 시간 청산, 미접수 재전송 간격, spool 저장 재개·보관 실패 표시·이미 저장 DONE.
+- `test_e1_exit.py` 3-2를 forced 정책(다음 날 09:00 매도)으로 갱신.
+- 변이 6종(기준 보류 제거·손절가 대체 복원·시간 청산 forced 해제·간격 제거·spool 기록 제거·수량 검증 제거) 각각 검출.
+- 회귀 48/48(`test_broker_order_status.py` 제외 — 통과로 세지 않음), 동등성 18/18, Python 3.14, 관리 창 데스크톱 3/3.
+
+### 변경하지 않은 것
+- S1·승인 조건(PASS·300세션 비교), 현재가 기준 손절, 실제 비용 우선, 중단 해제 후 당일 매수 금지, `config/settings.yaml`.
+
+### 다음 작업
+- 사용자: 실행기 중지 → 계좌·미체결·복구 상태 대조 → paper 설정(005930, 1주)으로 `--check-only` → 모의 자동매매 시작.
+
+### 전달 파일
+- 패치 1개 — 기준 `de35cd4`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

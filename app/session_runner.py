@@ -412,6 +412,8 @@ class SessionRunner:
         if not self._evidence_recovered and hasattr(self.recorder, "recover_unconfirmed"):
             self._evidence_recovered = True
             try:
+                if hasattr(self.recorder, "restore_spool"):
+                    self.recorder.restore_spool(now)          # C4: 저장 대기 근거 먼저(재조회 없음)
                 self.recorder.recover_unconfirmed(self.ledger_store.load(), now.date(), now)
             except Exception as exc:                     # noqa: BLE001 — 근거 복구 실패가 실행을 멈추지 않음
                 self.log.warning(f"[FILL_RECORDER] 재시작 복구 실패: {type(exc).__name__}: {exc}")

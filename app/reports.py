@@ -166,6 +166,7 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
     # M3 A2 보완(GPT R3): 보정 가격을 번들만으로 재현할 수 있게 체결 근거 전체, 취소 감사·실행 모드 표식도 함께
     ledger_dir = Path(st.fill_ledger_file).parent
     files["fill_evidence.jsonl"] = json_lines(ledger_dir / "fill_evidence.jsonl")
+    files["fill_evidence_spool.jsonl"] = json_lines(ledger_dir / "fill_evidence_spool.jsonl")   # C4 저장 대기 근거
     files["buy_cancels.jsonl"] = json_lines(Path(st.state_file).with_name("buy_cancels.jsonl"))
     em = ledger_dir / "execution_mode.json"
     try:
