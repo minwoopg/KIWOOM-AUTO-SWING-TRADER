@@ -36,7 +36,8 @@ from pathlib import Path
 from config.settings import Settings, load_settings
 from domain.models import AccountBalance
 from infra.broker.execution_mode import (
-    KIWOOM_PAPER, PaperKiwoomBroker, build_execution_broker, mode_label, resolve_execution_mode,
+    KIWOOM_PAPER, PaperKiwoomBroker, build_execution_broker, mode_label, paper_identity_problems,
+    resolve_execution_mode,
 )
 from infra.broker.kiwoom_broker import KiwoomBroker
 from infra.market_data.quote_source import KiwoomQuoteSource
@@ -123,8 +124,11 @@ class StartupReport:
 
 async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=asyncio.sleep) -> StartupReport:
     """인증 → 잔고 → 미해결 주문 흔적 확인. 주문은 절대 내지 않습니다."""
-    if getattr(settings, "swing_strategy", None) is not None and settings.swing_strategy.mode == "paper":
-        raise StartupBlockedError("swing_strategy.mode=paper — C3(일일 손실 한도·모의 전송 사전 점검) 전에는 그림자(shadow)만 허용")
+    paper_strategy = getattr(settings, "swing_strategy", None) is not None and settings.swing_strategy.mode == "paper"
+    if paper_strategy:
+        problems = paper_config_problems(settings, broker)
+        if problems:
+            raise StartupBlockedError("swing_strategy.mode=paper 기동 거부 — " + "; ".join(problems))
     is_live = not settings.broker.is_paper_trading
     # M0 커밋 1: 키움 모의투자 서버 모드도 실전과 같은 엄격 기준(잔고·주문 기록·원장을 모르면 시작 안 함).
     # 로컬 가짜 브로커(MOCK_LOCAL)만 예전처럼 경고 후 계속. 실전 조합은 build_broker에서 이미 거부됨.
@@ -215,7 +219,58 @@ async def run_startup_checks(settings: Settings, broker, app_logger, *, sleep=as
                 f"[STARTUP_RECONCILE] {line}")
         if report.reconcile.issues == []:
             app_logger.info("[STARTUP_RECONCILE] 원장·잔고·메타 일치")
+    if paper_strategy:
+        problems = paper_account_problems(report, state)
+        if problems:
+            from infra.storage.runner_status import request_buy_halt
+            _, req = request_buy_halt(settings.storage.commands_dir, reason="[paper 사전 점검] " + "; ".join(problems),
+                                      by="paper_precheck", now=now_local())
+            app_logger.critical(f"[STARTUP_PAPER] 사전 점검 문제 — 신규 매수 중단({req.get('request_id')}), 매도·손절은 계속: "
+                                + "; ".join(problems))
+        else:
+            app_logger.info(f"[STARTUP_PAPER] 사전 점검 통과 — 허용 종목 {list(settings.swing_strategy.allowed_symbols)}, "
+                            f"1주·최대 보유 1, 일일 손실 한도 {settings.swing_strategy.daily_loss_limit:,}원")
     return report
+
+
+def paper_config_problems(settings: Settings, broker) -> list[str]:
+    """S1 모의 전송(paper) 설정 점검(C3) — 하나라도 있으면 기동 거부. 실전은 build_broker·실행 모드에서 이미 거부."""
+    out: list[str] = []
+    st = settings.swing_strategy
+    try:
+        mode = resolve_execution_mode(settings.broker)
+    except Exception as exc:                              # noqa: BLE001
+        return [f"실행 모드 오류: {exc}"]
+    if mode != KIWOOM_PAPER:
+        out.append(f"실행 모드 {mode} — 키움 모의 서버(KIWOOM_PAPER: mockapi·use_mock false)만")
+    elif not isinstance(broker, PaperKiwoomBroker):
+        out.append("브로커가 모의투자 전용(PaperKiwoomBroker)이 아님")
+    out += [f"계좌 설정: {p}" for p in paper_identity_problems(settings.broker)]
+    if not st.allowed_symbols:
+        out.append("swing_strategy.allowed_symbols 비어 있음 — 허용 종목을 1개 이상 지정")
+    if st.quantity != 1:
+        out.append("수량 1주만")
+    if settings.session.entry_cancel_at in (None, ""):
+        out.append("session.entry_cancel_at(진입 마감·미체결 취소) 없음")
+    return out
+
+
+def paper_account_problems(report, state) -> list[str]:
+    """계좌 사전 점검(C3) — 문제가 있으면 기동은 하되 신규 매수 중단(보유 청산은 계속)."""
+    out: list[str] = []
+    if report.has_unresolved_orders:
+        out.append(f"미해결 주문 흔적 intents={report.unresolved_intent_symbols} journal={report.journal_symbols}")
+    if report.reconcile is not None and any(str(x).startswith("[BLOCK]") for x in report.reconcile.lines()):
+        out.append("원장·잔고·메타 불일치")
+    if report.balance is not None:
+        from app.s1_strategy import STRATEGY_ID
+        metas = state.positions if state is not None else {}
+        foreign = [p.symbol for p in report.balance.positions if p.quantity > 0
+                   and not (p.symbol in metas and metas[p.symbol].strategy_id == STRATEGY_ID
+                            and metas[p.symbol].origin == "ORDER" and metas[p.symbol].stop_price)]
+        if foreign:
+            out.append(f"S1 진입 메타 없는 보유 {foreign} — 사람 확인(자동 청산 안 함)")
+    return out
 
 
 async def async_main(check_only: bool = False):
@@ -361,15 +416,18 @@ def build_session_runner(settings: Settings, broker, app_logger, *, strategy=Non
         quote_source = KiwoomQuoteSource(broker, logger=app_logger)
     session_cfg = build_session_config(settings.session)
     mode = settings.swing_strategy.mode if use_settings_strategy else "off"
-    send_orders, shadow_sink = True, None
+    send_orders, shadow_sink, risk_guard = True, None, None
     if strategy is None and mode != "off":
         if mode == "paper":
-            raise StartupBlockedError("swing_strategy.mode=paper — C3(일일 손실 한도·모의 전송 사전 점검) 전에는 그림자(shadow)만 "
-                                      "허용. settings.yaml swing_strategy.mode를 shadow 또는 off로")
+            problems = paper_config_problems(settings, broker)
+            if problems:
+                raise StartupBlockedError("swing_strategy.mode=paper 기동 거부 — " + "; ".join(problems))
         strategy = build_s1_strategy(settings, broker, calendar, quote_source, session_cfg, candidates=candidates)
-        send_orders, shadow_sink = False, _jsonl_sink(Path(settings.storage.state_file).with_name("shadow_intents.jsonl"))
+        if mode == "shadow":
+            send_orders, shadow_sink = False, _jsonl_sink(Path(settings.storage.state_file).with_name("shadow_intents.jsonl"))
         import dataclasses as _dc
         session_cfg = _dc.replace(session_cfg, max_buy_quantity=settings.swing_strategy.quantity)
+        risk_guard = build_daily_risk_guard(settings, ledger_store, app_logger, enforce=(mode == "paper"))
     runner = SessionRunner(
         broker=broker, executor=executor, state=state, ledger_store=ledger_store,
         recorder=FillRecorder(ledger_store, logger=app_logger,
@@ -387,10 +445,23 @@ def build_session_runner(settings: Settings, broker, app_logger, *, strategy=Non
         meta={"execution_mode": resolve_execution_mode(settings.broker),
               "account_scope": settings.broker.account_scope_id.strip() or "unscoped",
               "code_version": code_version_cached(), "process": process, "strategy_mode": mode},
-        send_orders=send_orders, shadow_sink=shadow_sink,
+        send_orders=send_orders, shadow_sink=shadow_sink, risk_guard=risk_guard,
     )
     runner.summary.strategy_mode = mode
     return runner, executor
+
+
+def build_daily_risk_guard(settings: Settings, ledger_store, app_logger, *, enforce: bool):
+    """C3 일일 위험 한도 — paper는 중단 파일을 씀, shadow는 계산·기록만."""
+    from app.daily_risk import DailyRiskGuard
+    from domain.service.trade_costs import CostProfile
+    from infra.storage.daily_risk import DailyRiskStore, daily_risk_path
+    st = settings.swing_strategy
+    return DailyRiskGuard(
+        store=DailyRiskStore(daily_risk_path(settings.storage.state_file)), ledger_store=ledger_store,
+        evidence_store=FillEvidenceStore(evidence_path(settings.storage.fill_ledger_file), read_only=True),
+        commands_dir=settings.storage.commands_dir, logger=app_logger, limit=st.daily_loss_limit,
+        max_failures=st.max_failed_orders, profile=CostProfile(st.commission_rate, st.sell_tax_rate), enforce=enforce)
 
 
 def _jsonl_sink(path: Path):
@@ -433,7 +504,7 @@ def build_s1_strategy(settings: Settings, broker, calendar, quote_source, sessio
         keys=SignalKeyStore(keys_path(settings.storage.state_file, st.mode)),
         decisions=_jsonl_sink(Path(settings.storage.state_file).with_name("strategy_decisions.jsonl")),
         entry_start=_time(int(hh), int(mm)), entry_end=entry_end, quantity=st.quantity,
-        calendar=calendar, price=price)
+        calendar=calendar, price=price, allowed_symbols=st.allowed_symbols)
 
 
 def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,

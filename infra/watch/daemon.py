@@ -1093,7 +1093,7 @@ class WatchDaemon:
                 row = {"target_day": d.isoformat(), "signal_date": sig.isoformat(), "contract_hash": contract,
                        "scan_run_id": c["run_id"], "scan_at": c["scan_at"], "symbol": c["symbol"], "series_id": sid,
                        "role": role, "window_start": start.isoformat(), "window_end": sig.isoformat(),
-                       "market_basis": "UNCONFIRMED(stk_cd 단축코드·수정주가 — KRX 단독/통합 미실측)"
+                       "market_basis": "KRX(10/13 실측: 단축코드 = KRX 단독, 수정주가)"
                        if role == "STOCK" else "INDEX(ka20006)", "task_key": t["task_key"]}
                 try:
                     rs = rstore.research_series(sid, as_of=scan_at, start=start)

@@ -2037,4 +2037,43 @@ GPT 최소판 순서: 승인 보완(C1) → 손절·시간 청산 → 일일 손
 ### 전달 파일
 - 패치 1개 — 기준 C1 `085683f`(C1 먼저 적용)
 
+## 2026-10-14 — C3: 일일 손실·실패 주문 한도, 공통 비용 계산, paper 사전 점검·전환 (GPT B 검토 C 요청, 기준 C2)
+
+### 배경
+GPT 최소판 마지막 코드 단계: 일일 손실 한도(시작 기준 저장, −10,000원 또는 실패·불명 주문 1건 → 신규 매수 중단 유지, 입출금 무관,
+비용 이중 차감 없음), 실제/추정 비용 공통 함수, 작은 항목 4건, paper 전환 조건.
+
+### 변경 내용
+| 파일 | 내용 |
+|---|---|
+| `domain/service/trade_costs.py` (신규) | 사건 비용: 체결 근거 실제 우선, 없으면 추정(0.35%·0.20% 올림). 최대 나머지 배분(합 보존). 추정 비율 단일 출처 |
+| `domain/risk/daily_loss.py` (신규) | 일일 손익 = 원장 기준(시작 보유×기준가 → 지금 보유×현재가 + 매도 − 매수) − 비용. 현금 미사용 → 입출금 무관 |
+| `infra/storage/daily_risk.py` (신규) | `data/daily_risk.jsonl` DAY_START·ORDER_FAILURE·HALT, 손상 시 예외 |
+| `app/daily_risk.py` (신규) | 폴링마다 계산 → 한도면 `commands/halt.json`(by=daily_risk), 모르면 그 폴링 매수 보류. shadow는 기록만 |
+| `app/session_runner.py` | 한도 연결(BUY만 차단), 미접수·불명 주문 통지, 상태 `daily_risk`, 체결 근거 재확인 목록 재시작 복구 |
+| `app/main.py` | paper 설정 점검(모의 서버·모의 브로커·계좌·허용 종목·수량 1·진입 마감 → 아니면 기동 거부), 계좌 점검(미해결·불일치·S1 메타 없는 보유 → 신규 매수 중단). paper 기동 허용 |
+| `app/s1_strategy.py`, `config/settings.py` | `allowed_symbols`(NOT_ALLOWED), `daily_loss_limit`·`max_failed_orders`·비용 비율 설정 |
+| `infra/reporting/daily_report.py`, `app/reports.py`, `dashboard/data.py` | 공통 비용(당일 비용·비용 후 실현손익, 관리 창 비용 열), 일일 위험 요약, 번들·zip에 daily_risk·전략 판단·신호 키·execution_mode·시장 기준 원문 |
+| `domain/service/fill_recorder.py` | `recover_unconfirmed` — 오늘 근거 없는 사건을 재시작 때 다시 확인 |
+| `infra/watch/daemon.py` | `market_basis` = KRX(10/13 실측) |
+| `test_cost_model.py` | 비용 literal 허용 위치에 `trade_costs.py` 추가(추정 비율 단일 출처) |
+| `docs/m3_c3_daily_risk_paper.md` (신규), `docs/commands.md`, README | 규칙·paper 켜는 법 |
+
+### 테스트 및 검증
+- 새 시험 `test_c3_daily_risk.py` 19건: 비용(추정 올림·실제 우선·배분 합 보존), 일일 손익(입출금 무관·가격 없음), 손실 한도 중단·재시작 유지·손절은 계속,
+  같은 날 재시작 시작 기준 1건, 미접수·응답 불명 1건 중단, 재개해도 그날 매수 없음·다음 날 가능, 기록 손상 보류, 그림자 기록만,
+  paper 설정·계좌 점검, 허용 종목, 근거 재확인 복구, 리포트·번들.
+- 변이 확인 5종(실패 통지 제거·한도 완화·실제 비용 무시·근거 있는 사건 재조회·같은 날 재매수) 각각 검출.
+- 회귀 47/47(`test_broker_order_status.py` 제외 — 통과로 세지 않음), 동등성 18/18, Python 3.14, 관리 창 데스크톱 3/3.
+
+### 변경하지 않은 것
+- S1 진입·E1 청산 규칙, 후보 승인, 주문 경로·안전 한도, 원본 복사 파일, `config/settings.yaml`(모드는 사용자가 바꿈).
+
+### 다음 작업
+- 사용자: paper 전환 결정(허용 종목 1개, `--check-only`로 사전 점검 확인) → 실제 모의 자동매매 관찰.
+- 실제 후보 경로·부분 체결·취소 경합은 아직 미실측.
+
+### 전달 파일
+- 패치 1개 — 기준 C2 `1ea5a47`(C1·C2 먼저 적용)
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

@@ -44,13 +44,14 @@ class S1EntryStrategy:
     def __init__(self, *, mode: str, scope: str, candidates: Callable[[date, datetime], object],
                  quote: Callable[[str], tuple[int | None, int | None]], keys, decisions: Callable[[dict], None],
                  entry_start: time, entry_end: time, quantity: int = 1, calendar=None,
-                 price: Callable[[str], int | None] | None = None) -> None:
+                 price: Callable[[str], int | None] | None = None, allowed_symbols: tuple[str, ...] = ()) -> None:
         if quantity != 1:
             raise ValueError("최소판: 수량 1 고정")
         self.mode, self.scope = mode, scope
         self.candidates, self.quote, self.keys, self.decisions = candidates, quote, keys, decisions
         self.entry_start, self.entry_end, self.quantity = entry_start, entry_end, quantity
         self.calendar = calendar
+        self.allowed = frozenset(allowed_symbols)       # C3: 비어 있으면 제한 없음(그림자). paper는 기동 점검에서 필수
         self.price = price or (lambda sym: quote(sym)[0])
         self.book = None
         self._now: datetime | None = None
@@ -179,6 +180,9 @@ class S1EntryStrategy:
         for c in sorted(self.book.approved, key=lambda a: a.symbol):
             k = self.key(c.signal_id)
             if k in used:
+                continue
+            if self.allowed and c.symbol not in self.allowed:
+                self._note(ctx, c.symbol, "NOT_ALLOWED", {"allowed": sorted(self.allowed)})
                 continue
             if c.symbol in ctx.blocked_symbols or c.symbol in ctx.in_flight_symbols:
                 self._note(ctx, c.symbol, "SKIP_BLOCKED")

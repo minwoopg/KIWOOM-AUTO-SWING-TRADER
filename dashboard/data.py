@@ -501,22 +501,27 @@ def costs(p: Paths, settings) -> Section:
                         "세금": "-" if r is None or r.tax is None else r.tax,
                         "주문번호": e.order_id, "메모": e.note})
     ev_qty = {e.event_id: e.quantity for e in events}
-
-    def _cost(eid: str, qty: int):
-        """사건의 실제 비용을 이 매칭 수량만큼 안분. 근거 없음·값 미확인이면 None."""
-        r = overlay.applied.get(eid)
-        if r is None or r.commission is None or r.tax is None or not ev_qty.get(eid):
-            return None
-        return (r.commission + r.tax) * qty / ev_qty[eid]
+    # C3: 보고서·일일 손실 한도와 같은 비용 함수 — 실제(근거) 우선·없으면 추정, 한 사건을 여러 매칭에 나눌 때 합 보존
+    from domain.service.trade_costs import ACTUAL, CostProfile, event_costs, match_costs
+    st = getattr(settings, "swing_strategy", None) if settings is not None else None
+    prof = CostProfile() if st is None else CostProfile(st.commission_rate, st.sell_tax_rate)
+    actual = {eid: (r.commission, r.tax) for eid, r in overlay.applied.items()}
+    mixed = event_costs(events, actual, prof)
+    only_actual = {k: v for k, v in mixed.items() if v.source == ACTUAL}
+    mc_actual = match_costs(led.realized, only_actual, ev_qty)
+    mc_mixed = match_costs(led.realized, mixed, ev_qty)
 
     real = []
-    for r in led.realized:
-        cb, cs = _cost(r.buy_event_id, r.quantity), _cost(r.sell_event_id, r.quantity)
-        actual = None if cb is None or cs is None else int(round(cb + cs))
+    for r, ca, cm_ in zip(led.realized, mc_actual, mc_mixed):
+        actual_v = None if ca[2] is None else ca[0] + ca[1]
+        mixed_v = None if cm_[2] is None else cm_[0] + cm_[1]
         real.append({"매도일": r.sell_date.isoformat(), "종목": r.symbol, "수량": r.quantity, "매수가": r.buy_price,
                      "매도가": r.sell_price, "손익(비용 전)": r.gross_pnl,
-                     "실제 비용": "미확인" if actual is None else actual,
-                     "손익(실제 비용 후)": "—" if actual is None else r.gross_pnl - actual,
+                     "실제 비용": "미확인" if actual_v is None else actual_v,
+                     "손익(실제 비용 후)": "—" if actual_v is None else r.gross_pnl - actual_v,
+                     "비용(실제 우선·추정)": "—" if mixed_v is None else mixed_v,
+                     "손익(비용 후)": "—" if mixed_v is None else r.gross_pnl - mixed_v,
+                     "비용 출처": {"ACTUAL": "실제", "ESTIMATE": "추정 포함"}.get(cm_[2], "—"),
                      "구분": "추정 포함" if r.is_estimate else "브로커 근거"})
     try:
         from domain.cost_model import load_cost_model
@@ -629,7 +634,11 @@ def download_bundle(p: Paths, day: date, red: Redactor, summary: dict) -> bytes:
         # M3 A2 보완(GPT R3): 보정 가격 재현용 원장 + 체결 근거, 지정가 취소 감사
         for f, name in ((p.fill_ledger, "fill_ledger.jsonl"),
                         (p.fill_ledger.with_name("fill_evidence.jsonl"), "fill_evidence.jsonl"),
-                        (p.state_file.with_name("buy_cancels.jsonl"), "buy_cancels.jsonl")):
+                        (p.state_file.with_name("buy_cancels.jsonl"), "buy_cancels.jsonl"),
+                        # C3: 실행 모드 표식·일일 위험·전략 판단(번들과 같은 재현 범위)
+                        (p.fill_ledger.with_name("execution_mode.json"), "execution_mode.json"),
+                        (p.state_file.with_name("daily_risk.jsonl"), "daily_risk.jsonl"),
+                        (p.state_file.with_name("strategy_decisions.jsonl"), "strategy_decisions.jsonl")):
             if f.exists() and f.is_file():
                 z.writestr(f"data/{name}", red.text(f.read_text(encoding="utf-8", errors="replace")))
     return buf.getvalue()

@@ -16,6 +16,8 @@ from typing import Any
 
 import yaml
 
+from domain.service.trade_costs import PAPER_COMMISSION_RATE, PAPER_SELL_TAX_RATE
+
 ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 
 
@@ -154,11 +156,15 @@ class StrategySettings:
     mode
       off    : NullStrategy
       shadow : S1 후보를 읽어 주문 의도를 만들고 안전 한도 판정까지 한 뒤 **전송하지 않고 기록**(data/shadow_intents.jsonl)
-      paper  : 실제 모의 전송 — C(E1 청산·일일 손실 한도) 전에는 기동 거부
+      paper  : 실제 모의 전송(C3) — 모의 서버(mockapi)·use_mock false·허용 종목 1개 이상일 때만 기동
     watch_dir: 관리자 DB 폴더(daemon.sqlite3·watch_s1.sqlite3·watch_open.sqlite3) — 읽기 전용(mode=ro)으로만 엶
     min_after_close_min: 승인할 스캔의 완성 기준 하한(분). 18:10(160분) 스캔은 잠정 관찰로만 남기고 승인하지 않음
     quantity: 매수 수량(최소판 1주 고정 — 1이 아니면 기동 거부)
     entry_start: 신규 진입 시작(진입 마감은 session.entry_cancel_at)
+    allowed_symbols: 신규 매수 허용 종목(C3). 비어 있으면 shadow는 제한 없음, paper는 기동 거부
+    daily_loss_limit: 일일 손실 한도(원, 양수). 그날 거래 손익(비용 후) ≤ −한도 → 신규 매수 중단(commands/halt.json — 사람이 재개)
+    max_failed_orders: 그날 미접수·응답 불명 주문이 이 수에 닿으면 신규 매수 중단(같은 방식)
+    commission_rate / sell_tax_rate: 체결 근거가 없을 때의 비용 추정(모의 실측 10/13: 0.35%·0.20%)
     """
 
     mode: str = "off"
@@ -167,8 +173,25 @@ class StrategySettings:
     min_after_close_min: int = 300
     quantity: int = 1
     entry_start: str = "09:05"
+    allowed_symbols: tuple[str, ...] = ()
+    daily_loss_limit: int = 10_000
+    max_failed_orders: int = 1
+    commission_rate: float = PAPER_COMMISSION_RATE
+    sell_tax_rate: float = PAPER_SELL_TAX_RATE
 
     def __post_init__(self) -> None:
+        syms = tuple(str(x).strip() for x in (self.allowed_symbols or ()))
+        if any(not (len(x) == 6 and x.isdigit()) for x in syms):
+            raise ValueError(f"swing_strategy.allowed_symbols는 6자리 종목코드 목록 — {self.allowed_symbols!r}")
+        object.__setattr__(self, "allowed_symbols", syms)
+        if type(self.daily_loss_limit) is not int or self.daily_loss_limit <= 0:
+            raise ValueError("swing_strategy.daily_loss_limit는 양의 정수(원)")
+        if type(self.max_failed_orders) is not int or self.max_failed_orders < 1:
+            raise ValueError("swing_strategy.max_failed_orders는 1 이상 정수")
+        for name in ("commission_rate", "sell_tax_rate"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 <= v < 0.05):
+                raise ValueError(f"swing_strategy.{name}는 0 이상 0.05 미만")
         if self.mode not in STRATEGY_MODES:
             raise ValueError(f"swing_strategy.mode={self.mode!r} (허용: {STRATEGY_MODES})")
         if self.id != "s1":

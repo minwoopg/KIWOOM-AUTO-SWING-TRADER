@@ -176,7 +176,11 @@ class SessionRunner:
         meta: dict | None = None,
         send_orders: bool = True,
         shadow_sink: Callable[[dict], None] | None = None,
+        risk_guard=None,
     ) -> None:
+        self.risk_guard = risk_guard          # C3: 일일 손실·실패 주문 한도(app/daily_risk.DailyRiskGuard), None이면 없음
+        self._risk_block: str | None = None
+        self._evidence_recovered = False
         self.broker = broker
         self.executor = executor
         self.state = state
@@ -405,6 +409,12 @@ class SessionRunner:
         balance = self._fetch_balance()
         if balance is None:
             return None
+        if not self._evidence_recovered and hasattr(self.recorder, "recover_unconfirmed"):
+            self._evidence_recovered = True
+            try:
+                self.recorder.recover_unconfirmed(self.ledger_store.load(), now.date(), now)
+            except Exception as exc:                     # noqa: BLE001 — 근거 복구 실패가 실행을 멈추지 않음
+                self.log.warning(f"[FILL_RECORDER] 재시작 복구 실패: {type(exc).__name__}: {exc}")
         ledger, report = self._reconcile_step(balance, now)
         if ledger is None:
             self.executor.save_state()
@@ -422,6 +432,13 @@ class SessionRunner:
             orders_in_flight=bool(in_flight) or self.executor.has_unresolved_orders(),
             in_flight_symbols=in_flight,
         )
+        if self.risk_guard is not None:
+            try:
+                self._risk_block = self.risk_guard.step(now, ctx.trade_date, ctx.positions, balance,
+                                                        self._held_prices(ctx))
+            except Exception as exc:                     # noqa: BLE001 — 모르면 신규 매수 없음
+                self._risk_block = "DAILY_RISK_UNKNOWN"
+                self.log.critical(f"[DAILY_RISK] 확인 실패 — 신규 매수 보류: {type(exc).__name__}: {exc}")
         if allow_orders:
             self._cancel_expired_entries(now)
         if call_strategy_start:
@@ -465,8 +482,22 @@ class SessionRunner:
             status, detail = self._handle_intent_inner(intent, ctx)
         except Exception as exc:
             self._report_intent(intent, "UNKNOWN", f"{type(exc).__name__}: {exc}")
+            self._order_failed(intent, ctx, "UNKNOWN", f"{type(exc).__name__}: {exc}")
             raise
         self._report_intent(intent, status, detail)
+        if status == "UNKNOWN" or status.startswith("NOT_ACCEPTED"):
+            self._order_failed(intent, ctx, status, detail)
+
+    def _order_failed(self, intent: OrderIntent, ctx: TickContext, status: str, detail: str) -> None:
+        if self.risk_guard is None:
+            return
+        try:
+            block = self.risk_guard.on_order_failure(ctx.now, ctx.trade_date, intent, status, detail)
+        except Exception as exc:                          # noqa: BLE001
+            block = "DAILY_RISK_UNKNOWN"
+            self.log.critical(f"[DAILY_RISK] 주문 실패 반영 실패 — 신규 매수 보류: {type(exc).__name__}: {exc}")
+        if block:
+            self._risk_block = block
 
     def _report_intent(self, intent: OrderIntent, status: str, detail: str) -> None:
         hook = getattr(self.strategy, "on_intent_result", None)
@@ -506,6 +537,13 @@ class SessionRunner:
                           f"요청 {self.buy_halt.get('request_id')}")
             self._shadow(intent, ctx, allowed=False, code="BUY_HALTED")
             return "GUARD_REJECTED:BUY_HALTED", ""
+        if intent.side == "BUY" and self._risk_block:
+            # C3: 일일 손실·실패 주문 한도 — 매도·손절은 그대로
+            self.summary.intents_denied += 1
+            self.summary.denied_codes[self._risk_block] = self.summary.denied_codes.get(self._risk_block, 0) + 1
+            self.log.info(f"[GUARD] {intent.symbol} BUY {intent.quantity}주 차단 | {self._risk_block}")
+            self._shadow(intent, ctx, allowed=False, code=self._risk_block)
+            return f"GUARD_REJECTED:{self._risk_block}", ""
         if (intent.side == "BUY" and self.cfg.max_buy_quantity is not None
                 and intent.quantity > self.cfg.max_buy_quantity):
             self.summary.intents_denied += 1
@@ -725,6 +763,7 @@ class SessionRunner:
                                 else "market"}
                                for o in self.recorder.tracked.values()],
             "entry_cancel_at": self.cfg.entry_cancel_at.strftime("%H:%M") if self.cfg.entry_cancel_at else None,
+            "daily_risk": (dict(self.risk_guard.last, block=self._risk_block) if self.risk_guard is not None else None),
             "fill_evidence": self.recorder.evidence_status() if hasattr(self.recorder, "evidence_status") else None,
             "unresolved_symbols": sorted(self.executor.unresolved_symbols()),
             "buy_cancels": [r.to_dict() for r in self.executor.buy_cancels.values()]

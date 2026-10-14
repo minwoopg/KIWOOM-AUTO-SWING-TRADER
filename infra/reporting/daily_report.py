@@ -55,6 +55,8 @@ class ReportInputs:
     # M3 A2 보완: 체결 근거(ka10076) — event_id → (수수료, 세금). 값이 None이면 미확인
     actual_costs: dict[str, tuple] = field(default_factory=dict)
     evidence_notes: list[str] = field(default_factory=list)     # 근거 읽기 실패·충돌·적용 안 함
+    # C3: 근거가 없을 때 비용 추정(일일 손실 한도와 같은 함수 — domain/service/trade_costs). None이면 기본 프로파일
+    cost_profile: object | None = None
 
 
 def _won(v: float | int | None) -> str:
@@ -120,6 +122,22 @@ def build_daily_report(inp: ReportInputs, *, calendar: TradingCalendar, cost_mod
         total = sum(a + b for a, b in full)
         tag = "" if len(full) == len(day_events) else f" (근거 {len(full)}/{len(day_events)}건 — 나머지 미확인)"
         L.append(f"| 당일 실제 비용 (수수료+세금, 체결 근거) | {_won(total) if full else '—'}{tag} |")
+        # C3: 실제 우선·없으면 추정 — 일일 손실 한도와 같은 계산(실제가 있으면 모델 비용을 더하지 않음)
+        from domain.service.trade_costs import ESTIMATE, CostProfile, event_costs, match_costs
+        prof = inp.cost_profile or CostProfile()
+        costs_all = event_costs(events, inp.actual_costs, prof)
+        day_cost = sum(costs_all[e.event_id].amount for e in day_events)
+        n_est = sum(1 for e in day_events if costs_all[e.event_id].source == ESTIMATE)
+        L.append(f"| 당일 비용 (실제 우선·없으면 추정) | {_won(day_cost)}"
+                 f"{f' (추정 {n_est}/{len(day_events)}건)' if n_est else ''} |")
+        if today_matches:
+            mc = match_costs(ledger.realized, costs_all, {e.event_id: e.quantity for e in events})
+            ids = {id(m) for m in today_matches}
+            sel = [(m, c) for m, c in zip(ledger.realized, mc) if id(m) in ids]
+            if all(c[2] is not None for _, c in sel):
+                net = sum(m.gross_pnl - c[0] - c[1] for m, c in sel)
+                est = any(c[2] == ESTIMATE for _, c in sel)
+                L.append(f"| 당일 실현손익 (비용 후 — 실제 우선·없으면 추정) | {_signed(net)}{' (추정 비용 포함)' if est else ''} |")
     L.append("")
     notes = []
     if excluded_after:

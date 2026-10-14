@@ -91,10 +91,11 @@ def generate_daily_report(
         trade_date=trade_date, events=events, metas=state.positions, closes=closes,
         unresolved_intents=sorted(state.unresolved_order_intents), journal_symbols=journal,
         reconcile=reconcile_report, balance_available=balance is not None or reconcile_report is not None,
-        session_lines=session_lines or [], generated_at=datetime.now(), historical=historical,
+        session_lines=(session_lines or []) + _daily_risk_lines(settings, trade_date), generated_at=datetime.now(), historical=historical,
         reconcile_missing_reason=reconcile_missing_reason if reconcile_report is None else "",
         close_check=close_check, close_issues=list(close_issues or []),
         actual_costs=actual_costs, evidence_notes=evidence_notes,
+        cost_profile=_cost_profile(settings),
     ), calendar=calendar, cost_model=cost_model)
     path = write_report(settings.storage.reports_dir, trade_date, text)
     if logger is not None:
@@ -172,6 +173,19 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
                                                   ensure_ascii=False, indent=2) if em.exists() else ""
     except ValueError:
         files["execution_mode.json"] = mask_text(em.read_text(encoding="utf-8", errors="replace"))
+    # C3: 전략 판단·그림자 의도(그날), 일일 위험 기록(그날), 신호 키 전체, 시장 기준 실측 원문(logs/market_basis_*.json)
+    sd = Path(st.state_file).parent
+    files["strategy_decisions.jsonl"] = json_lines(sd / "strategy_decisions.jsonl", day_filter="at")
+    files["shadow_intents.jsonl"] = json_lines(sd / "shadow_intents.jsonl", day_filter="at")
+    files["daily_risk.jsonl"] = json_lines(sd / "daily_risk.jsonl", day_filter="trade_date")
+    for k in sorted(sd.glob("strategy_signal_keys_*.jsonl")):
+        files[k.name] = json_lines(k)
+    for mb in sorted(Path(st.app_log_file).parent.glob("market_basis_*.json")):
+        try:
+            files[f"market_basis/{mb.name}"] = json.dumps(mask_json(json.loads(mb.read_text(encoding="utf-8"))),
+                                                         ensure_ascii=False, indent=1)
+        except ValueError:
+            files[f"market_basis/{mb.name}"] = mask_text(mb.read_text(encoding="utf-8", errors="replace"))
     files["order_status_observations.jsonl"] = json_lines(Path(st.order_status_observation_log_file),
                                                           day_filter="started_at")
     for name, path in (("state.json", st.state_file), ("tracked_order_journal.json", st.tracked_order_journal_file)):
@@ -203,3 +217,32 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
         z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     tmp.replace(zpath)
     return zpath
+
+
+def _cost_profile(settings):
+    """C3: 보고서·일일 손실 한도가 같은 비용 추정 프로파일."""
+    from domain.service.trade_costs import CostProfile
+    st = getattr(settings, "swing_strategy", None)
+    return CostProfile() if st is None else CostProfile(st.commission_rate, st.sell_tax_rate)
+
+
+def _daily_risk_lines(settings, trade_date) -> list[str]:
+    """C3: 그날 일일 위험 기록(시작 기준·실패 주문·중단) 요약. 기록이 없으면 빈 목록."""
+    from infra.storage.daily_risk import DailyRiskStore, daily_risk_path
+    p = daily_risk_path(settings.storage.state_file)
+    if not p.exists():
+        return []
+    try:
+        start, fails, halts = DailyRiskStore(p).day(trade_date.isoformat())
+    except Exception as exc:                               # noqa: BLE001
+        return [f"일일 위험 기록 읽기 실패: {type(exc).__name__}: {exc}"]
+    out = []
+    if start is not None:
+        out.append(f"일일 위험 기준: {start.get('at')} 보유 {start.get('qty') or '없음'} · 시작 평가액 "
+                   f"{start.get('start_equity', 0):,}원 (손익은 원장 기준 — 입출금 무관)")
+    if fails:
+        out.append(f"미접수·응답 불명 주문 {len(fails)}건: " + ", ".join(f"{f['symbol']} {f['side']} {f['status']}" for f in fails[:3]))
+    for h in halts:
+        out.append(f"신규 매수 중단(일일 위험) {h.get('at')}: {h.get('reason')}")
+    return out
+

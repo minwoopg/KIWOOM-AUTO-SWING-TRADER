@@ -69,7 +69,9 @@ check("1-10) 표본 없으면 None", m.positive_rates([])["gross_positive_rate"]
 # 이제 **비용 literal 자체**(0.35 / 0.90 / 0.0035 / 0.009)를
 # 광범위하게 찾고 허용 위치만 제외한다.
 ALLOWED = {"domain/cost_model.py", "config/settings.yaml",
-           "test_cost_model.py"}
+           "test_cost_model.py",
+           # C3: 체결 근거가 없을 때의 사건 비용 추정 비율(모의 실측) 단일 출처 — 연구용 왕복 시나리오와 별개
+           "domain/service/trade_costs.py"}
 COST_LITERAL = re.compile(r"=\s*0\.(35|90|9|0035|009)\b")
 offenders = []
 for p in list(Path(".").rglob("*.py")) + list(Path(".").rglob("*.yaml")):

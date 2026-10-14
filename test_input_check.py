@@ -68,8 +68,8 @@ check("1-1) 08:40 입력 재확인: 후보 005930의 종목·지수(KOSPI 001) �
 check("1-2) 원본 보존: 다시 받은 값은 비교만 — 연구 DB 파일 바이트 그대로, 창은 스캔과 같은 300세션(신호일까지)",
       research_bytes(E0) == before and all(r["window_end"] == "2026-10-07" and r["scan_bars"] == r["fresh_bars"]
                                            and r["scan_digest"] == r["fresh_digest"] for r in rows1))
-check("1-3) 시장 기준은 미확인으로 기록(KRX 단독/통합 미실측) — 보고서에 재확인 결과",
-      all(r["market_basis"].startswith("UNCONFIRMED") for r in rows1 if r["role"] == "STOCK")
+check("1-3) 시장 기준은 KRX(10/13 실측: 단축코드 = KRX 단독)로 기록 — 보고서에 재확인 결과",
+      all(r["market_basis"].startswith("KRX(10/13 실측") for r in rows1 if r["role"] == "STOCK")
       and "개장 전 입력 재확인" in Path(t1["report_path"]).read_text(encoding="utf-8"))
 n14 = len(E0["fake"].calls)
 r14 = d0.tick()

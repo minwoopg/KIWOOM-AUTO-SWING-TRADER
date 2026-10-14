@@ -108,6 +108,29 @@ class FillRecorder:
             "last_error": self.last_evidence_error,
         }
 
+    def recover_unconfirmed(self, events, trade_date: date, now: datetime) -> int:
+        """재시작 복구(C3): 오늘 원장 매수·매도 사건 중 체결 근거가 없는 것을 체결조회 재확인 목록에 다시 올림.
+
+        재시도 목록은 메모리라 재시작하면 사라졌음 — 별도 파일 없이 원장·근거 파일에서 다시 만듦(파일이 원천).
+        체결조회(ka10076)는 당일 주문만 보이므로 오늘 사건만. 근거 파일을 못 읽으면 아무것도 하지 않음."""
+        if self.fill_lookup is None or self.evidence_store is None:
+            return 0
+        try:
+            have = {r.event_id for r in self.evidence_store.load()}
+        except Exception as exc:                       # noqa: BLE001
+            self.last_evidence_error = f"근거 파일 읽기 실패 — 재시작 복구 안 함: {type(exc).__name__}: {exc}"
+            return 0
+        n = 0
+        for ev in events:
+            if (ev.kind in ("BUY", "SELL") and ev.trade_date == trade_date and _norm_oid(ev.order_id)
+                    and ev.event_id not in have and ev.event_id not in self._unconfirmed
+                    and ev.event_id not in self._pending_saves):
+                self._unconfirmed[ev.event_id] = {"event": ev, "attempts": 0, "next_at": now}
+                n += 1
+        if n and self.logger is not None:
+            self.logger.info(f"[FILL_RECORDER] 재시작 복구 — 오늘 체결 근거 없는 사건 {n}건 다시 확인")
+        return n
+
     def _backoff(self, attempts: int, now: datetime):
         from datetime import timedelta
         return now + timedelta(seconds=min(self.BACKOFF_BASE_SEC * 2 ** max(attempts - 1, 0), self.BACKOFF_MAX_SEC))

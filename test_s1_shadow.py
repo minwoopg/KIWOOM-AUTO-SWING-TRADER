@@ -211,8 +211,9 @@ except StartupBlockedError as exc:
 s12 = shadow_settings("off", mode="off")
 r12, _ = build_session_runner(s12, ScriptedBroker(), Mock(), use_settings_strategy=True)
 r13, _ = build_session_runner(s8, ScriptedBroker(), Mock())            # M1 도구 경로(설정 전략 안 씀)
-check("3-6) paper 모드는 C 전에는 기동 거부, off는 NullStrategy, M1 수동 도구 경로는 설정이 shadow여도 전략·그림자 없음(전송 경로 유지)",
-      p11 and "그림자(shadow)만" in p11 and r12.strategy.strategy_id == "null" and r12.send_orders
+check("3-6) paper 모드는 사전 점검 실패(가짜 브로커·허용 종목 없음)면 기동 거부, off는 NullStrategy, "
+      "M1 수동 도구 경로는 설정이 shadow여도 전략·그림자 없음(전송 경로 유지)",
+      p11 and "기동 거부" in p11 and "allowed_symbols" in p11 and r12.strategy.strategy_id == "null" and r12.send_orders
       and r13.strategy.strategy_id == "null" and r13.send_orders)
 
 # 4. C1 승인 보완 (GPT 검토 R1~R4) — 정상 흐름 DB 사본을 바꿔 각 근거를 끊음

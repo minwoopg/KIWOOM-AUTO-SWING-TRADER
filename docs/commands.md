@@ -88,8 +88,15 @@ python -m app.main
 자동 전략 모드는 `config/settings.yaml` 맨 끝에서 정합니다.
 ```yaml
 swing_strategy:
-  mode: shadow        # off(기본) / shadow(기록만) / paper(C 전에는 기동 거부)
+  mode: shadow        # off(기본) / shadow(기록만) / paper(모의 전송 — C3 사전 점검 통과 시)
+  # paper에 필요(C3) — 자세한 내용은 docs/m3_c3_daily_risk_paper.md
+  # allowed_symbols: ["005930"]   # 신규 매수 허용 종목(paper 필수)
+  # daily_loss_limit: 10000       # 기본 10,000원
+  # max_failed_orders: 1          # 기본 1건
 ```
+
+일일 손실·실패 주문 한도로 중단되면 `commands/halt.json`(by=daily_risk)이 생깁니다. 그날은 풀어도 신규 매수가 없고,
+다음 거래일부터 다시 가능 — 원인 확인 뒤 아래 4번 `resume`.
 
 ## 4. 신규 매수 중단 (매도·손절은 계속)
 

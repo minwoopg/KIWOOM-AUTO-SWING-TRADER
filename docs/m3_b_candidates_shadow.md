@@ -57,7 +57,7 @@ swing_strategy:
 
 ## 미실측·남은 것
 
-- 시장 기준: 종목 일봉 `stk_cd`=단축코드가 KRX 단독인지 통합(NXT 포함)인지 미확인 — `input_check.market_basis=UNCONFIRMED`. paper 전환 전에 확인.
+- 시장 기준: 10/13 실측으로 단축코드 = KRX 단독 확인 — C3부터 `input_check.market_basis=KRX(10/13 실측…)`(이전 행은 UNCONFIRMED).
   실측 도구(읽기 전용, ka10081만): `python tools/probe_market_basis.py 005930 --days 5 --out logs\market_basis_<날짜>.json`
   — 단축코드·`_NX`·`_AL`을 받아 날짜별로 같은지 표시(접미사가 이 TR에서 되는지부터 미확인, 오류는 그대로 기록).
 - 실제 후보가 있는 날의 흐름(후보 0건이면 미실측으로 기록 — 조건 완화·가짜 후보 없음).
