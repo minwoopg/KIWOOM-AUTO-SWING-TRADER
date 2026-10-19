@@ -70,6 +70,7 @@ _UPGRADABLE = ("wd1", "wd2", "wd3")
 CLOSE_PREP, OPEN_CHECK, INPUT_CHECK = "CLOSE_PREP", "OPEN_CHECK", "INPUT_CHECK"
 INPUT_CHECK_LEAD_MIN = 20         # 개장 20분 전(일반 08:40) 실행 가능
 INPUT_CHECK_DEADLINE_MIN = 5      # 개장 5분 전(일반 08:55)까지 — 넘으면 MISSED(후보 승인 없음)
+WAIT_SCAN = "WAIT_SCAN"           # D1: 신호일 마감 준비가 아직 끝나지 않음 — 입력 재확인을 끝내지 않고 기다림
 STABLE, INPUT_CHANGED, CHECK_FAILED = "STABLE", "INPUT_CHANGED", "CHECK_FAILED"
 PENDING, RUNNING, COMPLETE, PARTIAL, YIELDED, FAILED, ABORTED, MISSED, SUPERSEDED = (
     "PENDING", "RUNNING", "COMPLETE", "PARTIAL", "YIELDED", "FAILED", "ABORTED", "MISSED", "SUPERSEDED")
@@ -624,7 +625,28 @@ class WatchDaemon:
                 if self._runnable(t, now):
                     out.append(t)
         prio = {OPEN_CHECK: 0, INPUT_CHECK: 1, CLOSE_PREP: 2}
-        return sorted(out, key=lambda t: (prio[t["kind"]], t["trading_day"]))
+        # D1(GPT 10/19): 스캔을 기다리는 입력 재확인은 마감 준비 뒤로 — 기다리는 대상(마감 준비)을 먼저 실행(우선순위 역전 방지)
+        return sorted(out, key=lambda t: (3 if self._waiting_scan(t) else prio[t["kind"]], t["trading_day"]))
+
+    @staticmethod
+    def _waiting_scan(t: dict | None) -> bool:
+        return bool(t) and t["kind"] == INPUT_CHECK and t["status"] == YIELDED \
+            and str(t.get("error") or "").startswith(f"YIELD {WAIT_SCAN}")
+
+    def _scan_pending(self, sig: date) -> str | None:
+        """신호일 sig의 마감 준비(스캔)가 아직 끝날 수 있는지 — 끝나지 않은(DONE 아닌) CLOSE_PREP가 있거나,
+        운영 시작일 이후인데 아직 작업이 없으면 그 사유. 모두 끝났으면(COMPLETE·MISSED·SUPERSEDED) None."""
+        rows = [t for t in self.dstore.tasks(sig.isoformat()) if t["kind"] == CLOSE_PREP]
+        # 끝나지 않았고 다시 실행될 수 있는 것만(재시도 한도를 넘긴 FAILED는 기다려도 끝나지 않음)
+        open_rows = [t for t in rows if t["status"] not in DONE
+                     and (t["status"] in (PENDING, RUNNING) or t.get("next_retry_at"))]
+        if open_rows:
+            r = sorted(open_rows, key=lambda t: t["created_at"])[-1]
+            return f"{r['task_key']} {r['status']}"
+        since = date.fromisoformat(self.dstore.meta("since") or sig.isoformat())
+        if not rows and sig >= since:
+            return f"{CLOSE_PREP}|{sig.isoformat()} 작업 아직 없음"
+        return None
 
     def next_due(self, now: datetime) -> datetime | None:
         """다음에 깨어날 시각(오늘·다음 거래일의 실행 가능 시각, 다시 시도 시각 중 가장 이른 미래)."""
@@ -658,6 +680,8 @@ class WatchDaemon:
         """양보 사유별 다시 실행 가능한 시각 (R2)."""
         if reason.startswith("CALL_BUDGET"):
             return datetime.combine(now.date() + timedelta(days=1), dtime(0))   # 다음 예산 창(요청일 자정)
+        if reason.startswith(WAIT_SCAN):
+            return now + timedelta(seconds=self.s.poll_sec)                     # 선행 마감 준비가 끝나길 기다림(D1)
         if reason.startswith("TIME_BUDGET") or reason.startswith("CLOCK_NOT_SETTLED"):
             return now + timedelta(seconds=self.s.poll_sec)                     # 받은 만큼 저장됨 — 한 번 쉬고 이어서
         return now          # PRIORITY: 계획이 OPEN_CHECK를 먼저 고름 / STOP_REQUESTED: 프로세스가 끝나고 다음 기동 때
@@ -686,6 +710,8 @@ class WatchDaemon:
         if self.budget_reason(INPUT_CHECK, now):
             return False
         t = self.dstore.task(self.input_key(d))
+        if self._waiting_scan(t):
+            return False        # D1: 스캔을 기다리는 확인 때문에 그 스캔(마감 준비)을 양보시키지 않음
         return t is None or self._runnable(t, now)
 
     def yield_reason(self, now: datetime | None = None) -> str | None:
@@ -1044,7 +1070,9 @@ class WatchDaemon:
           종목과 지수가 모두 STABLE일 때만 실행기 후보 승인(app/candidates.py)이 통과. 그 밖은 그날 신규 진입 보류.
         - 시장 기준: 종목 일봉은 단축코드 그대로(ka10081 stk_cd=코드, 수정주가) — KRX 단독인지 통합인지는 **미확인**
           (`market_basis` 기록). 확인 전에는 승인 결과를 실제 전송의 근거로 쓰지 않음(그림자 운영).
-        - 후보가 없으면 조회 없이 COMPLETE(NO_CANDIDATES/NO_SCAN)."""
+        - 후보가 없으면 조회 없이 COMPLETE(NO_CANDIDATES/NO_SCAN). `check_mode`로 조회 생략과 실제 비교를 구분.
+        - D1: 개장 전 스캔이 없는데 신호일 마감 준비가 아직 끝날 수 있으면(기한 전) WAIT_SCAN으로 양보 — poll 뒤 다시,
+          마감 준비보다 뒤 순서·마감 준비를 선점하지 않음. 기한까지 못 하면 MISSED(그날 승인 없음)."""
         from infra.research.collector import spec_of
         from infra.research.kiwoom_rows import to_research_bar
         from infra.research.s1_scanner import SCAN_LOOKBACK_SESSIONS, _bars_digest
@@ -1057,7 +1085,17 @@ class WatchDaemon:
             runs = [r for r in sstore.runs(sig.isoformat()) if r["status"] == "COMPLETE" and r.get("committed_at")
                     and r["committed_at"] < open_s and r["scan_at"] < open_s]
             if not runs:
-                detail.update({"result": "NO_SCAN", "note": f"{sig} 신호 스캔이 개장 전에 저장 완료되지 않음 — 확인할 후보 없음"})
+                # D1(GPT 10/19): 신호일 마감 준비가 아직 끝날 수 있고 기한 전이면 NO_SCAN으로 끝내지 않고 기다림
+                #   (10/16 08:41:09 NO_SCAN COMPLETE → 08:41:26 스캔 완료인데 재확인하지 않은 경로).
+                pending = self._scan_pending(sig)
+                deadline = self.due_times(d)[INPUT_CHECK][1]
+                if pending and self.now() < deadline:
+                    detail.update({"result": WAIT_SCAN, "check_mode": "WAITING_SCAN",
+                                   "note": f"{sig} 신호 스캔 미완료({pending}) — 기한 {_ts(deadline)}까지 기다렸다 다시"})
+                    raise RequestStopped(f"{WAIT_SCAN}({pending})")
+                detail.update({"result": "NO_SCAN", "check_mode": "SKIPPED_NO_SCAN",
+                               "note": f"{sig} 신호 스캔이 개장 전에 저장 완료되지 않음 — 확인할 후보 없음"
+                                       + ("" if pending else " (마감 준비가 끝났거나 없음 — 기다릴 대상 없음)")})
                 return COMPLETE, None
             contract = sorted(runs, key=lambda r: r["committed_at"])[-1]["contract_hash"]
             cset, cands = A5.select_candidates(sstore, rstore, self.cal, d, contract)
@@ -1069,7 +1107,9 @@ class WatchDaemon:
                        "candidate_reason": cset["reason"]})
         if not cands:
             detail["result"] = "NO_CANDIDATES"
+            detail["check_mode"] = "SKIPPED_NO_CANDIDATES"      # 유효한 스캔의 후보 0건 — 조회 없이 정상 완료
             return COMPLETE, contract
+        detail["check_mode"] = "COMPARED"
         cov_start = date(min(self.cal.covered_years), 1, 1)
         collector = ResearchCollector(self.client, rstore, self.cal, after_close=self.s.after_close, log=self.log)
         rows: list[dict] = []
@@ -1275,6 +1315,12 @@ def _current_gate_text(cg) -> str:
             + ("모두 통과" if not ex else "제외(가격 미조회) " + json.dumps(ex, ensure_ascii=False)))
 
 
+_CHECK_MODE_TEXT = {"COMPARED": "실제 비교(입력 창 다시 조회)",
+                    "SKIPPED_NO_CANDIDATES": "조회 생략 — 유효한 스캔의 후보 0건(정상)",
+                    "SKIPPED_NO_SCAN": "조회 생략 — 개장 전 저장된 스캔 없음(승인 근거 없음)",
+                    "WAITING_SCAN": "스캔 대기 중 — 기한 전 다시"}
+
+
 def write_daily_report(dstore: DaemonStore, p: DaemonPaths, day: str) -> str:
     """그날 작업·설정 버전·준비 상태·S1 관찰·개장 확인 요약(관찰 기록 — 체결 아님)."""
     tasks = dstore.tasks(day)
@@ -1303,7 +1349,8 @@ def write_daily_report(dstore: DaemonStore, p: DaemonPaths, day: str) -> str:
             lines += ["", "## 개장 전 입력 재확인",
                       f"- 신호일 {d.get('signal_date')} 계약 {d.get('contract_hash') or '-'} 후보 {d.get('candidates') or []}",
                       f"- 결과 {json.dumps(d.get('result'), ensure_ascii=False)} · 승인 {d.get('approved') or []}",
-                      "- 종목·지수 입력 창을 다시 받아 스캔 당시 값과 비교(연구 DB는 바꾸지 않음). 시장 기준(KRX/통합)은 미실측"]
+                      f"- 방식: {_CHECK_MODE_TEXT.get(d.get('check_mode'), d.get('check_mode') or '기록 없음(D1 이전)')}",
+                      "- 종목·지수 입력 창을 다시 받아 스캔 당시 값과 비교(연구 DB는 바꾸지 않음). 시장 기준: 단축코드 = KRX(10/13 실측)"]
         if t["kind"] == OPEN_CHECK and d:
             lines += ["", "## 개장 확인",
                       f"- 신호일 {d.get('signal_date')} 후보 {d.get('candidate_status')} — {d.get('candidate_reason')}",

@@ -283,8 +283,10 @@ def today_progress(p: Paths, day: date, runner: Section) -> Section:
     else:
         det = json.loads(ic["detail_json"] or "{}")
         res = det.get("result")
+        mode = {"COMPARED": "실제 비교", "SKIPPED_NO_CANDIDATES": "조회 생략(후보 0건)",
+                "SKIPPED_NO_SCAN": "조회 생략(개장 전 스캔 없음)", "WAITING_SCAN": "스캔 대기"}.get(det.get("check_mode"))
         label = (f"{ic['status']} — 승인 {det.get('approved') or []}" if isinstance(res, dict) else
-                 f"{ic['status']} — {res or ic['error'] or ''}")
+                 f"{ic['status']} — {res or ic['error'] or ''}") + (f" · {mode}" if mode else "")
         rows.insert(1, {"단계": "일봉 입력 재확인(08:40)", "상태": label, "시각": ic["finished_at"] or ic["started_at"] or "",
                         "사유": json.dumps(res, ensure_ascii=False) if isinstance(res, dict) else (ic["error"] or ""),
                         "작업": ic["task_key"], "계약": ic["contract_hash"] or ""})
