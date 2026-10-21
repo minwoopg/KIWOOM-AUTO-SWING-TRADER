@@ -260,6 +260,14 @@ def today_progress(p: Paths, day: date, runner: Section) -> Section:
             rows.append({"단계": title, "상태": f"{t['status']} (시도 {t['attempts']}/실패 {t['failures']})",
                          "시각": t["finished_at"] or t["started_at"] or "", "사유": why,
                          "작업": t["task_key"], "계약": t["contract_hash"] or ""})
+        if prep is not None:       # E1: 신호일 스캔의 단계별 건수(순차·시장 조건만으로 제외·독립)
+            f = ((json.loads(prep["detail_json"] or "{}") or {}).get("s1") or {}).get("funnel")
+            if f:
+                from domain.research.s1_funnel import funnel_line
+                rows.append({"단계": "S1 단계별 건수", "상태": f"최종 PASS {f['final']} · 시장만으로 제외 "
+                                                             f"{f['blocked_by_market']}",
+                             "시각": prep["finished_at"] or "", "사유": funnel_line(f),
+                             "작업": prep["task_key"], "계약": prep["contract_hash"] or ""})
         if today_open:
             det = json.loads(today_open["detail_json"] or "{}")
             cs = det.get("candidate_status", "")

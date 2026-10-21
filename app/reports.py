@@ -187,6 +187,16 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
                                                          ensure_ascii=False, indent=1)
         except ValueError:
             files[f"market_basis/{mb.name}"] = mask_text(mb.read_text(encoding="utf-8", errors="replace"))
+    # E1: 관리자 진단 요약 — 그날·전날 관리자 일일 보고서와 최근 S1 스캔 보고서(종목별 탈락 사유). DB 사본 없이도 원인 확인
+    wdir = root / "reports" / "watch"
+    for wd in sorted({day, *[d for d in [_prev_day(day)] if d]}):
+        wp = wdir / "daily" / f"watch_{wd.isoformat()}.md"
+        if wp.exists():
+            files[f"watch/{wp.name}"] = mask_text(wp.read_text(encoding="utf-8", errors="replace"))
+    scans = sorted((wdir / "s1").glob("s1_scan_*.md"), key=lambda x: x.stat().st_mtime)[-2:] \
+        if (wdir / "s1").exists() else []
+    for sp in scans:
+        files[f"watch/s1/{sp.name}"] = mask_text(sp.read_text(encoding="utf-8", errors="replace"))
     files["order_status_observations.jsonl"] = json_lines(Path(st.order_status_observation_log_file),
                                                           day_filter="started_at")
     for name, path in (("state.json", st.state_file), ("tracked_order_journal.json", st.tracked_order_journal_file)):
@@ -246,4 +256,12 @@ def _daily_risk_lines(settings, trade_date) -> list[str]:
     for h in halts:
         out.append(f"신규 매수 중단(일일 위험) {h.get('at')}: {h.get('reason')}")
     return out
+
+
+def _prev_day(day):
+    try:
+        from utils.trading_calendar import TradingCalendar
+        return TradingCalendar.load().previous_trading_day(day)
+    except Exception:                                      # noqa: BLE001 — 달력 밖이면 그날만
+        return None
 

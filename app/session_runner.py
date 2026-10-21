@@ -341,11 +341,19 @@ class SessionRunner:
     def _fetch_balance(self) -> AccountBalance | None:
         try:
             balance = self.broker.get_account_balance()
+            if self._consecutive_balance_failures:
+                # E1: 연속 실패 뒤 복구 시점을 남김(10/21 10:25~10:37 장애는 복구 시각이 로그에 없었음)
+                since = getattr(self, "_balance_fail_since", None)
+                self.log.warning(f"[SESSION] 잔고 조회 복구 — 연속 실패 {self._consecutive_balance_failures}회"
+                                 + (f" ({since:%H:%M:%S}부터)" if since else ""))
+            self._balance_fail_since = None
             self._consecutive_balance_failures = 0
             self.last_balance = balance
             self._last_balance_ok_at = self.clock()
             return balance
         except Exception as exc:
+            if not self._consecutive_balance_failures:
+                self._balance_fail_since = self.clock()
             self._consecutive_balance_failures += 1
             self.summary.balance_failures += 1
             self.last_balance_error = f"{type(exc).__name__}: {exc}"

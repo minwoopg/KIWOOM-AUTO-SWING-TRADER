@@ -70,6 +70,19 @@ python tools/watchlist.py restore
 | `prepare` | 등록 종목 일봉 갱신·준비 상태 판정 |
 | `restore` | 마지막 정상 설정으로 되돌림 |
 
+관찰 확대(E1): 후보 보기(읽기만) → 확인 → 한 번에 추가. 관리자를 멈춘 상태에서 합니다.
+```powershell
+python tools/watchlist.py suggest --kospi 20 --kosdaq 10
+python tools/watchlist.py add-many 000660,035420 --interest --s1
+```
+
+S1 신호 빈도 분석(E1, 조회 전용) — 결과는 `reports\research\s1_frequency_<날짜>.md` · `.csv`
+```powershell
+python tools/research_collect.py backfill --codes 005930,000660 --from 2025-01-01   # 일봉이 모자라면
+python tools/s1_frequency.py --days 250
+Get-Content reports\research\s1_frequency_2026-10-21.md -Encoding UTF8
+```
+
 ## 3. 실행기 (app.main — 작업 스케줄러가 매일 기동)
 
 ```powershell

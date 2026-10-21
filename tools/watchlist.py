@@ -17,6 +17,8 @@
     python tools/watchlist.py prepare                       # 등록 종목 + 국내 지수만 일봉 갱신·준비 상태 판정
     python tools/watchlist.py status
     python tools/watchlist.py history
+    python tools/watchlist.py suggest --kospi 20 --kosdaq 10   # E1: 관찰 확대 후보(읽기만 — 파일·DB 안 바꿈)
+    python tools/watchlist.py add-many 000660,035420 --interest --s1   # E1: 여러 종목을 한 번에(설정 1버전)
 
 - 바꾸는 명령(add·set·enable·disable·holding-close·remove·restore)은 바꾼 결과를 먼저 검증(보유 보호 포함)하고, 틀리면
   파일을 바꾸지 않고 종료 코드 2. 파일을 쓴 뒤 적용이 거부되면 파일을 되돌리고 종료 코드 2(W1b-R2).
@@ -111,6 +113,14 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--version", type=int, help="되돌릴 APPLIED 버전(기본: 사용 중 버전)")
     rj = sub.add_parser("resolve-journal", help="미해결 적용 저널을 격리하고 지금 파일을 적용(파일을 확인한 뒤)")
     rj.add_argument("--keep-file", action="store_true", required=True)
+    sg = sub.add_parser("suggest", help="관찰 확대 후보(종목 목록 스냅숏, 시가총액 순) — 읽기만")
+    sg.add_argument("--kospi", type=int, default=20)
+    sg.add_argument("--kosdaq", type=int, default=10)
+    am = sub.add_parser("add-many", help="여러 종목 추가(한 번에 적용·이력 1건) 뒤 과거 일봉 준비")
+    am.add_argument("codes", help="쉼표로 구분한 종목코드")
+    am.add_argument("--interest", action="store_true")
+    am.add_argument("--s1", action="store_true")
+    am.add_argument("--no-fetch", action="store_true")
     pr = sub.add_parser("prepare")
     pr.add_argument("--codes", help="쉼표로 구분한 등록 종목만 조회(상태 판정은 전체)")
     pr.add_argument("--no-list-refresh", action="store_true", help="오늘 종목 목록을 다시 받지 않음")
@@ -381,6 +391,69 @@ def _n(v) -> str:
     return "-" if v is None else f"{v:,}"
 
 
+def _suggest(args, rstore, cfg_path: Path, snap_id) -> int:
+    """관찰 확대 후보(E1) — 최신 종목 목록 스냅숏에서 보통주·수집 대상·지금 진입 자격·위험 표시 없음, 시가총액(상장주식수 ×
+    현재가) 큰 순으로 KOSPI·KOSDAQ 각각. 이미 설정에 있는 종목은 뺌. 거래대금(20일 평균 30억 이상)은 S1이 따로 판정.
+    읽기만 — 설정 파일·DB를 바꾸지 않음. 사람이 확인한 뒤 add-many."""
+    if snap_id is None:
+        print("[중단] 종목 목록 스냅숏 없음 — prepare 먼저")
+        return 2
+    snap = rstore.latest_snapshot()
+    text, _ = read_config_text(cfg_path)
+    have = set()
+    if text:
+        raw, perr = parse_text(text)
+        if not perr and isinstance(raw, dict):
+            have = {_code(str(x.get("code", ""))) for x in (raw.get("symbols") or []) if isinstance(x, dict)}
+    rows = [r for r in rstore.snapshot_rows(snap["snapshot_id"], collect_only=True)
+            if r["security_type"] == "COMMON" and r["eligible_now"] and not r["risk_flags"]
+            and r["list_count"] and r["last_price"] and r["code"] not in have]
+    out = []
+    for market, n in (("KOSPI", args.kospi), ("KOSDAQ", args.kosdaq)):
+        pick = sorted((r for r in rows if r["market"] == market), key=lambda r: -(r["list_count"] * r["last_price"]))[:n]
+        out += pick
+        print(f"\n## {market} 상위 {len(pick)} (스냅숏 {snap['snapshot_id']} · {snap['observed_at']} · 기존 {len(have)}종목 제외)")
+        print("| 순위 | 코드 | 이름 | 현재가 | 시가총액(억) |")
+        print("|---:|---|---|---:|---:|")
+        for i, r in enumerate(pick, 1):
+            print(f"| {i} | {r['code']} | {r['name']} | {r['last_price']:,} | {r['list_count'] * r['last_price'] // 100_000_000:,} |")
+    print(f"\n확인 뒤 추가(관심·S1, 설정 1버전, 과거 일봉 준비):\npython tools/watchlist.py add-many "
+          f"{','.join(r['code'] for r in out)} --interest --s1")
+    return 0
+
+
+def _add_many(args, codes, cfg_path, wstore, listing, snap_id, now) -> tuple[int, object]:
+    text0, rerr = read_config_text(cfg_path)
+    if rerr:
+        print(f"[중단] 지금 파일을 읽을 수 없음 — 고친 뒤 apply: {rerr}")
+        return 2, None
+    doc = empty_document()
+    if text0 is not None:
+        raw, perr = parse_text(text0)
+        if perr:
+            print(f"[중단] 지금 파일을 읽을 수 없음 — 직접 고친 뒤 apply: {perr}")
+            return 2, None
+        doc = raw if isinstance(raw, dict) else empty_document()
+    try:
+        for c in codes:
+            ns = argparse.Namespace(cmd="add", code=c, name=None, memo=None, interest=True, s1=args.s1, band=[],
+                                    holding=False, qty=None, avg=None, stop=None, target=None)
+            edit_document(doc, ns)
+    except EditError as exc:
+        print(f"[거부] {exc} — 아무것도 바꾸지 않음")
+        return 2, None
+    r = commit_config_text(wstore, cfg_path, dump_document(doc), listing, snap_id, now=now,
+                           origin=f"CLI:add-many {len(codes)}", lock_timeout=args.lock_timeout)
+    _report_commit(r)
+    if r.code:
+        return r.code, None
+    att = r.att or {"version": "?", "status": "APPLIED", "warnings": []}
+    print(f"add-many {len(codes)}종목 → v{att['version']} {att['status']}")
+    _print_issues([], att.get("warnings", []))
+    state = r.state if r.state is not None else load_state(wstore)
+    return 0, (None if args.no_fetch else state)
+
+
 def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar: TradingCalendar | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg_path = Path(args.config)
@@ -436,6 +509,9 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                       f" 목록={h['list_snapshot_id']}" + (f" 오류 {len(h['errors'])}" if h["errors"] else ""))
             return 0
 
+        if args.cmd == "suggest":
+            return _suggest(args, rstore, cfg_path, snap_id)
+
         if client is None:
             client = _LazyClient(lambda: make_client(args))
         collector = ResearchCollector(client, rstore, calendar, after_close=after_close, log=print)
@@ -459,6 +535,32 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
             r = next(x for x in res2["rows"] if x["code"] == _code(args.code) and x["kind"] == "STOCK")
             print(f"데이터: {_ready_cell(r)} (준비 실행 {res2['run_id']}, 조회 {res2['calls']}회)")
             return 0
+
+        if args.cmd == "add-many":
+            codes = [_code(c) for c in args.codes.split(",") if c.strip()]
+            if not codes or len(set(codes)) != len(codes):
+                print("[거부] 종목코드 목록이 비었거나 중복")
+                return 2
+            if not args.interest:
+                print("[거부] add-many는 관심 감시 추가용 — --interest 필요(보유는 add --holding으로 하나씩)")
+                return 2
+            try:
+                with config_lock(wstore, timeout=args.lock_timeout):
+                    code_, fetch_state = _add_many(args, codes, cfg_path, wstore, listing, snap_id, now)
+            except ConfigLockTimeout as exc:
+                print(f"[잠금] {exc}")
+                return 2
+            if fetch_state is None:
+                return code_
+            try:
+                res2 = prepare_data(wstore, rstore, collector, calendar, fetch_state, listing, now=now,
+                                    codes=codes, after_close=after_close, log=print)
+            except (ResearchConfigError, ResearchApiError, CollectError) as exc:
+                print(f"[과거 일봉 수집 못 함 — 설정은 적용됨, 나중에 prepare] {exc}")
+                return 1
+            print_json({k: v for k, v in res2.items() if k != "rows"})
+            _status_table(fetch_state, wstore, listing, snap_id)
+            return 0 if res2["status"] == "COMPLETE" else 1
 
         if args.cmd == "resolve-journal":
             try:

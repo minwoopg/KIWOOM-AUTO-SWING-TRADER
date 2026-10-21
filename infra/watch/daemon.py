@@ -504,7 +504,8 @@ class WatchDaemon:
         for k in aborted:
             self.log(f"[관리자] 중단된 작업 {k} → ABORTED, 다시 시도 대상")
         up = self.dstore.meta("upgraded_from")
-        if up:
+        if up and self.dstore.meta("upgrade_logged") != up:
+            self.dstore.set_meta("upgrade_logged", up)     # E1: 실제로 올린 뒤 첫 기동에만 출력(매 기동 반복 안 함)
             self.log(f"[관리자] 관리자 DB {up} → {DAEMON_SCHEMA} (기존 작업 보존 — 이전 형식 CLOSE_PREP 키는 새 범위 키로 "
                      "한 번 다시 실행될 수 있음, 게이트 근거 없는 이전 후보는 유효로 보지 않음)")
         self.log(f"[관리자] 시작 {self.run_id} (since {self.dstore.meta('since')}) — 설정 poll {self.s.poll_sec:.0f}초·"
@@ -1040,6 +1041,14 @@ class WatchDaemon:
                                 "actionable": bool(run["context"].get("next_open")
                                                    and run["context"]["scan_at"] < run["context"]["next_open"])
                                 if run else None}
+                if run is not None:
+                    try:     # E1: 단계별 건수(순차·독립·시장 조건만으로 제외) — 보고서·관리 창용, 판정에 쓰지 않음
+                        from domain.research.s1_funnel import funnel
+                        f = funnel(sstore.evals(run["run_id"]))
+                        f["fail_checks"] = dict(list(f["fail_checks"].items())[:8])
+                        detail["s1"]["funnel"] = f
+                    except Exception as exc:                    # noqa: BLE001
+                        detail["s1"]["funnel_error"] = f"{type(exc).__name__}: {exc}"
                 if run is not None and res["status"] == "COMPLETE":
                     # 계산 PASS(관찰 DB)와 운영 진입 자격(관리자 DB candidate_gate)을 따로 저장 (R1)
                     detail["s1"]["gate"] = self._record_scan_gates(run, contract, s1_codes, wstore, state, snap_id,
@@ -1315,6 +1324,12 @@ def _current_gate_text(cg) -> str:
             + ("모두 통과" if not ex else "제외(가격 미조회) " + json.dumps(ex, ensure_ascii=False)))
 
 
+def _funnel_text(f: dict) -> str:
+    from domain.research.s1_funnel import funnel_line
+    fc = ", ".join(f"{k} {v}" for k, v in list((f.get("fail_checks") or {}).items())[:6])
+    return funnel_line(f) + (f" · 주요 탈락 {fc}" if fc else "")
+
+
 _CHECK_MODE_TEXT = {"COMPARED": "실제 비교(입력 창 다시 조회)",
                     "SKIPPED_NO_CANDIDATES": "조회 생략 — 유효한 스캔의 후보 0건(정상)",
                     "SKIPPED_NO_SCAN": "조회 생략 — 개장 전 저장된 스캔 없음(승인 근거 없음)",
@@ -1344,7 +1359,9 @@ def write_daily_report(dstore: DaemonStore, p: DaemonPaths, day: str) -> str:
                       f"- 운영 진입 게이트(설정 v{d.get('config_version')}): "
                       + (f"통과 {(s1.get('gate') or {}).get('eligible')} · 제외 "
                          f"{json.dumps((s1.get('gate') or {}).get('blocked'), ensure_ascii=False)}"
-                         if s1.get("gate") else "기록 없음") + " — 계산 PASS라도 게이트 제외면 개장 후보 아님"]
+                         if s1.get("gate") else "기록 없음") + " — 계산 PASS라도 게이트 제외면 개장 후보 아님",
+                      "- 단계별 건수: " + (_funnel_text(s1["funnel"]) if s1.get("funnel") else "기록 없음(E1 이전)"),
+                      "  (순차 = 앞 단계를 통과한 것만 셈, 독립 = 데이터 준비된 것 중 그 조건만 본 수)"]
         if t["kind"] == INPUT_CHECK and d:
             lines += ["", "## 개장 전 입력 재확인",
                       f"- 신호일 {d.get('signal_date')} 계약 {d.get('contract_hash') or '-'} 후보 {d.get('candidates') or []}",
