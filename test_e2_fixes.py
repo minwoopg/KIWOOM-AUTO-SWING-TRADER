@@ -104,6 +104,28 @@ check("4-1) 과거 날짜(10/20) 번들: 그날·전 거래일 신호일(10/19·
       "watch/s1/s1_scan_2026-10-19_a.md" in names and "watch/s1/s1_scan_2026-10-20_b.md" in names
       and "watch/s1/s1_scan_2026-10-21_c.md" not in names)
 
+# 5. E3 통합 — 그룹·기간 비교, 결과 측정 도구(같은 연구 DB, 읽기 전용)
+import tools.s1_outcome as SO  # noqa: E402
+gout = TMP / "grp"
+with contextlib.redirect_stdout(io.StringIO()):
+    gr = SF.main(["--db", str(rdb), "--group", "a=005930", "--group", "b=005930,000660", "--days", "5", "--end",
+                  "2026-10-07", "--recent-from", "2026-10-06", "--out-dir", str(gout)])
+gmd = next(gout.glob("*.md")).read_text(encoding="utf-8")
+check("5-1) 그룹·기간 비교: 그룹 a·b × 전체·최근 4줄, 월별 표(그룹별), 눌림 세부 사유, 중복 탈락 주의 문구, 실행 ID",
+      gr == 0 and gmd.count("| a | ") == 2 and gmd.count("| b | ") == 2 and "### a (1종목)" in gmd
+      and "눌림(PULLBACK) 실패 세부 사유" in gmd and "중복" in gmd and "실행 ID" in gmd)
+oout = TMP / "out"
+b = io.StringIO()
+with contextlib.redirect_stdout(b):
+    orc = SO.main(["--db", str(rdb), "--codes", "005930,000660", "--days", "5", "--end", "2026-10-07",
+                   "--out-dir", str(oout)])
+omd = next(oout.glob("*.md")).read_text(encoding="utf-8")
+ocsv = next(oout.glob("*.csv")).read_text(encoding="utf-8-sig")
+check("5-2) 결과 측정 도구: 10/7 005930 신호 1건 → 진입일 없음(데이터 끝 — 다음 날 봉 없음)으로 분류, 보고서에 '운영 체결 재현이 아님'·"
+      "처리 기준, CSV 행, 연구 DB 바이트 그대로",
+      orc == 0 and "운영 체결 재현이 아님" in omd and "처리 기준" in omd and "2026-10-07,005930" in ocsv
+      and hashlib.sha256(rdb.read_bytes()).hexdigest() == h0)
+
 shutil.rmtree(TMP, ignore_errors=True)
 passed = sum(1 for _, ok in results if ok)
 print(f"\n총 {len(results)}건 중 통과 {passed}건, 실패 {len(results) - passed}건")

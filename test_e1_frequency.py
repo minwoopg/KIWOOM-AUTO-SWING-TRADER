@@ -91,8 +91,8 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     rc = SF.main(["--db", str(rdb), "--codes", "005930,000660,999999", "--days", "5", "--end", "2026-10-07",
                   "--out-dir", str(out_dir)])
-md = (out_dir / "s1_frequency_2026-10-07.md").read_text(encoding="utf-8")
-csv_text = (out_dir / "s1_frequency_2026-10-07.csv").read_text(encoding="utf-8-sig")
+md = next(out_dir.glob("s1_frequency_2026-10-07_*.md")).read_text(encoding="utf-8")
+csv_text = next(out_dir.glob("s1_frequency_2026-10-07_*.csv")).read_text(encoding="utf-8-sig")
 with D.DaemonStore(E["paths"].daemon_db) as ds:
     pass
 from infra.research.scan_store import ScanStore  # noqa: E402

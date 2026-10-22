@@ -417,6 +417,8 @@ def _suggest(args, rstore, cfg_path: Path, snap_id) -> int:
         print("|---:|---|---|---:|---:|")
         for i, r in enumerate(pick, 1):
             print(f"| {i} | {r['code']} | {r['name']} | {r['last_price']:,} | {r['list_count'] * r['last_price'] // 100_000_000:,} |")
+    print(f"\n기존 {len(have)}종목 + 추가 후보 {len(out)}종목 = 총 {len(have) + len(out)}종목 "
+          f"(--kospi·--kosdaq은 기존을 뺀 **추가** 수)")
     print(f"\n확인 뒤 추가(관심·S1, 설정 1버전, 과거 일봉 준비):\npython tools/watchlist.py add-many "
           f"{','.join(r['code'] for r in out)} --interest --s1")
     return 0

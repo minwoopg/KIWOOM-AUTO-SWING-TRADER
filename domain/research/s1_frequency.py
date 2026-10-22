@@ -14,6 +14,8 @@ from __future__ import annotations
 | NO_TREND | 추세 조건(C_GT_MA120·MA60_RISING)만 뺌 |
 | PULLBACK_2_15 | 눌림 허용 2~15일(기본 2~10) — S1 다시 계산 |
 
+가격 열(stop_ref·entry_cap·pullback_days)은 **BASE(운영 S1) 계산값**이며 변형별 값이 아님(E3).
+
 한계(보고서에 표시): 현재 저장된 수정주가 기준(그날 실제로 보였던 값이 아님), 종목 자격은 최근 종목 목록 기준(과거 관리·경고
 상태 아님), 진입·청산·수익은 계산하지 않음(신호 수만).
 """
@@ -104,7 +106,9 @@ def analyze(dates: list[date], sessions_for: callable, stocks: dict[str, dict], 
                              "data_status": "OK" if hist and hist["result"] == PASS else "SHORT_HISTORY",
                              **{g: res[g] for g in ("pattern_pass", "eligibility_pass", "market_pass", "stop_valid",
                                                     "eligible_signal")},
-                             "checks": [{"name": c["name"], "result": c["result"]} for c in res["checks"]],
+                             "checks": [{"name": c["name"], "result": c["result"],
+                                         **({"detail": c.get("detail") or ""} if c["result"] != PASS else {})}
+                                        for c in res["checks"]],
                              "variants": variants_of(res, res15),
                              "market_state": (res.get("market") or {}).get("state"),
                              "stop_ref": (res.get("levels") or {}).get("stop_ref"),
