@@ -22,7 +22,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Iterable
 
-from domain.research.market import MIXED, RISK_ON
+from domain.research.market import MIXED, RISK_ON, classify_market
 from domain.research.s1 import Eligibility, S1Config, evaluate_s1
 from domain.research.series import SeriesView
 
@@ -82,7 +82,8 @@ def analyze(dates: list[date], sessions_for: callable, stocks: dict[str, dict], 
     for t in dates:
         sess = sessions_for(t)
         iviews = {iid: SeriesView(b, sess, t, source_id=iid) for iid, b in indexes.items()}
-        reg = {}
+        # E2(GPT 10/22): 시장 판정 분포는 종목 구성과 무관하게 지수마다 날짜별로 직접 계산
+        reg = {iid: classify_market(v).state for iid, v in iviews.items()}
         for code, s in stocks.items():
             iv = iviews.get(s["index_id"])
             if iv is None:
@@ -98,14 +99,14 @@ def analyze(dates: list[date], sessions_for: callable, stocks: dict[str, dict], 
                 continue
             res = evaluate_s1(code, view, iv, None, s["eligibility"], cfg).to_dict()
             res15 = evaluate_s1(code, view, iv, None, s["eligibility"], cfg15).to_dict()
-            reg[s["index_id"]] = (res.get("market") or {}).get("state")
             hist = next((c for c in res["checks"] if c["name"] == "HISTORY"), None)
             out.rows.append({"date": t.isoformat(), "code": code,
                              "data_status": "OK" if hist and hist["result"] == PASS else "SHORT_HISTORY",
                              **{g: res[g] for g in ("pattern_pass", "eligibility_pass", "market_pass", "stop_valid",
                                                     "eligible_signal")},
                              "checks": [{"name": c["name"], "result": c["result"]} for c in res["checks"]],
-                             "variants": variants_of(res, res15), "market_state": reg[s["index_id"]],
+                             "variants": variants_of(res, res15),
+                             "market_state": (res.get("market") or {}).get("state"),
                              "stop_ref": (res.get("levels") or {}).get("stop_ref"),
                              "entry_cap": (res.get("levels") or {}).get("entry_cap"),
                              "pullback_days": (res.get("pullback") or {}).get("pullback_len")})

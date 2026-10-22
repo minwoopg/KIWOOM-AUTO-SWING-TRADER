@@ -193,7 +193,9 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
         wp = wdir / "daily" / f"watch_{wd.isoformat()}.md"
         if wp.exists():
             files[f"watch/{wp.name}"] = mask_text(wp.read_text(encoding="utf-8", errors="replace"))
-    scans = sorted((wdir / "s1").glob("s1_scan_*.md"), key=lambda x: x.stat().st_mtime)[-2:] \
+    # E2(GPT 10/22): 파일 수정 시각이 아니라 그 번들 날짜에 연결된 신호일(전 거래일·그날)의 스캔 보고서만
+    sig_days = sorted({d.isoformat() for d in (day, _prev_day(day)) if d})
+    scans = sorted(p for sd in sig_days for p in (wdir / "s1").glob(f"s1_scan_{sd}_*.md")) \
         if (wdir / "s1").exists() else []
     for sp in scans:
         files[f"watch/s1/{sp.name}"] = mask_text(sp.read_text(encoding="utf-8", errors="replace"))

@@ -467,6 +467,14 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
         print(f"만듦: {cfg_path} (종목 없음 — add로 추가)")
         return 0
 
+    if args.cmd == "suggest":
+        # E2(GPT 10/22): 진짜 읽기 전용 — 연구 DB만 mode=ro, 감시 DB는 열지 않음(없으면 만들지 않음·스키마 안 올림)
+        if not Path(args.db).exists():
+            print(f"[중단] 연구 DB 없음: {args.db} — prepare 먼저(아무것도 만들지 않음)")
+            return 2
+        with ResearchStore(args.db, readonly=True) as rstore:
+            return _suggest(args, rstore, cfg_path, listing_from_store(rstore)[1])
+
     calendar = calendar or TradingCalendar.load()
     with ResearchStore(args.db) as rstore, WatchStore(args.watch_db) as wstore:
         if wstore.backup_path:
@@ -508,9 +516,6 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                 print(f"v{h['version']} {h['attempted_at']} {h['status']} {h['origin']} hash={h['config_hash']}"
                       f" 목록={h['list_snapshot_id']}" + (f" 오류 {len(h['errors'])}" if h["errors"] else ""))
             return 0
-
-        if args.cmd == "suggest":
-            return _suggest(args, rstore, cfg_path, snap_id)
 
         if client is None:
             client = _LazyClient(lambda: make_client(args))

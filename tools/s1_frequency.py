@@ -148,6 +148,8 @@ def main(argv=None) -> int:
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     md = out / f"s1_frequency_{end.isoformat()}.md"
+    if md.exists():          # E2: 같은 끝날짜로 다시 돌려도 이전 결과를 덮어쓰지 않음(비교 보존)
+        md = out / f"s1_frequency_{end.isoformat()}_{datetime.now():%Y%m%d_%H%M%S}_{len(stocks)}sym.md"
     md.write_text(render(res, f_base, stocks, missing, dates, args, snap), encoding="utf-8")
     cp = md.with_suffix(".csv")
     with cp.open("w", encoding="utf-8-sig", newline="") as fh:
