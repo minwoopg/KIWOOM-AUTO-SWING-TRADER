@@ -7,7 +7,8 @@ from __future__ import annotations
     python -m app.main                 # 기동 점검 → 하루 수명주기(app/session_runner.py) → 마감 후 종료
     python -m app.main --check-only    # 기동 점검만 하고 종료 (이전 라운드 동작)
 
-전략 자리는 비어 있습니다(NullStrategy — 주문을 내지 않음).
+전략은 `swing_strategy.mode`로 정합니다: off(NullStrategy — 주문 없음) / shadow(S1 기록만) / paper(S1 모의주문).
+시작 화면 문구도 이 설정을 그대로 보여줍니다(`strategy_banner`).
 
 기동 점검 순서 (단타 레포 `app/main.py`(bdde6c2)에서 매매 로직과 무관한 부분):
 
@@ -273,6 +274,20 @@ def paper_account_problems(report, state) -> list[str]:
     return out
 
 
+def strategy_banner(settings: Settings, check_only: bool = False) -> str:
+    """시작 화면·시작 알림의 전략 문구 — 설정의 swing_strategy.mode를 그대로 보여줌(F1, 10/27: 고정 문구 'NullStrategy' 오해)."""
+    if check_only:
+        return "기반 점검 모드"
+    st = getattr(settings, "swing_strategy", None)
+    mode = getattr(st, "mode", "off") if st is not None else "off"
+    if mode == "paper":
+        syms = ",".join(str(x) for x in st.allowed_symbols) or "없음"
+        return f"하루 수명주기 (전략: S1 모의주문 paper · 허용 종목 {syms} · {st.quantity}주)"
+    if mode == "shadow":
+        return "하루 수명주기 (전략: S1 shadow — 주문 안 냄, 기록만)"
+    return "하루 수명주기 (전략: 없음 off — 주문 안 냄)"
+
+
 async def async_main(check_only: bool = False):
     load_dotenv()
     settings = load_settings()
@@ -288,7 +303,7 @@ async def _run_application(settings: Settings, check_only: bool = False):
 
     app_logger = build_app_logger(settings.storage.app_log_file, settings.app.log_level)
     print("=" * 50)
-    print("  스윙 자동매매 — " + ("기반 점검 모드" if check_only else "하루 수명주기 (전략: NullStrategy)"))
+    print("  스윙 자동매매 — " + strategy_banner(settings, check_only))
     print(f"  app.log: {settings.storage.app_log_file}")
     print("=" * 50)
 
@@ -302,7 +317,7 @@ async def _run_application(settings: Settings, check_only: bool = False):
     send_startup_notification_async(
         notifier, app_logger, report.mode, now_local().strftime("%H:%M"), None,
         title=STARTUP_TITLE,
-        watch_line="기반 점검 모드" if check_only else "하루 수명주기 시작 (전략 없음)",
+        watch_line=strategy_banner(settings, check_only),
     )
 
     # 매매 루프가 없어 곧바로 종료되므로, 백그라운드 알림 스레드(daemon)가
