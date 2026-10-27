@@ -23,6 +23,7 @@ from __future__ import annotations
   · 그 종목 마지막 봉 이후 세션은 공백이 아니라 데이터 끝 → 그때까지 청산 안 되면 OPEN_AT_END.
   · 진입일: 봉 없음 = ENTRY_DATA_GAP, 거래량 0 = ENTRY_NO_TRADES, 그 종목 데이터가 신호일에서 끝남 = NO_NEXT_DAY.
 - 데이터 끝까지 청산되지 않으면 OPEN_AT_END(마지막 종가 평가, 손익 통계에서 따로).
+- 진입 방식(E4 — 사용자 10/27): entry_mode="close"는 신호일 종가 진입 근사(마감 직전 매수) — `_simulate_close`.
 - 손절 거리(G4): 진입 가정가 기준 (진입 − 손절 기준)/진입, 상한(지정가) 기준 (지정가 − 손절 기준)/지정가를 따로 기록.
   예상 손실액 = (진입 − 손절 기준) × 수량 + 예상 비용(매수 + 손절가 매도). 운영 S1의 risk_ratio_at_cap은 상한 기준.
 - 비용: 호출부가 넘기는 비용 함수(도구는 `domain/service/trade_costs` 추정 — 수수료·매도세 비율, 원 단위 올림. 연구 계층은
@@ -63,6 +64,8 @@ class OutcomeParams:
     quantity: int = 1
     cost_fn: Callable[[str, int, int], int] | None = None    # (BUY/SELL, 수량, 원 단위 가격) → 비용(원). None이면 0
     cost_label: str = "비용 0(비용 함수 없음)"
+    entry_mode: str = "open"          # E4: open = 다음 거래일 시가(현재 운영) / close = 신호일 종가(마감 직전 진입 근사)
+    close_entry_slip_bps: float = 10.0  # E4: 종가 진입은 마감 직전 매수 — 종가보다 불리한 쪽으로(상한 제한 없음)
 
 
 def _won(x: float) -> int:
@@ -85,6 +88,8 @@ def simulate(sig: dict, days: list[date], bars: dict[date, object], p: OutcomePa
         out["status"] = INVALID_LEVELS
         return out
     out["stop_dist_cap_pct"] = (limit - stop) / limit * 100
+    if p.entry_mode == "close":
+        return _simulate_close(sig, t, days, bars, p, out, stop)
     last_bar = max(bars) if bars else None
     after = [d for d in days if d > t and last_bar is not None and d <= last_bar]   # 마지막 봉 이후 = 데이터 끝
     if not after:
@@ -142,6 +147,68 @@ def simulate(sig: dict, days: list[date], bars: dict[date, object], p: OutcomePa
                 "hold_sessions": after.index(exit_day)})
     out.update(_pnl(entry, exit_px, p, realized=True))
     return out
+
+
+def _simulate_close(sig: dict, t: date, days: list[date], bars: dict, p: OutcomeParams, out: dict, stop: int) -> dict:
+    """E4(사용자 10/27): 신호일 종가 진입 근사 — 마감 직전(15:10~15:20) 매수를 그날 종가 × (1 + 슬리피지)로.
+    가정: 마감 직전 가격 ≈ 종가, 그 시점의 잠정 판정 = 종가 기준 최종 판정(실제로는 뒤집힐 수 있음 — 따로 측정 필요).
+    진입일 = 신호일(0일), 다음 거래일부터 손절(갭·장중), 진입일 0일 기준 10번째 거래일 종가 시간 청산.
+    진입 상한(지정가)은 적용하지 않음(다음 날 시가 상한 초과로 못 사는 문제를 없애는 방식이라) — 대신 종가 ≤ 손절 기준이면 미진입."""
+    out["entry_mode"] = "close"
+    b0 = bars.get(t)
+    if b0 is None:
+        out.update({"status": ENTRY_DATA_GAP, "entry_date": t.isoformat()})
+        return out
+    if not b0.volume:
+        out.update({"status": ENTRY_NO_TRADES, "entry_date": t.isoformat()})
+        return out
+    if b0.close <= stop:
+        out.update({"status": NOT_ENTERED_AT_OR_BELOW_STOP, "entry_date": t.isoformat(), "open": b0.close})
+        return out
+    entry = b0.close * (1 + p.close_entry_slip_bps / 10_000)
+    out.update({"status": ENTERED, "entry_date": t.isoformat(), "entry": entry, **_risk(entry, stop, p)})
+    last_bar = max(bars)
+    after = [d for d in days if t < d <= last_bar]
+    slip = 1 - p.exit_slip_bps / 10_000
+    exit_px = exit_day = None
+    for i, d in enumerate(after):
+        b = bars.get(d)
+        if b is None:
+            out["gap_days"].append(d.isoformat())
+            continue
+        if not b.volume:
+            out["no_trades_days"] += 1
+            continue
+        if b.open <= stop:
+            exit_px, exit_day, out["exit"] = b.open * slip, d, STOP_GAP
+            break
+        if b.low <= stop:
+            exit_px, exit_day, out["exit"] = stop * slip, d, STOP
+            break
+        if i + 1 >= p.time_exit_sessions:
+            exit_px, exit_day, out["exit"] = b.close * slip, d, TIME
+            break
+    if out["gap_days"]:
+        out["quality"] = DATA_GAP_UNCERTAIN
+    if exit_px is None:
+        last = next((d for d in reversed(after) if bars.get(d) is not None and bars[d].volume), t)
+        out.update({"exit": OPEN_AT_END, "exit_date": last.isoformat(), "mark": bars[last].close})
+        out.update(_pnl(entry, bars[last].close, p, realized=False))
+        return out
+    out.update({"exit_date": exit_day.isoformat(), "exit_price": exit_px, "hold_sessions": after.index(exit_day) + 1})
+    out.update(_pnl(entry, exit_px, p, realized=True))
+    return out
+
+
+def paired(open_res: dict, close_res: dict) -> dict:
+    """같은 신호를 두 진입 방식으로 — 둘 다 확정 표본인 신호의 차이, 시가 진입에서 상한 초과로 놓친 신호의 종가 진입 결과."""
+    both = [(k, open_res[k], close_res[k]) for k in open_res
+            if k in close_res and confirmed([open_res[k]]) and confirmed([close_res[k]])]
+    diff = [c["net_pct"] - o["net_pct"] for _, o, c in both]
+    missed = [close_res[k] for k, r in open_res.items() if r.get("status") == NOT_ENTERED_ABOVE_CAP and k in close_res]
+    return {"n_both": len(both), "mean_diff": sum(diff) / len(diff) if diff else None,
+            "median_diff": median(diff) if diff else None, "close_better": sum(1 for x in diff if x > 0),
+            "missed": missed, "missed_metrics": metrics(missed)}
 
 
 def _risk(entry: float, stop: int, p: OutcomeParams) -> dict:

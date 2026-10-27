@@ -4,6 +4,8 @@
     python tools/s1_outcome.py --codes 005930,000660 --exit-slip-bps 20
     python tools/s1_outcome.py --capital 10000000 --per-trade 3000000     # 계좌 기준(G3)
 
+E4(10/27): 보고서 8장에 진입 시점 비교 — 다음 날 시가(현재 운영) vs 신호일 종가(마감 직전 매수 근사, --close-slip-bps).
+
 BASE(운영 S1) 신호마다 다음 거래일 **시가 진입 가정** → E1(손절·10거래일 시간 청산) 근사.
 신호별 독립 결과와 최대 1포지션 순차 계좌 결과를 따로 냄. 규칙·한계는 domain/research/s1_outcome.py.
 결과: reports/research/s1_outcome_<끝날짜>_<실행 ID>.md · .csv (고유 ID·배타적 생성)
@@ -23,8 +25,9 @@ sys.path.insert(0, str(ROOT))
 from domain.research.s1_frequency import analyze  # noqa: E402
 from domain.research.s1_outcome import (  # noqa: E402
     BIG_WIN_PCT, DATA_GAP_UNCERTAIN, ENTERED, ENTRY_LABEL, EXIT_LABEL, OPEN_AT_END, OutcomeParams, account, confirmed,
-    distance_buckets, distance_caps, gap_uncertain, metrics, sequential, simulate,
+    distance_buckets, distance_caps, gap_uncertain, metrics, paired, sequential, simulate,
 )
+from dataclasses import replace as _replace  # noqa: E402
 from domain.service.trade_costs import CostProfile, estimate_cost  # noqa: E402
 from infra.research.report_files import create_exclusive  # noqa: E402
 from infra.research.s1_scanner import INDEX_IDS, SCAN_LOOKBACK_SESSIONS  # noqa: E402
@@ -116,6 +119,62 @@ def render(rid, args, params, sigs, res, seq, mi, ms, stocks, accts) -> str:
     return "\n".join(L) + "\n"
 
 
+def render_compare(args, params, res_o, mi_o, ms_o, accts_o, c, stocks) -> str:
+    """E4(사용자 10/27): 진입 시점 비교 — 다음 거래일 시가(현재 운영) vs 신호일 종가(마감 직전 매수 근사)."""
+    mi_c, ms_c, pr = c["mi"], c["ms"], c["paired"]
+    L = ["", "## 8. 진입 시점 비교 — 다음 날 시가(현재 운영) vs 신호일 종가(마감 직전 매수 근사) · 측정용", "",
+         f"> **신호일 종가 진입 가정:** 마감 직전(15:10~15:20) 매수를 그날 종가 × (1 + {c['pc'].close_entry_slip_bps:g}bp)로 근사. "
+         "그 시각의 잠정 판정이 종가 기준 최종 판정과 같다고 가정함(종가로 판정하는 조건 — 전일 고가 돌파·20일선 등 — 은 "
+         "15:10과 15:30 사이에 뒤집힐 수 있어 **실제보다 유리하게 나올 수 있음**). 진입 상한은 적용하지 않고 종가 ≤ 손절 기준이면 미진입. "
+         "진입일 0일 → 다음 날부터 손절, 10번째 거래일 종가 시간 청산. 운영 조건이 아님.", "",
+         "| 구분 | 진입 가정 | 확정 표본 | 평균(비용 후) | 중앙값 | 승률 | 평균 이익 | 평균 손실 | 최악 | 손절/갭/시간 |",
+         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+
+    def worst(rr):
+        xs = [t["net_pct"] for t in rr if t.get("net_pct") is not None and t.get("exit") not in (None, OPEN_AT_END)
+              and t.get("quality", "OK") == "OK"]
+        return min(xs) if xs else None
+    for name, rr, m in (("다음 날 시가 — 독립", res_o.values(), mi_o), ("신호일 종가 — 독립", c["res"].values(), mi_c)):
+        ent = sum(1 for r in rr if r["status"] == ENTERED)
+        if not m.get("n"):
+            L.append(f"| {name} | {ent} | 0 | - | - | - | - | - | - | - |")
+            continue
+        be = m["by_exit"]
+        L.append(f"| {name} | {ent} | {m['n']} | {_fmt(m['net_mean'])} | {_fmt(m['net_median'])} | {m['win_rate']:.0f}% | "
+                 f"{_fmt(m['avg_win'])} | {_fmt(m['avg_loss'])} | {_fmt(worst(rr))} | {be['STOP']}/{be['STOP_GAP']}/{be['TIME']} |")
+    for name, seq, m in (("다음 날 시가 — 순차", None, ms_o), ("신호일 종가 — 순차", None, ms_c)):
+        if not m.get("n"):
+            L.append(f"| {name} | - | 0 | - | - | - | - | - | - | - |")
+            continue
+        be = m["by_exit"]
+        L.append(f"| {name} | - | {m['n']} | {_fmt(m['net_mean'])} | {_fmt(m['net_median'])} | {m['win_rate']:.0f}% | "
+                 f"{_fmt(m['avg_win'])} | {_fmt(m['avg_loss'])} | - | {be['STOP']}/{be['STOP_GAP']}/{be['TIME']} |")
+    a_o = accts_o[0][1]
+    L += ["", f"가상계좌(관찰 {args.n_codes}종목·순차·초기 자금 {args.capital:,}원, **실제 운영 재현 아님**):", "",
+          "| 진입 | 1주 고정: 수익률 · 최대 낙폭 | 고정 금액 {0:,}원: 수익률 · 최대 낙폭 |".format(args.per_trade), "|---|---|---|",
+          f"| 다음 날 시가 | {a_o['return_pct']:+.2f}% · {a_o['mdd_pct']:.2f}% | {accts_o[1][1]['return_pct']:+.2f}% · "
+          f"{accts_o[1][1]['mdd_pct']:.2f}% |",
+          f"| 신호일 종가 | {c['acct']['return_pct']:+.2f}% · {c['acct']['mdd_pct']:.2f}% | {c['acct_amt']['return_pct']:+.2f}% · "
+          f"{c['acct_amt']['mdd_pct']:.2f}% |", ""]
+    if pr["n_both"]:
+        L.append(f"같은 신호 짝 비교(두 방식 모두 확정 {pr['n_both']}건): 종가 진입 − 시가 진입 평균 {pr['mean_diff']:+.2f}%p · "
+                 f"중앙값 {pr['median_diff']:+.2f}%p · 종가 진입이 나은 신호 {pr['close_better']}/{pr['n_both']}")
+    mm = pr["missed_metrics"]
+    n_missed = len(pr["missed"])
+    if n_missed:
+        L += ["", f"**다음 날 시가가 상한을 넘어 놓친 신호 {n_missed}건**을 신호일 종가로 샀다면: "
+              + (f"확정 {mm['n']}건 · 평균 {_fmt(mm['net_mean'])} · 중앙값 {_fmt(mm['net_median'])} · 승률 {mm['win_rate']:.0f}% · "
+                 f"평균 손실 {_fmt(mm['avg_loss'])}" if mm.get("n") else "확정 표본 없음"), "",
+              "| 신호일 | 종목 | 종가 진입 | 청산일 | 사유 | 비용 후 |", "|---|---|---:|---|---|---:|"]
+        for r in sorted(pr["missed"], key=lambda r: (r["date"], r["code"])):
+            L.append(f"| {r['date']} | {r['code']} {stocks[r['code']]['name']} | "
+                     f"{(r.get('entry') or 0):,.0f} | {r.get('exit_date', '-')} | {EXIT_LABEL.get(r.get('exit'), r.get('exit') or r['status'])} | "
+                     f"{_fmt(r.get('net_pct'))} |")
+    L += ["", "> 다음 단계(결과가 유리하게 나올 때만): 15:10 장중 가격으로 잠정 판정 → 종가 판정과 얼마나 자주 다른지 분봉으로 측정 "
+          "→ 마감 직전 진입 전략을 그림자 모드로. 그 전에는 운영을 바꾸지 않음."]
+    return "\n".join(L) + "\n"
+
+
 def _account_section(accts, args) -> list[str]:
     L = ["", f"## 3. 가상계좌 — 관찰 {args.n_codes}종목·순차 선택, 초기 자금 {args.capital:,}원 (**실제 운영 재현 아님**)", "",
          "현금·보유 평가액(그날 종가)·매수·매도 비용을 반영한 일별 평가 곡선. 수량 기준에 따라 원화 결과가 달라지므로 두 기준을 "
@@ -176,6 +235,7 @@ def main(argv=None) -> int:
     p.add_argument("--exit-slip-bps", type=float, default=10.0)
     p.add_argument("--capital", type=int, default=10_000_000, help="계좌 기준 초기 자금(원)")
     p.add_argument("--per-trade", type=int, help="고정 금액 기준 1회 투입(원, 기본: 초기 자금 전액) — 수량 = 내림(금액 ÷ 진입가)")
+    p.add_argument("--close-slip-bps", type=float, default=10.0, help="E4 신호일 종가 진입 비교의 진입 슬리피지(bp)")
     p.add_argument("--out-dir", default=str(ROOT / "reports" / "research"))
     args = p.parse_args(argv)
     if args.capital <= 0 or (args.per_trade is not None and args.per_trade <= 0):
@@ -212,27 +272,45 @@ def main(argv=None) -> int:
     accts = [("1주 고정(운영과 같은 수량)", account(seq, bars, acct_days, args.capital, lambda px: 1, cfn)),
              (f"고정 금액 {args.per_trade:,}원(수량 내림)",
               account(seq, bars, acct_days, args.capital, lambda px: args.per_trade // px, cfn))]
+    # E4(사용자 10/27): 같은 신호를 신호일 종가 진입(마감 직전 매수 근사)으로도
+    pc = _replace(params, entry_mode="close", close_entry_slip_bps=args.close_slip_bps)
+    res_c = {(s["date"], s["code"]): simulate(s, all_days, bars[s["code"]], pc) for s in sigs}
+    seq_c = sequential(sigs, res_c)
+    cmp_ = {"pc": pc, "res": res_c, "seq": seq_c, "mi": metrics(res_c.values()), "ms": metrics(seq_c),
+            "acct": account(seq_c, bars, acct_days, args.capital, lambda px: 1, cfn),
+            "acct_amt": account(seq_c, bars, acct_days, args.capital, lambda px: args.per_trade // px, cfn),
+            "paired": paired(res, res_c)}
     rid, files = create_exclusive(args.out_dir, f"s1_outcome_{end.isoformat()}", (".md", ".csv"))
-    files[".md"].write_text(render(rid, args, params, sigs, res, seq, mi, ms, stocks, accts), encoding="utf-8")
+    files[".md"].write_text(render(rid, args, params, sigs, res, seq, mi, ms, stocks, accts)
+                            + render_compare(args, params, res, mi, ms, accts, cmp_, stocks), encoding="utf-8")
     in_seq = {(t["date"], t["code"]) for t in seq}
     with files[".csv"].open("w", encoding="utf-8-sig", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["signal_date", "code", "name", "status", "entry_date", "limit", "stop", "entry", "stop_dist_pct",
                     "stop_dist_cap_pct", "exp_loss_1sh", "exit", "exit_date", "exit_price", "hold_sessions",
                     "same_day_uncertain", "quality", "gap_days", "no_trades_days", "gross_pct", "net_pct", "net_won_1sh",
-                    "in_sequential"])
+                    "in_sequential", "close_status", "close_entry", "close_exit", "close_exit_date", "close_exit_price",
+                    "close_net_pct", "close_quality", "close_in_sequential"])
+        in_seq_c = {(t["date"], t["code"]) for t in seq_c}
         for (d, c), r in sorted(res.items()):
+            rc = res_c[(d, c)]
             w.writerow([d, c, stocks[c]["name"], r["status"], r.get("entry_date"), r.get("limit"), r.get("stop"),
                         r.get("entry"), _r(r.get("stop_dist_pct")), _r(r.get("stop_dist_cap_pct")), _r(r.get("exp_loss")),
                         r.get("exit"), r.get("exit_date"), r.get("exit_price", r.get("mark")), r.get("hold_sessions"),
                         r.get("same_day_uncertain"), r.get("quality"), " ".join(r.get("gap_days") or []),
-                        r.get("no_trades_days"), r.get("gross_pct"), r.get("net_pct"), r.get("net"), (d, c) in in_seq])
+                        r.get("no_trades_days"), r.get("gross_pct"), r.get("net_pct"), r.get("net"), (d, c) in in_seq,
+                        rc["status"], rc.get("entry"), rc.get("exit"), rc.get("exit_date"),
+                        rc.get("exit_price", rc.get("mark")), rc.get("net_pct"), rc.get("quality"), (d, c) in in_seq_c])
     print(f"신호 {len(sigs)} · 진입 {sum(r['status'] == ENTERED for r in res.values())} · 확정 표본 {mi.get('n', 0)} "
           f"(공백 불확실 {len(gap_uncertain(res.values()))}) · 순차 거래 {len(seq)}")
     for label, a in accts:
         print(f"계좌 {label}: 손익 {a['net_won']:+,.0f}원 ({a['return_pct']:+.2f}%) · 최대 낙폭 {a['mdd_pct']:.2f}%")
     if mi.get("n"):
         print(f"독립 비용 후 평균 {mi['net_mean']:+.2f}% 중앙값 {mi['net_median']:+.2f}% 승률 {mi['win_rate']:.0f}%")
+    mc = cmp_["mi"]
+    if mc.get("n"):
+        print(f"[비교] 신호일 종가 진입: 확정 {mc['n']} · 평균 {mc['net_mean']:+.2f}% 중앙값 {mc['net_median']:+.2f}% "
+              f"승률 {mc['win_rate']:.0f}% · 가상계좌 1주 {cmp_['acct']['return_pct']:+.2f}%")
     print(f"보고서 {files['.md']}\nCSV {files['.csv']}")
     return 0
 
