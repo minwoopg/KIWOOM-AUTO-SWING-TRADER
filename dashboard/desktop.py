@@ -108,7 +108,7 @@ class Table(ttk.Frame):
                 self.tree.heading(c, text=c)
                 width = 260 if c in ("내용", "조치", "신규 진입 제외 사유", "사유", "비고", "메모", "상태", "가격 출처", "결과",
                                      "S1 판단", "현재 상태", "종목", "출처", "기준", "데이터") else (
-                    170 if c == "S1 점수" else 120)
+                    230 if c == "S1 조건 충족도" else 120)
                 self.tree.column(c, width=width, minwidth=60, stretch=True, anchor="w")
             self.cols = cols
         self.tree.delete(*self.tree.get_children())
@@ -330,7 +330,9 @@ class App:
         if sm.state == D.OK:
             d = sm.data
             col = {"정상 처리": GREEN, "아직 처리하지 않음": YELLOW}.get(d["state"], RED)
-            self.sum_state.configure(text=f"[{d['state']}] {d['headline']}", fg=col)
+            ops = d.get("ops") or []
+            self.sum_state.configure(text=f"[{d['state']}] 전략 결과: {d.get('strategy', d['headline'])}\n운영 상태: "
+                                          + (" / ".join(t for _, t in ops) if ops else "정상"), fg=col)
             b = d.get("basis") or {}
             self.sum_basis.configure(text=(f"기준: 거래일 {b.get('trade_date', '-')} · 신호일 {b.get('signal_date', '-')} · 스캔 "
                                            f"{b.get('scan', '-')} · 주문 허용 {', '.join(b.get('allowed') or [])} — 모든 건수는 "

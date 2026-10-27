@@ -12,7 +12,8 @@ from __future__ import annotations
 - 순서(H2 — GPT 10/27): 실행기가 그 폴링의 주문 의도를 **모두 처리(전송)한 뒤** `after_tick`에서 관찰 — 주문 의도
   반환 경로에 끼지 않음. 보유·미해결 주문이 있어도 관찰은 계속.
 - 조회 한도: 종목마다 최소 간격(기본 55초 — 폴링 60초마다 한 번), 한 폴링에 최대 5종목(오래 안 본 종목부터),
-  한 폴링 전체 15초 예산, 진입 마감이 지나면 조회하지 않음.
+  한 폴링 전체 15초 예산(U2: monotonic·조회를 작업 스레드에서 남은 예산만큼만 기다림 — 진행 중 조회도 끊음),
+  진입 마감이 지나면 조회하지 않음.
 - 시각: 종목마다 요청 시작(requested_at)·응답 수신(received_at)을 실제 시계로 기록. 마감 뒤 받은 값은 in_window=false —
   조건을 만족해도 최초 충족(OBS_FIRST_OK)·충족 횟수로 세지 않음.
 - 실패해도 매매에 영향 없음: 조회 예외는 QUOTE_FAILED로 기록, 기록 파일 쓰기 실패는 삼킴.
@@ -24,13 +25,15 @@ from __future__ import annotations
 """
 
 import json
+import threading
+import time as _time
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
 OBS_QUOTE, OBS_FIRST_OK = "OBS_QUOTE", "OBS_FIRST_OK"
-REASON_LABEL = {"NO_PRICE": "현재가 없음", "PRICE_AT_OR_BELOW_STOP": "현재가 ≤ 손절 기준", "PRICE_ABOVE_CAP": "현재가 > 진입 상한",
+REASON_LABEL = {"QUOTE_TIMEOUT": "관찰 예산 초과", "NO_PRICE": "현재가 없음", "PRICE_AT_OR_BELOW_STOP": "현재가 ≤ 손절 기준", "PRICE_ABOVE_CAP": "현재가 > 진입 상한",
                 "NO_ASK": "매도호가 없음", "ASK_ABOVE_LIMIT": "매도호가 > 지정가", "QUOTE_FAILED": "조회 실패"}
 
 
@@ -58,13 +61,16 @@ def observation_path(state_file: str | Path) -> Path:
 class EntryObserver:
     MIN_INTERVAL_SEC = 55
     MAX_PER_TICK = 5
-    BUDGET_SEC = 15            # H2: 한 폴링 관찰 전체 시간 예산 — 다음 취소·손절 처리까지 늦추지 않게
+    BUDGET_SEC = 15.0          # 한 폴링 관찰 전체 시간 예산 — **실제 최대 대기**(U2: 진행 중인 조회도 이 안에서 끊음)
 
     def __init__(self, quote: Callable[[str], tuple[int | None, int | None]], sink: Callable[[dict], None], *,
-                 mode: str = "", clock: Callable[[], datetime] = datetime.now) -> None:
-        self.quote, self.sink, self.mode, self.clock = quote, sink, mode, clock
+                 mode: str = "", clock: Callable[[], datetime] = datetime.now,
+                 monotonic: Callable[[], float] = _time.monotonic, budget_sec: float | None = None) -> None:
+        self.quote, self.sink, self.mode, self.clock, self.monotonic = quote, sink, mode, clock, monotonic
+        self.budget_sec = self.BUDGET_SEC if budget_sec is None else budget_sec
         self._last: dict[str, datetime] = {}          # signal_id → 마지막 조회 요청 시각
         self._first_ok: set[str] = set()
+        self._stray: threading.Thread | None = None    # 예산 초과로 기다리지 않고 남겨 둔 조회(끝날 때까지 새 관찰 안 함)
 
     def _write(self, rec: dict) -> None:
         try:
@@ -72,13 +78,24 @@ class EntryObserver:
         except Exception:                                  # noqa: BLE001 — 기록 실패가 매매를 멈추지 않음
             pass
 
+    def busy(self) -> bool:
+        return self._stray is not None and self._stray.is_alive()
+
     def observe(self, trade_date: date, cands: Iterable, *, window_end: datetime,
                 clock: Callable[[], datetime] | None = None) -> int:
         """cands: 관찰할 승인 후보(ApprovedCandidate). window_end: 진입 마감(그 뒤엔 조회하지 않고, 그 뒤 받은 값은
-        시간 안 충족으로 세지 않음). clock: 실제 시각(실행기 시계). 반환: 이번에 조회한 수.
-        H2(GPT 10/27): 종목마다 요청 시작·응답 수신 시각을 따로 기록(폴링 시작 시각을 쓰지 않음), 전체 예산 BUDGET_SEC."""
+        시간 안 충족으로 세지 않음). clock: 실제 시각(실행기 시계 — 기록용). 반환: 이번에 조회를 끝낸 수.
+
+        시간 예산(U2 — GPT 10/27 ③): 경과는 monotonic으로 재고(시스템 시각 변경 영향 없음), 조회 하나하나를 작업 스레드에서
+        돌려 **남은 예산만큼만** 기다림. 예산이 끝나도 안 끝난 조회는 기다리지 않고(QUOTE_TIMEOUT 기록) 그 폴링 관찰을 멈춤 —
+        그 조회는 키움 HTTP 시간 제한(호출당 10초) 안에 스스로 끝나며, 끝날 때까지 다음 관찰을 시작하지 않음(동시 조회 1개 이하).
+        늦게 온 값은 쓰지 않음."""
         clk = clock or self.clock
+        if self.busy():
+            return 0                                       # 지난 폴링의 남은 조회가 아직 진행 중 — 이번 관찰은 건너뜀
+        self._stray = None
         start = clk()
+        deadline = self.monotonic() + self.budget_sec
         due = []
         for c in cands:
             last = self._last.get(c.signal_id)
@@ -88,31 +105,44 @@ class EntryObserver:
         n = 0
         for _, _, c in due[: self.MAX_PER_TICK]:
             req = clk()
-            if req >= window_end or (req - start).total_seconds() >= self.BUDGET_SEC:
+            left = deadline - self.monotonic()
+            if req >= window_end or left <= 0:
                 break                                      # 마감 지남·예산 소진 — 남은 종목은 다음 폴링(오래 안 본 순)
             self._last[c.signal_id] = req
-            err = None
-            try:
-                price, ask = self.quote(c.symbol)
-            except Exception as exc:                       # noqa: BLE001
-                price, ask, err = None, None, f"{type(exc).__name__}: {exc}"
+            box: dict = {}
+
+            def _run(sym=c.symbol, box=box):
+                try:
+                    box["v"] = self.quote(sym)
+                except Exception as exc:                   # noqa: BLE001
+                    box["e"] = f"{type(exc).__name__}: {exc}"
+            th = threading.Thread(target=_run, name=f"entry-observe-{c.symbol}", daemon=True)
+            th.start()
+            th.join(timeout=max(0.0, left))
             recv = clk()
+            base = {"at": recv.isoformat(timespec="seconds"), "requested_at": req.isoformat(timespec="seconds"),
+                    "received_at": recv.isoformat(timespec="seconds"), "trade_date": trade_date.isoformat(),
+                    "event": OBS_QUOTE, "mode": self.mode, "observe_only": True, "symbol": c.symbol,
+                    "signal_id": c.signal_id, "signal_date": c.signal_date, "limit": c.limit_price,
+                    "stop_ref": c.stop_ref, "entry_cap": c.entry_cap, "in_window": recv < window_end}
+            if th.is_alive():
+                self._stray = th
+                self._write({**base, "price": None, "ask": None, "ok": False, "reasons": ["QUOTE_TIMEOUT"],
+                             "stop_dist_pct": None, "cap_gap_pct": None, "quote_ms": None,
+                             "error": f"관찰 예산 {self.budget_sec:g}초 초과 — 기다리지 않음(늦게 온 값은 버림)"})
+                break
+            err = box.get("e")
+            price, ask = (None, None) if err else box.get("v", (None, None))
             reasons = ["QUOTE_FAILED"] if err else entry_reasons(price, ask, c)
             ok = not reasons
-            in_window = recv < window_end
-            rec = {"at": recv.isoformat(timespec="seconds"), "requested_at": req.isoformat(timespec="seconds"),
-                   "received_at": recv.isoformat(timespec="seconds"), "trade_date": trade_date.isoformat(),
-                   "event": OBS_QUOTE, "mode": self.mode, "observe_only": True, "symbol": c.symbol,
-                   "signal_id": c.signal_id, "signal_date": c.signal_date, "price": price, "ask": ask,
-                   "limit": c.limit_price, "stop_ref": c.stop_ref, "entry_cap": c.entry_cap, "ok": ok,
-                   "in_window": in_window, "reasons": reasons,
+            rec = {**base, "price": price, "ask": ask, "ok": ok, "reasons": reasons,
                    "stop_dist_pct": round((price - c.stop_ref) / price * 100, 3) if price else None,
                    "cap_gap_pct": round((price - c.entry_cap) / c.entry_cap * 100, 3) if price and c.entry_cap else None,
                    "quote_ms": int((recv - req).total_seconds() * 1000)}
             if err:
                 rec["error"] = err
             self._write(rec)
-            if ok and in_window and c.signal_id not in self._first_ok:
+            if ok and rec["in_window"] and c.signal_id not in self._first_ok:
                 self._first_ok.add(c.signal_id)
                 self._write({**rec, "event": OBS_FIRST_OK})
             n += 1

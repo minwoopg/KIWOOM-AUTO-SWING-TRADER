@@ -137,25 +137,61 @@ check("3-1) 폴링 시작 뒤 45초 지난 매수 판단(가격 재확인이 낡
       not br.place_calls and runner.summary.denied_codes.get("STALE_DECISION") == 1
       and any("STALE_DECISION" in str(d.get("status")) for d in dec))
 
-# 4. 관찰 예산·마감
+# 4. 관찰 예산·마감 (U2: 경과는 monotonic — 시험은 가짜 monotonic을 조회가 밀어 줌)
 clk4 = Clock(datetime.combine(D, time(9, 10)))
 many = [cand(f"00{i:04d}", 10_000, 9_000.0, 10_020.0) for i in range(1, 6)]
 calls: list = []
+mono = [0.0]
 
 
 def q4(sym):
     calls.append(sym)
     clk4.advance(6)
+    mono[0] += 6
     return 9_990, 10_000
 
 
-o4 = EntryObserver(q4, lambda r: None, clock=clk4)
+o4 = EntryObserver(q4, lambda r: None, clock=clk4, monotonic=lambda: mono[0])
 n = o4.observe(D, many, window_end=datetime.combine(D, time(9, 30)))
 clk5 = Clock(datetime.combine(D, time(9, 30)))
 o5 = EntryObserver(q4, lambda r: None, clock=clk5)
 n5 = o5.observe(D, many, window_end=datetime.combine(D, time(9, 30)))
-check("4-1) 한 폴링 관찰 예산 15초: 종목당 6초 걸리면 3종목 조회 뒤 멈춤(다음 취소·손절 처리를 늦추지 않음) · 마감(09:30) 뒤엔 조회 안 함",
+check("4-1) 한 폴링 관찰 예산 15초(monotonic): 종목당 6초 걸리면 3종목 조회 뒤 멈춤 · 마감(09:30) 뒤엔 조회 안 함",
       n == 3 and calls[:3] == ["000001", "000002", "000003"] and n5 == 0)
+
+# 4-2. U2(GPT 10/27 ③) — 이미 시작한 조회가 예산을 넘겨도 기다리지 않음(실제 최대 대기 = 예산)
+import threading  # noqa: E402
+import time as _rt  # noqa: E402
+gate_ev = threading.Event()
+slow_calls: list = []
+
+
+def stuck(sym):
+    slow_calls.append(sym)
+    gate_ev.wait(5)                               # 응답이 늦는 조회(시험은 최대 5초 뒤 풀림)
+    return 9_990, 10_000
+
+
+rec6: list = []
+clk6 = Clock(datetime.combine(D, time(9, 10)))
+o6 = EntryObserver(stuck, rec6.append, clock=clk6, budget_sec=0.3)
+t0 = _rt.monotonic()
+n6 = o6.observe(D, many[:2], window_end=datetime.combine(D, time(9, 30)))
+waited = _rt.monotonic() - t0
+clk6.advance(60)
+n6b = o6.observe(D, many[:2], window_end=datetime.combine(D, time(9, 30)))     # 남은 조회 진행 중 → 건너뜀
+gate_ev.set()
+for _ in range(50):
+    if not o6.busy():
+        break
+    _rt.sleep(0.05)
+clk6.advance(60)
+n6c = o6.observe(D, many[:1], window_end=datetime.combine(D, time(9, 30)))
+check("4-2) GPT 재현: 예산 0.3초인데 조회가 멈춤 → 약 0.3초만 기다리고 반환(이전: 조회가 끝날 때까지 대기), QUOTE_TIMEOUT 기록·"
+      "늦은 값은 충족으로 안 셈, 남은 조회가 끝나기 전 다음 폴링은 관찰을 건너뜀(동시 조회 1개 이하), 끝난 뒤엔 다시 관찰",
+      n6 == 0 and waited < 1.5 and rec6[0]["reasons"] == ["QUOTE_TIMEOUT"] and not rec6[0]["ok"]
+      and n6b == 0 and slow_calls == ["000001", "000001"] and n6c == 1
+      and not any(r.get("ok") and r["requested_at"].endswith("09:10:00") for r in rec6))
 
 # 5. after_tick 예외는 실행기를 멈추지 않음
 clk6 = Clock(datetime.combine(D, time(9, 10)))

@@ -70,7 +70,7 @@ def scan_evals(p: Paths, run_id: str) -> Section:
     return s
 
 
-# S1 점수(사용자 요청 10/27): 신호를 가르는 조건 9개의 충족 비율 × 10. 자격 조건(이력·보통주·위험 표시·거래대금·ATR)은
+# S1 조건 충족도(사용자 요청 10/27, U2에서 이름 정리): 신호를 가르는 조건 9개의 충족 비율 × 10. 자격 조건(이력·보통주·위험 표시·거래대금·ATR)은
 # 점수에 넣지 않고 "자격 미달"로 따로 표시 — 거의 늘 충족이라 점수를 부풀리기 때문. **수익 예측·매수 추천 점수가 아님**:
 # S1은 모든 조건을 만족해야(10.0) 신호이고, 9.0이어도 매수하지 않음.
 SCORE_CHECKS = ("C_GT_MA120", "MA60_RISING", "RS60_POS", "PULLBACK", "CLOSE_GT_PREV_HIGH", "CLOSE_GE_MA20",
@@ -79,24 +79,29 @@ GATE_CHECKS = ("HISTORY", "ATR_POS", "SECURITY_TYPE", "RISK_STATUS", "LIQUIDITY_
 
 
 def s1_score(e: dict | None) -> dict | None:
-    """저장된 조건별 결과로 점수 — 판정 본문이 없으면 None(점수 없음). UNKNOWN은 미충족으로 셈."""
+    """저장된 조건별 결과로 조건 충족도 — 판정 본문이 없으면 None. 판정 불가(UNKNOWN)는 미충족과 따로 셈(점수엔 미충족 취급)."""
     res = (e or {}).get("result") or {}
     checks = {c["name"]: c.get("result") for c in res.get("checks") or []}
     if not checks:
         return None
     met = [n for n in SCORE_CHECKS if checks.get(n) == "PASS"]
-    miss = [n for n in SCORE_CHECKS if checks.get(n) != "PASS"]
+    fail = [n for n in SCORE_CHECKS if checks.get(n) == "FAIL"]
+    unk = [n for n in SCORE_CHECKS if checks.get(n) not in ("PASS", "FAIL")]
     gate_bad = [n for n in GATE_CHECKS if n in checks and checks[n] != "PASS"]
     return {"score": round(10 * len(met) / len(SCORE_CHECKS), 1), "met": len(met), "total": len(SCORE_CHECKS),
-            "missing": miss, "gate_bad": gate_bad}
+            "fail": fail, "unknown": unk, "missing": fail + unk, "gate_bad": gate_bad}
 
 
-def score_text(sc: dict | None) -> str:
+def score_text(sc: dict | None, order_ok: bool = True) -> str:
+    """U2(GPT 10/27): 'S1 조건 충족도' — 충족·미충족·판정 불가를 나눠 표시, 10점이어도 자격 미달·주문 미허용이면 함께."""
     if sc is None:
         return "-"
-    t = f"{sc['score']:.1f}/10 ({sc['total']}개 중 {sc['met']})"
+    t = f"{sc['score']:.1f}/10 (충족 {sc['met']} · 미충족 {len(sc['fail'])}"
+    t += f" · 판정 불가 {len(sc['unknown'])})" if sc["unknown"] else ")"
     if sc["gate_bad"]:
         t += " · 자격 미달"
+    if not order_ok:
+        t += " · 주문 미허용"
     return t
 
 
@@ -194,15 +199,21 @@ def _day_records(path: Path, day: date, key: str = "at") -> list[dict]:
     return [r for r in s.data if isinstance(r, dict) and str(r.get(key, "")).startswith(d)]
 
 
-def _ledger_today(p: Paths, day: date) -> tuple[dict, list]:
+def _ledger_today(p: Paths, day: date) -> tuple[dict | None, list | None, str]:
+    """(보유, 오늘 체결, 오류). U2(GPT 10/27 ①): 원장을 읽지 못하면 (None, None, 오류) — 0건·보유 없음으로 바꾸지 않음.
+    원장 파일이 아직 없으면(거래 이력 없음) 빈 결과."""
     from dashboard.data import ledger_events
     le = ledger_events(p)
+    if le.state == MISSING:
+        return {}, [], ""
     if le.state != OK:
-        return {}, []
-    from domain.service.lot_ledger import apply_events
-    pos = {s: x for s, x in apply_events(le.data).positions().items() if x.quantity > 0}
-    today = [e for e in le.data if e.trade_date == day]
-    return pos, today
+        return None, None, f"원장 {STATE_LABEL.get(le.state, le.state)} {le.error}".strip()
+    try:
+        from domain.service.lot_ledger import apply_events
+        pos = {s: x for s, x in apply_events(le.data).positions().items() if x.quantity > 0}
+    except Exception as exc:                               # noqa: BLE001 — 원장 해석 실패도 확인 불가
+        return None, None, f"원장 해석 실패 {type(exc).__name__}: {exc}"
+    return pos, [e for e in le.data if e.trade_date == day], ""
 
 
 def _task(p: Paths, kind: str, day: str) -> dict | None:
@@ -212,95 +223,114 @@ def _task(p: Paths, kind: str, day: str) -> dict | None:
 
 
 def today_summary(p: Paths, settings, day: date, now: datetime, runner: Section, *, calendar=None) -> Section:
-    """오늘 매수가 없는(있는) 이유 — 같은 기준의 단계별 건수 + 한 줄 결론 + 상태(정상·아직·실패)."""
+    """오늘 매수가 없는(있는) 이유. U2(GPT 10/27 ②): **전략 결과**(신호가 있었나)와 **운영 상태**(확인 과정이 정상인가)를 분리 —
+    'S1 통과 0건'이 '전체 처리 정상'을 뜻하지 않음. 상태(정상·아직·실패)는 운영 문제 중 가장 나쁜 것.
+    data: state·headline·strategy·ops(문제 목록)·steps·basis."""
     allowed = tuple(getattr(getattr(settings, "swing_strategy", None), "allowed_symbols", ()) or ())
     sig = signal_date_for(day, calendar)
-    steps: list[dict] = []
-    state, head = DONE, ""
     if sig is None:
-        return Section(OK, {"state": FAILED, "headline": f"{day} 직전 거래일을 달력에서 찾지 못함 — 확인 불가", "steps": [],
-                            "basis": {}}, source="krx_calendar")
+        msg = f"{day} 직전 거래일을 달력에서 찾지 못함"
+        return Section(OK, {"state": FAILED, "headline": f"전략 결과: 확인 불가 · 운영 상태: {msg}", "strategy": "확인 불가",
+                            "ops": [(FAILED, msg)], "steps": [], "basis": {}}, source="krx_calendar")
+    ops: list[tuple[str, str]] = []                        # (수준, 설명)
     run = scan_run_for(p, sig)
     prep = _task(p, "CLOSE_PREP", sig)
-    open_t = _task(p, "OPEN_CHECK", day.isoformat())
     evs: dict = {}
+    scan_ok = False
     if run.state != OK:
-        state, head = FAILED, f"관리자 스캔 기록 {STATE_LABEL[run.state]} — 확인 불가"
+        ops.append((FAILED, f"관리자 스캔 기록 {STATE_LABEL[run.state]}"))
     elif run.data is None:
         if prep is None:
-            state, head = NOT_YET, f"신호일 {sig} 스캔 기록 없음 — 마감 준비(20:30)가 아직 돌지 않음(관리자·PC가 꺼져 있었는지 확인)"
+            ops.append((NOT_YET, f"신호일 {sig} 스캔 기록 없음 — 마감 준비(20:30)가 아직 돌지 않음"))
         elif prep["status"] == "COMPLETE":
-            state, head = FAILED, f"신호일 {sig} 마감 준비는 완료인데 완료 스캔 기록이 없음 — 확인 불가"
+            ops.append((FAILED, f"신호일 {sig} 마감 준비는 완료인데 완료 스캔 기록이 없음"))
         else:
-            state = FAILED if prep["status"] in ("FAILED", "ABORTED", "MISSED") else NOT_YET
-            head = f"신호일 {sig} 마감 준비 {prep['status']} — 스캔 미완료"
+            ops.append((FAILED if prep["status"] in ("FAILED", "ABORTED", "MISSED") else NOT_YET,
+                        f"신호일 {sig} 마감 준비 {prep['status']} — 스캔 미완료"))
     else:
         es = scan_evals(p, run.data["run_id"])
         if es.state != OK:
-            state, head = FAILED, f"스캔 판정 {STATE_LABEL[es.state]}"
+            ops.append((FAILED, f"스캔 판정 {STATE_LABEL[es.state]}"))
         else:
-            evs = es.data
+            evs, scan_ok = es.data, True
     n_all = len(evs)
     n_ready = sum(1 for e in evs.values() if e["data_status"] == "OK")
     passed = sorted(s for s, e in evs.items() if e["eligible_signal"] == "PASS")
     book = candidate_book(p, day, now, calendar)
+    if book.state == "ERROR":
+        ops.append((FAILED, "후보 승인 확인 실패" + (f": {book.note}" if book.note else "")))
+    elif book.state == "WAITING":
+        late = now.time() >= datetime.strptime("09:30", "%H:%M").time()
+        ops.append((FAILED if late else NOT_YET,
+                    "개장 확인 미완료(진입 시간 지남)" if late else "후보 승인 대기 — 개장 확인(09:05) 전"))
     approved = sorted(a.symbol for a in book.approved) if book.state == "READY" else []
     allow_ok = [s for s in approved if not allowed or s in allowed]
     allow_no = [s for s in approved if allowed and s not in allowed]
+    dsec = read_jsonl(p.state_file.with_name("strategy_decisions.jsonl"))
+    if dsec.state not in (OK, MISSING):
+        ops.append((FAILED, f"실행기 판단 기록 {STATE_LABEL[dsec.state]}"))
     dec = _day_records(p.state_file.with_name("strategy_decisions.jsonl"), day)
-    pos, fills = _ledger_today(p, day)
-    buys = [e for e in fills if e.kind == "BUY"]
-    rc = (runner.data or {}).get("counters") or {} if runner.state == OK else {}
+    pos, fills, lerr = _ledger_today(p, day)
+    if lerr:
+        ops.append((FAILED, f"{lerr} — 체결·보유 확인 불가"))
+    buys = None if fills is None else [e for e in fills if e.kind == "BUY"]
+    if runner.state == UNREADABLE:
+        ops.append((FAILED, f"실행기 상태 파일 읽기 실패 {runner.error}".strip()))
+    rc = ((runner.data or {}).get("counters") or {}) if runner.state == OK else {}
     rn_today = runner.state == OK and (runner.data or {}).get("trade_date") == day.isoformat()
     basis = {"trade_date": day.isoformat(), "signal_date": sig,
              "scan": (f"{run.data['run_id']} · {run.data['scan_at']} (마감 {run.data['after_close_min']}분 뒤)"
                       if run.state == OK and run.data else "없음"),
              "allowed": list(allowed) or ["제한 없음"]}
     raw_steps = [
-        {"단계": "분석 대상(관심·S1)", "건수": n_all if run.data else "-", "기준": f"신호일 {sig} 스캔", "출처": "watch_s1 s1_eval"},
-        {"단계": "데이터 준비", "건수": n_ready if run.data else "-", "기준": "데이터 상태 OK", "출처": "watch_s1 s1_eval"},
-        {"단계": "S1 통과", "건수": len(passed) if run.data else "-", "기준": "최종 판정 PASS",
+        {"단계": "분석 대상(관심·S1)", "건수": n_all if scan_ok else "확인 불가", "기준": f"신호일 {sig} 스캔", "출처": "watch_s1 s1_eval"},
+        {"단계": "데이터 준비", "건수": n_ready if scan_ok else "확인 불가", "기준": "데이터 상태 OK", "출처": "watch_s1 s1_eval"},
+        {"단계": "S1 통과", "건수": len(passed) if scan_ok else "확인 불가", "기준": "최종 판정 PASS",
          "종목": ", ".join(passed), "출처": "watch_s1 s1_eval"},
-        {"단계": "개장 확인 승인", "건수": len(approved) if book.state == "READY" else "-",
+        {"단계": "개장 확인 승인", "건수": len(approved) if book.state == "READY" else
+         ("확인 불가" if book.state == "ERROR" else "대기"),
          "기준": f"오늘 {day} 09:05 개장 확인·08:40 입력 재확인", "종목": ", ".join(approved),
          "출처": f"관리자 후보 판독 {book.state}" + (f" — {book.note}" if book.note else "")},
         {"단계": "주문 허용", "건수": len(allow_ok) if book.state == "READY" else "-",
          "기준": "설정 allowed_symbols " + ("/".join(allowed) if allowed else "(제한 없음)"),
          "종목": ", ".join(allow_ok) + (f" (미허용: {', '.join(allow_no)} — 가격만 관찰)" if allow_no else ""),
          "출처": "config/settings.yaml"},
-        {"단계": "주문 전송·접수", "건수": (f"{rc.get('orders_sent', 0)}·{rc.get('orders_accepted', 0)}" if rn_today else "-"),
+        {"단계": "주문 전송·접수", "건수": (f"{rc.get('orders_sent', 0)}·{rc.get('orders_accepted', 0)}" if rn_today else
+                                     ("확인 불가" if runner.state == UNREADABLE else "-")),
          "기준": "오늘 실행기(매수·매도 합)", "출처": "runner_status.json" if rn_today else "오늘 실행기 기록 없음"},
-        {"단계": "매수 체결", "건수": len(buys), "기준": f"원장 {day}", "종목": ", ".join(sorted({e.symbol for e in buys})),
-         "출처": "fill_ledger.jsonl"},
+        {"단계": "매수 체결", "건수": "확인 불가" if buys is None else len(buys), "기준": f"원장 {day}",
+         "종목": "" if buys is None else ", ".join(sorted({e.symbol for e in buys})),
+         "출처": "fill_ledger.jsonl" + (f" — {lerr}" if lerr else "")},
     ]
     steps = [{"단계": r["단계"], "건수": r["건수"], "종목": r.get("종목", ""), "기준": r["기준"], "출처": r["출처"]}
              for r in raw_steps]
-    if not head:
-        oc = None
-        if open_t is not None:
-            oc = open_t["status"]
-        if n_all and not passed:
-            head = f"오늘 S1 매수 대상 없음 — 신호일 {sig} S1 통과 종목 없음({n_all}종목 분석, 데이터 준비 {n_ready})"
-        elif oc is None and now.time() < datetime.strptime("09:05", "%H:%M").time():
-            state, head = NOT_YET, f"S1 통과 {len(passed)}종목 — 개장 확인(09:05) 전"
-        elif book.state != "READY":
-            state = NOT_YET if book.state == "WAITING" else FAILED
-            head = f"S1 통과 {len(passed)}종목 — 후보 승인 {book.state}" + (f": {book.note}" if book.note else "")
-        elif not approved:
-            head = (f"S1 통과 {len(passed)}종목이 개장 확인에서 승인되지 않음"
-                    + (f" — {_rejected_text(book)}" if book.rejected else ""))
-        elif not allow_ok:
-            head = f"승인 {len(approved)}종목({', '.join(approved)})이 주문 허용 목록에 없어 가격만 관찰 중"
-        elif buys:
-            head = f"매수 체결 {len(buys)}건 — {', '.join(sorted({e.symbol for e in buys}))}"
-        else:
-            last = _last_reason(dec, allow_ok)
-            head = f"주문 허용 후보 {', '.join(allow_ok)} — " + (last or "실행기 판단 기록 없음(실행기가 켜져 있는지 확인)")
-        if buys and "매수 체결" not in head:
-            head += f" · 오늘 매수 체결 {len(buys)}건({', '.join(sorted({e.symbol for e in buys}))}, 원장)"
-        if pos:
-            head += f" · 보유 {', '.join(sorted(pos))}(손절·시간 청산 감시)"
-    return Section(OK, {"state": state, "headline": head, "steps": steps, "basis": basis},
+    # 전략 결과 — 신호·승인·주문 흐름(운영 문제와 섞지 않음)
+    if not scan_ok:
+        strat = "확인 불가(스캔 결과 없음)"
+    elif not passed:
+        strat = f"S1 통과 0건(신호일 {sig}, {n_all}종목 분석·데이터 준비 {n_ready})"
+    elif book.state != "READY":
+        strat = f"S1 통과 {len(passed)}건({', '.join(passed)}) — 승인 {'확인 불가' if book.state == 'ERROR' else '대기'}"
+    elif not approved:
+        strat = (f"S1 통과 {len(passed)}건이 개장 확인에서 승인되지 않음"
+                 + (f" — {_rejected_text(book)}" if book.rejected else ""))
+    elif not allow_ok:
+        strat = f"승인 {len(approved)}건({', '.join(approved)}) — 주문 허용 목록에 없어 가격만 관찰"
+    elif buys:
+        strat = f"매수 체결 {len(buys)}건 — {', '.join(sorted({e.symbol for e in buys}))}"
+    else:
+        last = _last_reason(dec, allow_ok)
+        strat = f"주문 허용 후보 {', '.join(allow_ok)} — " + (last or "실행기 판단 기록 없음")
+    if buys and "매수 체결" not in strat:
+        strat += f" · 오늘 매수 체결 {len(buys)}건({', '.join(sorted({e.symbol for e in buys}))}, 원장)"
+    if pos:
+        strat += f" · 보유 {', '.join(sorted(pos))}(손절·시간 청산 감시)"
+    elif pos is None:
+        strat += " · 보유 확인 불가"
+    state = FAILED if any(lv == FAILED for lv, _ in ops) else (NOT_YET if ops else DONE)
+    ops_text = "정상" if not ops else " / ".join(t for _, t in ops)
+    head = f"전략 결과: {strat} · 운영 상태: {ops_text}"
+    return Section(OK, {"state": state, "headline": head, "strategy": strat, "ops": ops, "steps": steps, "basis": basis},
                    source="watch_s1 · daemon(후보 판독) · strategy_decisions · fill_ledger · runner_status",
                    as_of=run.data["scan_at"] if run.state == OK and run.data else "")
 
@@ -384,7 +414,11 @@ def symbol_view(p: Paths, settings, day: date, now: datetime, *, calendar=None) 
         by_sym.setdefault(str(r.get("topic", "")).replace("exit:", ""), []).append(r)
     from app.entry_observation import observation_path, read_day, summarize
     obs = {s["symbol"]: s for s in summarize(read_day(observation_path(p.state_file), day))}
-    pos, _ = _ledger_today(p, day)
+    pos, _, lerr = _ledger_today(p, day)
+    if lerr:
+        note.append(f"{lerr} — 보유 여부 확인 불가(보유 감시 표시 없음)")
+    pos_known = pos is not None
+    pos = pos or {}
     purposes = _purposes(p)
     risk = ro_query(p.watch_db, "SELECT code,status,flags_json FROM symbol_risk")
     risk_map = {r["code"]: r for r in (risk.data or [])} if risk.state == OK else {}
@@ -423,19 +457,21 @@ def symbol_view(p: Paths, settings, day: date, now: datetime, *, calendar=None) 
         sc = s1_score(e)
         rows.append({"종목": (e or {}).get("name", ""), "코드": code, "감시 목적": " · ".join(pur) or "-",
                      "데이터": data_txt, "S1 판단": s1, "주문 자격": order_ok, "현재 상태": cur,
-                     "S1 점수": score_text(sc), "마지막 확인": r["checked_at"]})
+                     "S1 조건 충족도": score_text(sc, order_ok == "허용"), "마지막 확인": r["checked_at"]})
         D = [f"{(e or {}).get('name', '')} {code} — 감시 목적 {' · '.join(pur) or '-'} · 주문 자격 {order_ok}",
              f"데이터: 가격 {r['status']} {r['reason'] or ''} · 분석 {r['analysis_status']} {r['analysis_reason'] or ''}"
              f" (판정 {r['checked_at']})"]
         if rk and rk["status"] != "OK":
             D.append(f"위험 표시: {rk['status']} {rk['flags_json']}")
         if sc is not None:
-            D.append(f"S1 점수: {score_text(sc)} — 신호를 가르는 조건 {sc['total']}개 중 충족 비율(수익 예측·매수 추천 아님, "
-                     "10.0일 때만 신호)"
-                     + (f" · 남은 조건: {', '.join(check_label(n) for n in sc['missing'])}" if sc["missing"] else "")
+            D.append(f"S1 조건 충족도: {score_text(sc, order_ok == '허용')} — 신호를 가르는 조건 {sc['total']}개 중 충족 비율"
+                     "(보조 표시 — 수익 가능성·매수 우선순위 아님). 10점이어도 자격 조건(이력·보통주·위험 표시·거래대금·ATR)·"
+                     "주문 허용·개장 확인 승인을 모두 통과해야 매수"
+                     + (f" · 미충족: {', '.join(check_label(n) for n in sc['fail'])}" if sc["fail"] else "")
+                     + (f" · 판정 불가: {', '.join(check_label(n) for n in sc['unknown'])}" if sc["unknown"] else "")
                      + (f" · 자격 미달: {', '.join(check_label(n) for n in sc['gate_bad'])}" if sc["gate_bad"] else ""))
         else:
-            D.append("S1 점수: 기록 없음(판정 본문 없음)")
+            D.append("S1 조건 충족도: 기록 없음(판정 본문 없음)")
         D += eval_detail(e)
         if code in appr:
             a = appr[code]
@@ -455,6 +491,8 @@ def symbol_view(p: Paths, settings, day: date, now: datetime, *, calendar=None) 
             for x in evs_s[-5:]:
                 extra = x.get("reasons") or x.get("status") or ""
                 D.append(f"  {x.get('at', '')[11:19]} {EVENT_LABEL.get(x.get('event'), x.get('event'))} {extra}")
+        if not pos_known:
+            D.append("보유: 확인 불가(원장 읽기 실패)")
         if held:
             q = pos[code]
             D.append(f"보유: 원장 {q.quantity}주 · 평균 {q.avg_price:,.0f} · 첫 진입 {q.first_entry_date}")
