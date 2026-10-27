@@ -56,6 +56,19 @@ rows_watch = len(app.tabs["watch"].tree.get_children())
 after = tree_hash(R1)
 check("1) 창 그리기: 관리자 '실행 중', 감시 종목 3행, 5번 새로고침 뒤 자료 바이트 동일(쓰기 없음)",
       "실행 중" in st and rows_watch == 3 and before == after)
+# UI 1차: 첫 탭 '오늘 요약' 결론·단계 표, 감시 종목 행 선택 → 상세(저장된 조건별 근거), 새로고침해도 선택 유지
+sum_txt = app.sum_state.cget("text")
+wt = app.tabs["watch"]
+iid = next(i for i in wt.tree.get_children() if wt.tree.item(i, "values")[wt.cols.index("코드")] == "005930")
+wt.tree.selection_set(iid)
+app.win.update()
+app.refresh()
+app.win.update()
+det = wt.detail.get("1.0", "end")
+check("1-2) UI 1차: 첫 탭 '오늘 요약'에 상태·결론([정상 처리]…) + 단계 7줄, 감시 종목에서 005930 선택 → 상세에 저장된 조건별 근거"
+      "(전일 고가 돌파 미충족), 새로고침 뒤에도 선택·상세 유지",
+      app.nb.tab(0, "text") == "오늘 요약" and sum_txt.startswith("[") and len(app.tabs["summary"].tree.get_children()) == 7
+      and "전일 고가 돌파: 미충족" in det and wt.tree.selection())
 app.win.destroy()
 
 R2 = build(TMP / "empty", "empty", NOW)

@@ -676,8 +676,18 @@ def snapshot(p: Paths, settings, now: datetime, day: date | None = None) -> dict
     day = day or now.date()
     red = Redactor(settings)
     rn = runner_status(p, now)
+    from dashboard.decisions import symbol_view, today_summary
+    try:
+        summ = today_summary(p, settings, day, now, rn)
+    except Exception as exc:              # noqa: BLE001 — 한 구역 실패가 화면 전체를 막지 않음
+        summ = Section(UNREADABLE, error=f"{type(exc).__name__}: {exc}", source="오늘 요약")
+    try:
+        syms = symbol_view(p, settings, day, now)
+    except Exception as exc:              # noqa: BLE001
+        syms = Section(UNREADABLE, error=f"{type(exc).__name__}: {exc}", source="종목별 판단")
     return {"now": now.isoformat(timespec="seconds"), "daemon": daemon_status(p, now), "runner": rn,
-            "halt": buy_halt_view(p, now), "progress": today_progress(p, day, rn), "watch": watchlist(p),
+            "halt": buy_halt_view(p, now), "summary": summ, "symbols": syms,
+            "progress": today_progress(p, day, rn), "watch": watchlist(p),
             "holdings": holdings(p, rn), "orders": orders(p, rn), "errors": recent_errors(p, red),
             "costs": costs(p, settings)}
 

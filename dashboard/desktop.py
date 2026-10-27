@@ -106,7 +106,8 @@ class Table(ttk.Frame):
             self.tree.configure(columns=cols)
             for c in cols:
                 self.tree.heading(c, text=c)
-                width = 260 if c in ("내용", "조치", "신규 진입 제외 사유", "사유", "비고", "메모", "상태", "가격 출처", "결과") else 120
+                width = 260 if c in ("내용", "조치", "신규 진입 제외 사유", "사유", "비고", "메모", "상태", "가격 출처", "결과",
+                                     "S1 판단", "현재 상태", "종목", "출처", "기준", "데이터") else 120
                 self.tree.column(c, width=width, minwidth=60, stretch=True, anchor="w")
             self.cols = cols
         self.tree.delete(*self.tree.get_children())
@@ -124,6 +125,45 @@ class Table(ttk.Frame):
             return
         vals = self.tree.item(sel[0], "values")
         messagebox.showinfo("행 내용", "\n".join(f"{c}: {v}" for c, v in zip(self.cols, vals)), parent=self)
+
+
+class DetailTable(Table):
+    """UI 1차: 표 + 아래 상세(선택한 종목의 저장된 판단 근거). 행을 한 번 누르면 상세가 바뀜."""
+
+    def __init__(self, master, app):
+        super().__init__(master, app)
+        self.detail = tk.Text(self, height=14, wrap="word", font="TkTextFont")
+        self.detail.pack(fill="both", expand=False, padx=6, pady=(0, 6))
+        self.detail.configure(state="disabled")
+        self.tree.bind("<<TreeviewSelect>>", self._select)
+        self.details: dict[str, list[str]] = {}
+        self._sel_code = None
+
+    def show_with(self, rows, details, meta, empty):
+        keep = self._sel_code
+        self.details = details or {}
+        self.show(rows, meta, empty)
+        if keep is not None:                       # 새로고침해도 선택 유지
+            for iid in self.tree.get_children():
+                vals = self.tree.item(iid, "values")
+                if "코드" in self.cols and vals[self.cols.index("코드")] == keep:
+                    self.tree.selection_set(iid)
+                    break
+        self._render_detail()
+
+    def _select(self, _evt=None):
+        sel = self.tree.selection()
+        if sel and "코드" in self.cols:
+            self._sel_code = self.tree.item(sel[0], "values")[self.cols.index("코드")]
+        self._render_detail()
+
+    def _render_detail(self):
+        lines = self.details.get(self._sel_code) if self._sel_code else None
+        txt = "\n".join(lines) if lines else "종목을 누르면 판정 당시 저장된 근거(조건별 값·승인·관찰·실행기 판단)를 여기에 보여줍니다."
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        self.detail.insert("end", txt)
+        self.detail.configure(state="disabled")
 
 
 class App:
@@ -194,9 +234,19 @@ class App:
         self.nb = ttk.Notebook(self.win)
         self.nb.pack(fill="both", expand=True, padx=10, pady=(4, 10))
         self.tabs: dict[str, Table] = {}
-        for key, title in (("progress", "오늘 진행"), ("watch", "감시 종목"), ("holdings", "보유"), ("orders", "주문"),
+        # UI 1차: 첫 탭 '오늘 요약'(오늘 거래가 없는/있는 이유), '감시 종목'은 종목별 판단 + 선택 상세
+        sf = ttk.Frame(self.nb)
+        self.nb.add(sf, text="오늘 요약")
+        self.sum_state = tk.Label(sf, text="", font=self.f_title, anchor="w", justify="left", wraplength=1300)
+        self.sum_state.pack(fill="x", padx=10, pady=(10, 2))
+        self.sum_basis = ttk.Label(sf, text="", style="Meta.TLabel", justify="left", wraplength=1300)
+        self.sum_basis.pack(fill="x", padx=10, pady=(0, 4))
+        st = Table(sf, self)
+        st.pack(fill="both", expand=True)
+        self.tabs["summary"] = st
+        for key, title in (("watch", "감시 종목"), ("progress", "오늘 진행"), ("holdings", "보유"), ("orders", "주문"),
                            ("errors", "최근 오류"), ("events", "비용·체결 근거"), ("realized", "실현 손익")):
-            t = Table(self.nb, self)
+            t = DetailTable(self.nb, self) if key == "watch" else Table(self.nb, self)
             self.nb.add(t, text=title)
             self.tabs[key] = t
         lf = ttk.Frame(self.nb)
@@ -275,11 +325,29 @@ class App:
         self.halt_btn.state(["disabled"] if req else ["!disabled"])
 
         t = self.tabs
+        sm = snap["summary"]
+        if sm.state == D.OK:
+            d = sm.data
+            col = {"정상 처리": GREEN, "아직 처리하지 않음": YELLOW}.get(d["state"], RED)
+            self.sum_state.configure(text=f"[{d['state']}] {d['headline']}", fg=col)
+            b = d.get("basis") or {}
+            self.sum_basis.configure(text=(f"기준: 거래일 {b.get('trade_date', '-')} · 신호일 {b.get('signal_date', '-')} · 스캔 "
+                                           f"{b.get('scan', '-')} · 주문 허용 {', '.join(b.get('allowed') or [])} — 모든 건수는 "
+                                           "이 한 기준으로만 셈(다른 날 스캔·관찰을 섞지 않음)"))
+            t["summary"].show(d["steps"], meta_text(sm), "단계 기록 없음")
+        else:
+            self.sum_state.configure(text=f"[처리 실패·확인 불가] 오늘 요약 {D.STATE_LABEL[sm.state]}", fg=RED)
+            self.sum_basis.configure(text=sm.error)
+            t["summary"].show([], meta_text(sm), "요약 자료 없음")
+        sy = snap["symbols"]
+        if sy.state == D.OK:
+            t["watch"].show_with(sy.data["rows"], sy.data["details"], meta_text(sy), "감시 종목 없음")
+        else:
+            w = snap["watch"]
+            t["watch"].show_with(w.data if w.state == D.OK else [], {}, meta_text(sy) + "\n(종목별 판단을 읽지 못해 기본 표)",
+                                 f"감시 종목 자료 없음 — {D.STATE_LABEL[w.state]} {w.error}")
         pr = snap["progress"]
         t["progress"].show(pr.data, meta_text(pr), "진행 기록 없음")
-        w = snap["watch"]
-        t["watch"].show(w.data if w.state == D.OK else [], meta_text(w),
-                        f"감시 종목 자료 없음 — {D.STATE_LABEL[w.state]} {w.error}")
         h = snap["holdings"]
         t["holdings"].show(h.data if h.state == D.OK else [], meta_text(h), "보유 없음" if h.state == D.OK
                            else f"보유 확인 불가 — {D.STATE_LABEL[h.state]}")

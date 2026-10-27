@@ -95,6 +95,15 @@ def build(root: Path, scenario: str, now: datetime) -> Path:
                             "eligibility_pass,market_pass,stop_valid,data_status,index_status,snapshot_status,no_trades_hold,"
                             "final,actionable,input_hash,codec,evidence_z) VALUES('s1_x',?,?,'KOSPI',?,?,?,'FAIL','PASS','FAIL',"
                             "'PASS','OK','OK','OK',0,1,1,'h','c',x'00')", (sym, name, f"STOCK:{sym}", prev, sig))
+        # UI 1차: 005930은 판정 본문(조건별 저장 값)까지 — 전일 고가 돌파 미충족·시장 RISK_OFF
+        res = {"checks": [{"name": "C_GT_MA120", "result": "PASS", "value": 12000.0, "detail": ""},
+                          {"name": "PULLBACK", "result": "PASS", "value": 4, "detail": ""},
+                          {"name": "CLOSE_GT_PREV_HIGH", "result": "FAIL", "value": -1500.0, "detail": ""},
+                          {"name": "MARKET_REGIME", "result": "FAIL", "value": None, "detail": "RISK_OFF"}],
+               "market": {"state": "RISK_OFF", "index_id": "INDEX:KOSPI:001"},
+               "levels": {"stop_ref": 218000.0, "entry_cap": 231500.0, "risk_ratio_at_cap": 0.0583}}
+        ss.conn.execute("UPDATE s1_eval SET codec='zd1', result_z=? WHERE run_id='s1_x' AND symbol='005930'",
+                        (ss._pack(res),))
     data = root / "data"
     led = [
         {"v": 1, "event_id": "acct-swing|20261013|BUY|005930|0112293|1", "kind": "BUY", "symbol": "005930", "quantity": 1,

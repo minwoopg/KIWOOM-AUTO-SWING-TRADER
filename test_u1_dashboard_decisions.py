@@ -1,0 +1,142 @@
+# -*- coding: utf-8 -*-
+"""UI 1차 (GPT 10/27): 관리 창 '오늘 요약'·'감시 종목'(종목별 판단 + 선택 상세) 자료 계층 — 읽기 전용, 저장된 판단만.
+
+    python test_u1_dashboard_decisions.py
+
+임시 폴더의 가짜 기록만(dashboard.sample_data). 키움 API·파일 쓰기 없음.
+"""
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import shutil
+import sqlite3
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from app.candidates import ApprovedCandidate, CandidateBook  # noqa: E402
+from config.settings import load_settings  # noqa: E402
+from dashboard import data as D  # noqa: E402
+from dashboard import decisions as X  # noqa: E402
+from dashboard.sample_data import build  # noqa: E402
+
+results: list = []
+
+
+def check(label, cond):
+    results.append((label, bool(cond)))
+    print(f"[{'PASS' if cond else 'FAIL'}] {label}")
+
+
+TMP = Path(tempfile.mkdtemp(prefix="u1_"))
+NOW = datetime(2026, 10, 14, 10, 30)          # 신호일 = 2026-10-13
+SIG = "2026-10-13"
+
+
+def env(name, scenario="normal", allowed=()):
+    root = build(TMP / name, scenario, NOW)
+    s = load_settings(root / "config/settings.yaml")
+    if allowed:
+        s = dataclasses.replace(s, swing_strategy=dataclasses.replace(s.swing_strategy, allowed_symbols=tuple(allowed)))
+    return root, s, D.paths_from_settings(s, root)
+
+
+def tree_hash(root: Path) -> dict:
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+# 1. 정상 — 후보 0건
+R, S, P = env("normal")
+h0 = tree_hash(R)
+snap = D.snapshot(P, S, NOW)
+h1 = tree_hash(R)
+sm, sy = snap["summary"], snap["symbols"]
+check("1-1) 화면 자료를 읽어도 파일·DB 바이트 그대로(쓰기 없음)", h0 == h1)
+steps = {r["단계"]: r for r in sm.data["steps"]}
+check("1-2) 오늘 요약: [정상 처리] 신호일 10/13 S1 통과 0 — 'S1 매수 대상 없음'·분석 3·데이터 준비 3, 원장 매수 체결은 따로 표시, "
+      "보유 감시 표시, 모든 단계가 같은 신호일 스캔 기준",
+      sm.state == D.OK and sm.data["state"] == X.DONE and "S1 매수 대상 없음" in sm.data["headline"]
+      and steps["분석 대상(관심·S1)"]["건수"] == 3 and steps["S1 통과"]["건수"] == 0
+      and "매수 체결 1건" in sm.data["headline"] and "보유 005380" in sm.data["headline"]
+      and sm.data["basis"]["signal_date"] == SIG and "s1_x" in sm.data["basis"]["scan"])
+rows = {r["코드"]: r for r in sy.data["rows"]}
+det = "\n".join(sy.data["details"]["005930"])
+check("1-3) 종목별: 005930 S1 '탈락: 전일 고가 돌파, 시장 조건'(저장된 조건별 결과), 상세에 판정 당시 값(-1,500)·시장 RISK_OFF·"
+      "손절 기준·상한, 010120 '판정 안 함 — 데이터 확인 필요'",
+      rows["005930"]["S1 판단"] == "탈락: 전일 고가 돌파, 시장 조건" and "값 -1,500" in det and "RISK_OFF" in det
+      and "손절 기준 218,000" in det and rows["010120"]["현재 상태"].startswith("판정 안 함"))
+check("1-4) 판정 본문이 없는 행(010120)은 상세에 '기록 없음' — 다시 계산하지 않음",
+      any("기록 없음" in ln for ln in sy.data["details"]["010120"]))
+
+# 2. 승인됐지만 주문 미허용 → 가격만 관찰
+R2, S2, P2 = env("approved", allowed=("005930",))
+with sqlite3.connect(P2.watch_db) as cx:
+    cx.execute("INSERT INTO readiness(target,kind,code,status,reason,detail_json,config_version,run_id,checked_at,"
+               "analysis_status,analysis_reason) VALUES('STOCK:000660','STOCK','000660','READY','','{}',6,'prep_x',?,"
+               "'READY','')", (f"{SIG}T18:10:21",))
+with sqlite3.connect(P2.s1_db) as cx:
+    cx.execute("INSERT INTO s1_eval(run_id,symbol,name,market,series_id,signal_date,eligible_signal,pattern_pass,"
+               "eligibility_pass,market_pass,stop_valid,data_status,index_status,snapshot_status,no_trades_hold,final,"
+               "actionable,input_hash,codec,evidence_z) VALUES('s1_x','000660','SK하이닉스','KOSPI','STOCK:000660',?,'PASS',"
+               "'PASS','PASS','PASS','PASS','OK','OK','OK',0,1,1,'h','c',x'00')", (SIG,))
+obs = P2.state_file.with_name("entry_observation.jsonl")
+obs.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in (
+    {"at": "2026-10-14T09:06:00", "trade_date": "2026-10-14", "event": "OBS_QUOTE", "symbol": "000660",
+     "signal_id": "sig-000660", "signal_date": SIG, "price": 199000, "ask": 200500, "limit": 200000, "stop_ref": 180000,
+     "ok": False, "in_window": True, "reasons": ["ASK_ABOVE_LIMIT"]},
+    {"at": "2026-10-14T09:07:00", "trade_date": "2026-10-14", "event": "OBS_QUOTE", "symbol": "000660",
+     "signal_id": "sig-000660", "signal_date": SIG, "price": 198500, "ask": 199500, "limit": 200000, "stop_ref": 180000,
+     "ok": True, "in_window": True, "reasons": [], "stop_dist_pct": 9.32})), encoding="utf-8")
+BOOK = CandidateBook("READY", "2026-10-14", SIG, "h", [ApprovedCandidate(
+    "000660", "SK하이닉스", "sig-000660", SIG, "h", "s1_x", 200400.0, 180000.0, 200000, 199000, "WITHIN_CAP")])
+orig = X.candidate_book
+X.candidate_book = lambda *a, **k: BOOK
+h0 = tree_hash(R2)
+s2 = X.today_summary(P2, S2, NOW.date(), NOW, D.runner_status(P2, NOW))
+v2 = X.symbol_view(P2, S2, NOW.date(), NOW)
+X.candidate_book = orig
+r2 = {r["코드"]: r for r in v2.data["rows"]}
+d2 = "\n".join(v2.data["details"]["000660"])
+st2 = {r["단계"]: r for r in s2.data["steps"]}
+check("2-1) 오늘 요약: S1 통과 1 → 승인 1 → 주문 허용 0 → '승인 1종목(000660)이 주문 허용 목록에 없어 가격만 관찰 중'",
+      st2["S1 통과"]["건수"] == 1 and st2["개장 확인 승인"]["건수"] == 1 and st2["주문 허용"]["건수"] == 0
+      and "가격만 관찰" in s2.data["headline"] and "000660" in s2.data["headline"] and "미허용: 000660" in st2["주문 허용"]["종목"])
+check("2-2) 종목별: 000660 주문 자격 '미허용', 현재 상태 '승인 · 주문 미허용 — 가격만 관찰 (관찰 2회, 충족 1)', 상세에 승인 지정가·"
+      "장초반 관찰(최초 충족 09:07 198,500)", r2["000660"]["주문 자격"] == "미허용"
+      and r2["000660"]["현재 상태"] == "승인 · 주문 미허용 — 가격만 관찰 (관찰 2회, 충족 1)"
+      and "지정가 200,000" in d2 and "최초 충족 09:07 198,500" in d2 and h0 == tree_hash(R2))
+
+# 3. 아직 처리하지 않음 / 처리 실패
+R3, S3, P3 = env("noscan")
+with sqlite3.connect(P3.s1_db) as cx:
+    cx.execute("DELETE FROM scan_run")
+s3b = X.today_summary(P3, S3, NOW.date(), NOW, D.runner_status(P3, NOW))      # 마감 준비 COMPLETE인데 스캔 없음
+with sqlite3.connect(P3.daemon_db) as cx:
+    cx.execute("DELETE FROM task WHERE kind='CLOSE_PREP'")
+s3 = X.today_summary(P3, S3, NOW.date(), NOW, D.runner_status(P3, NOW))
+R4, S4, P4 = env("broken")
+P4.s1_db.write_bytes(b"not a sqlite file" * 10)
+s4 = X.today_summary(P4, S4, NOW.date(), NOW, D.runner_status(P4, NOW))
+R5, S5, P5 = env("empty", "empty")
+s5 = X.today_summary(P5, S5, NOW.date(), NOW, D.runner_status(P5, NOW))
+check("3-1) 신호일 마감 준비·스캔 없음 → '아직 처리하지 않음', 마감 준비 완료인데 스캔 없음 → '처리 실패', 스캔 DB 손상 → '처리 실패·확인 불가', "
+      "자료 없음 → '처리 실패·확인 불가'(정상 완료로 보이지 않음), 빈 폴더에 파일을 만들지 않음",
+      s3.data["state"] == X.NOT_YET and "스캔 기록 없음" in s3.data["headline"] and s3b.data["state"] == X.FAILED
+      and s4.data["state"] == X.FAILED and s5.data["state"] == X.FAILED
+      and not (R5 / "data").exists())
+
+# 4. 다시 계산하지 않음
+src = (Path(__file__).resolve().parent / "dashboard" / "decisions.py").read_text(encoding="utf-8")
+check("4-1) 화면 자료 코드에 S1 재계산·브로커·주문·API 호출 없음(저장된 판단만)",
+      all(x not in src for x in ("evaluate_s1", "KiwoomBroker", "place_order", "get_quote", "requests.", "_post(")))
+
+shutil.rmtree(TMP, ignore_errors=True)
+passed = sum(1 for _, ok in results if ok)
+print(f"\n총 {len(results)}건 중 통과 {passed}건, 실패 {len(results) - passed}건")
+sys.exit(0 if passed == len(results) else 1)
