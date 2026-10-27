@@ -50,9 +50,10 @@ b = io.StringIO()
 with contextlib.redirect_stdout(b):
     c1 = W.main(["--config", str(E["paths"].config), "--watch-db", str(wdb_new), "--db", str(rdb), "suggest",
                  "--kospi", "3", "--kosdaq", "1"])
-check("1-2) 정상 suggest: 연구 DB 바이트 그대로(mode=ro), 감시 DB는 열지도 만들지도 않음, 결과는 그대로(000660·035420·247540)",
+check("1-2) 정상 suggest: 연구 DB 바이트 그대로(mode=ro), 감시 DB는 열지도 만들지도 않음, 결과는 그대로(000660·035420·247540), "
+      "출력 명령의 코드 목록은 따옴표(H2 — PowerShell)",
       c1 == 0 and hashlib.sha256(rdb.read_bytes()).hexdigest() == h0 and not wdb_new.exists()
-      and all(x in b.getvalue() for x in ("000660", "035420", "247540")))
+      and all(x in b.getvalue() for x in ("000660", "035420", "247540")) and 'add-many "' in b.getvalue())
 
 # 2. 시장 조건만으로 제외
 P_, F_, U_ = "PASS", "FAIL", "UNKNOWN"
@@ -124,7 +125,7 @@ ocsv = next(oout.glob("*.csv")).read_text(encoding="utf-8-sig")
 check("5-2) 결과 측정 도구: 10/7 005930 신호 1건 → 진입일 없음(데이터 끝 — 다음 날 봉 없음)으로 분류, 보고서에 '운영 체결 재현이 아님'·"
       "처리 기준, CSV 행, 연구 DB 바이트 그대로",
       orc == 0 and "운영 체결 재현이 아님" in omd and "처리 기준" in omd and "2026-10-07,005930" in ocsv
-      and "계좌 기준" in omd and "진입 시 손절 거리" in omd and "계좌 수익률·계좌 최대 낙폭이 아님" not in omd
+      and "가상계좌" in omd and "실제 운영 재현 아님" in omd and "지금 운영의 계좌 결과" not in omd and "진입 시 손절 거리" in omd and "계좌 수익률·계좌 최대 낙폭이 아님" not in omd
       and "stop_dist_pct" in ocsv and "quality" in ocsv
       and hashlib.sha256(rdb.read_bytes()).hexdigest() == h0)
 

@@ -26,8 +26,9 @@ E1 청산 (C2 — GPT 최소판 요청 4, B 검토 C3)
 - 같은 신호는 한 번만: 의도를 넘기기 전에 신호 키를 기록(SignalKeyStore). 취소로 FLAT이 돼도 다시 진입하지 않음.
 - 한 폴링에 의도 하나.
 - 판단 기록: 후보 상태·보류 사유·의도를 decisions(콜백)로 남김(같은 사유 반복은 한 번).
-- H1: 주문 미허용(allowed_symbols 밖) 승인 후보는 그 폴링의 주문 판단이 끝난 뒤 `EntryObserver`로 가격만 관찰해 따로 기록
-  (의도·신호 키 없음, 보유·미해결 주문이 있어도 계속). 관찰 실패는 매매에 영향 없음.
+- H1·H2: 주문 미허용(allowed_symbols 밖) 승인 후보는 `after_tick`(실행기가 그 폴링의 주문 의도를 모두 처리한 뒤 호출)에서
+  `EntryObserver`로 가격만 관찰해 따로 기록(의도·신호 키 없음, 보유·미해결 주문이 있어도 계속, 실제 시계·15초 예산).
+  관찰 실패는 매매에 영향 없음.
 """
 
 from datetime import date, datetime, time
@@ -62,6 +63,7 @@ class S1EntryStrategy:
         self.allowed = frozenset(allowed_symbols)       # C3: 비어 있으면 제한 없음(그림자). paper는 기동 점검에서 필수
         self.price = price or (lambda sym: quote(sym)[0])
         self.observer = observer                        # H1: 주문 미허용 후보 가격 관찰(없으면 관찰 안 함)
+        self._obs_book = None
         self.book = None
         self._now: datetime | None = None
         # C4: forced 매도가 미접수면 종목별 재전송 간격(60·120·240…초, 최대 900초). 메모리 — 재시작하면 처음부터
@@ -181,6 +183,7 @@ class S1EntryStrategy:
 
     def on_tick(self, ctx: TickContext) -> list[OrderIntent]:
         now = self._now = ctx.now
+        self._obs_book = None
         if ctx.phase != MarketPhase.REGULAR:
             return []
         exits = self._exits(ctx)
@@ -188,18 +191,23 @@ class S1EntryStrategy:
             return exits                                   # 청산이 있으면 그 폴링은 신규 진입을 보지 않음
         if not (self.entry_start <= now.time() < self.entry_end):
             return []
-        self.book = None
         out = self._entry(ctx)
-        self._observe(ctx)                                 # H1: 주문 판단 뒤에(주문을 늦추지 않음)
+        self._obs_book = self.book                         # 이번 폴링에 읽은 승인 — after_tick 관찰 대상
         return out
 
-    def _observe(self, ctx: TickContext) -> None:
-        if self.observer is None or not self.allowed or self.book is None or self.book.state != "READY":
+    def after_tick(self, ctx: TickContext, clock: Callable[[], datetime] | None = None) -> None:
+        """H2(GPT 10/27): 실행기가 그 폴링의 주문 의도를 모두 처리한 뒤 호출 — 주문 미허용 승인 후보 가격 관찰.
+        on_tick이 진입 판단을 한 폴링(그때 읽은 승인)만 대상. clock은 실행기 시계(실제 수신 시각 기록·마감 판정)."""
+        book, self._obs_book = self._obs_book, None
+        if self.observer is None or not self.allowed or book is None or book.state != "READY":
+            return
+        if ctx.phase != MarketPhase.REGULAR:
             return
         try:
-            cands = [c for c in self.book.approved if c.symbol not in self.allowed]
+            cands = [c for c in book.approved if c.symbol not in self.allowed]
             if cands:
-                self.observer.observe(ctx.now, ctx.trade_date, cands)
+                self.observer.observe(ctx.trade_date, cands, window_end=datetime.combine(ctx.trade_date, self.entry_end),
+                                      clock=clock)
         except Exception as exc:                           # noqa: BLE001 — 관찰 실패가 매매를 멈추지 않음
             self._note(ctx, "observe", "OBSERVE_FAILED", {"error": f"{type(exc).__name__}: {exc}"})
 

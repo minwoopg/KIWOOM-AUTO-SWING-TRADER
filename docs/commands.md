@@ -73,7 +73,7 @@ python tools/watchlist.py restore
 관찰 확대(E1): 후보 보기(읽기만) → 확인 → 한 번에 추가. 관리자를 멈춘 상태에서 합니다.
 ```powershell
 python tools/watchlist.py suggest --kospi 20 --kosdaq 10
-python tools/watchlist.py add-many 000660,035420 --interest --s1
+python tools/watchlist.py add-many "000660,035420" --interest --s1
 ```
 
 신호 결과 측정(E3, 연구용 일봉 근사 — 운영 체결 재현 아님) — `reports\research\s1_outcome_<날짜>_<ID>.md`
@@ -83,9 +83,9 @@ python tools/s1_outcome.py --days 250
 
 S1 신호 빈도 분석(E1, 조회 전용) — 결과는 `reports\research\s1_frequency_<날짜>.md` · `.csv`
 ```powershell
-python tools/research_collect.py backfill --codes 005930,000660 --from 2025-01-01   # 일봉이 모자라면
+python tools/research_collect.py backfill --codes "005930,000660" --from 2025-01-01   # 일봉이 모자라면
 python tools/s1_frequency.py --days 250
-python tools/s1_frequency.py --days 250 --group base5=005930,005380,010120,058470,196170 --group all=watch   # 그룹·기간 비교(E3)
+python tools/s1_frequency.py --days 250 --group "base5=005930,005380,010120,058470,196170" --group "all=watch"   # 그룹·기간 비교(E3)
 Get-Content reports\research\s1_frequency_2026-10-21.md -Encoding UTF8
 ```
 

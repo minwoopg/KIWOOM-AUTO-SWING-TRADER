@@ -2305,4 +2305,33 @@ GPT가 E1(`72c81bb`)을 검토하며 3건 재현 + 1건 지적: suggest가 쓰�
 ### 전달 파일
 - `swing_h1.zip` (G1 다음에 적용)
 
+## H2 — H1 관찰 주문 지연·시각 보완, 가상계좌 표시, PowerShell 코드 목록 (2026-10-27, GPT 10/27 검토)
+
+### 배경
+- GPT 재현: H1 관찰 조회가 주문 의도 반환 경로 안에 있어, 09:29:55 판단 + 관찰 20초 → 의도가 09:30:15에 실행기로 돌아가고 실행기는 폴링 시작 시각으로 진입 마감을 검사해 막지 못함. 관찰 기록도 폴링 시작 시각으로 남아 "시간 안 충족"이 왜곡될 수 있음.
+- 결과 측정 보고서의 "그 결과가 지금 운영의 계좌 결과임" 표현이 부정확(관찰 25종목·운영 조건 미재현).
+- 10/27 사용자 PC: PowerShell이 따옴표 없는 `000660,...`를 숫자로 읽어 앞자리 0을 지움 → add-many 거부.
+
+### 변경 내용
+- `app/session_runner.py` — 의도 처리 뒤 `_after_tick`(전략 `after_tick(ctx, clock)`, 예외는 경고만). 매수 진입 마감 검사를 전송 직전 실제 시각으로, 폴링 시작 뒤 30초 넘은 매수 판단은 `STALE_DECISION`(`MAX_BUY_DECISION_AGE_SEC`).
+- `app/s1_strategy.py` — 관찰을 `on_tick`에서 빼 `after_tick`으로(그 폴링에 읽은 승인만).
+- `app/entry_observation.py` — 실행기 시계로 종목별 `requested_at`·`received_at`, `in_window`, 한 폴링 15초 예산·마감 뒤 조회 안 함, 마감 뒤 수신은 최초 충족·충족 횟수에서 제외, 요약에 "마감 뒤 수신".
+- `tools/s1_outcome.py` — 3장 "가상계좌 — 관찰 N종목 … 실제 운영 재현 아님", 운영과 다른 점 명시, "1주 고정(운영과 같은 수량)", 거래량 0 처리는 연구 규칙이라는 문구.
+- `tools/watchlist.py` — `suggest` 출력 명령에 따옴표, `add-many`에 6자리 아닌 코드 거부 + PowerShell 따옴표 안내. `tools/research_collect.py` backfill `--codes` 같은 검사.
+- 문서 `docs/h1_entry_observation.md`(H2 절), `docs/e3_outcome_compare.md`, `docs/commands.md`(코드 목록 따옴표).
+
+### 테스트 및 검증
+- `test_h2_observation_timing.py` 8건 — 실행기 통합: 느린 관찰에서도 주문이 관찰보다 먼저 전송, 관찰 시각 = 실제 요청·수신·마감 뒤 수신은 충족 아님, 폴링 시작 09:29:50·판단 끝 09:30:05 → ENTRY_WINDOW_CLOSED, 45초 지난 판단 STALE_DECISION, 관찰 예산·마감, after_tick 예외 격리, 앞자리 0 안내·add-many 거부.
+- `test_h1_entry_observation.py`를 after_tick 순서로 갱신, `test_e2_fixes.py` 1-2·5-2 갱신. 회귀 전체, 단타 동등성 18/18, 데스크톱 대시보드.
+
+### 변경하지 않은 것
+- 주문 허용 종목·수량·최대 보유, S1 판정, 신호 키 규칙, 실행기·관리자 기동 방식(사람이 직접), 설정 파일.
+
+### 다음 작업
+- 관리 창 UI 1차(오늘 단계별 건수·종목별 상태·제외 사유·선택 종목 상세 — 저장된 판단만 읽음).
+- 순차 선택 순서 민감도, 시장 조건만 탈락한 후보 연구 기록, 거래량 0 처리 대안 비교.
+
+### 전달 파일
+- `swing_h2.zip`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

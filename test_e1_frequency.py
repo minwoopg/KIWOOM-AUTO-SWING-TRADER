@@ -133,7 +133,7 @@ c1, o1 = cli("suggest", "--kospi", "5", "--kosdaq", "5")
 check("4-1) suggest: 보통주·위험 없음만(ETF 069500 제외), 이미 있는 005930·000660 제외, 시장별 시가총액 순 → 035420(KOSPI)·"
       "247540(KOSDAQ), add-many 명령 출력. 설정 파일 그대로",
       c1 == 0 and "035420" in o1 and "247540" in o1 and "069500" not in o1 and "| 005930" not in o1
-      and "add-many 035420,247540 --interest --s1" in o1 and EW["cfg"].read_text(encoding="utf-8") == cfg_before)
+      and 'add-many "035420,247540" --interest --s1' in o1 and EW["cfg"].read_text(encoding="utf-8") == cfg_before)
 with WatchStore(EW["wdb"]) as ws:
     v_before = len(ws.history(1000))
 E["fake"].series["247540"] = flat_series(50_000)

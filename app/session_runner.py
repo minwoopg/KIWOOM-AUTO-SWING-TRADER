@@ -153,6 +153,7 @@ class SessionSummary:
 
 
 class SessionRunner:
+    MAX_BUY_DECISION_AGE_SEC = 30      # H2: 폴링 시작 → 매수 전송 직전까지 허용 시간(넘으면 STALE_DECISION)
     def __init__(
         self,
         *,
@@ -457,8 +458,20 @@ class SessionRunner:
             intents = self._safe_strategy_call("on_tick", ctx) or []
             for intent in intents:
                 self._handle_intent(intent, ctx)
+            self._after_tick(ctx)
         self.executor.save_state()
         return ctx
+
+    def _after_tick(self, ctx: TickContext) -> None:
+        """H2(GPT 10/27): 그 폴링의 주문 의도를 모두 처리(전송)한 뒤 전략의 부가 작업(주문 미허용 후보 가격 관찰).
+        주문 경로와 분리 — 예외는 기록만 하고 계속."""
+        hook = getattr(self.strategy, "after_tick", None)
+        if hook is None:
+            return
+        try:
+            hook(ctx, self.clock)
+        except Exception as exc:                         # noqa: BLE001
+            self.log.warning(f"[STRATEGY] after_tick 예외(매매 영향 없음): {type(exc).__name__}: {exc}")
 
     def _shadow(self, intent: OrderIntent, ctx: TickContext, *, allowed: bool, code: str = "", detail: str = "") -> None:
         """그림자 모드 기록 — 전송하지 않음. 판정(허용/차단 사유)과 의도 전체를 남김."""
@@ -562,14 +575,26 @@ class SessionRunner:
                               f"최소판 상한 {self.cfg.max_buy_quantity}주")
             self._shadow(intent, ctx, allowed=False, code="QTY_LIMIT")
             return "GUARD_REJECTED:QTY_LIMIT", ""
+        # H2(GPT 10/27): 진입 마감은 폴링 시작 시각(ctx.now)이 아니라 **전송 직전 실제 시각**으로 검사
+        fresh = self.clock() if intent.side == "BUY" else ctx.now
         if (intent.side == "BUY" and intent.order_type == "limit" and self.cfg.entry_cancel_at is not None
-                and ctx.now.time() >= self.cfg.entry_cancel_at):
+                and max(ctx.now, fresh).time() >= self.cfg.entry_cancel_at):
             self.summary.intents_denied += 1
             self.summary.denied_codes["ENTRY_WINDOW_CLOSED"] = self.summary.denied_codes.get("ENTRY_WINDOW_CLOSED", 0) + 1
             self.log.info(f"[GUARD] {intent.symbol} 지정가 BUY 차단 | ENTRY_WINDOW_CLOSED | "
                           f"진입 마감 {self.cfg.entry_cancel_at:%H:%M}")
             self._shadow(intent, ctx, allowed=False, code="ENTRY_WINDOW_CLOSED")
             return "GUARD_REJECTED:ENTRY_WINDOW_CLOSED", ""
+        age = (fresh - ctx.now).total_seconds()
+        if intent.side == "BUY" and age > self.MAX_BUY_DECISION_AGE_SEC:
+            # H2: 폴링 시작 뒤 너무 오래 지난 매수 판단(가격 재확인 시점이 낡음) — 보내지 않음. 신호 키는 이미 기록됐으므로
+            # 그 신호는 다시 쓰지 않음(뒤늦은 추격 매수 없음, 보수적).
+            self.summary.intents_denied += 1
+            self.summary.denied_codes["STALE_DECISION"] = self.summary.denied_codes.get("STALE_DECISION", 0) + 1
+            self.log.warning(f"[GUARD] {intent.symbol} BUY 차단 | STALE_DECISION | 판단 뒤 {age:.0f}초 "
+                             f"(한도 {self.MAX_BUY_DECISION_AGE_SEC}초)")
+            self._shadow(intent, ctx, allowed=False, code="STALE_DECISION")
+            return "GUARD_REJECTED:STALE_DECISION", f"{age:.0f}s"
         prices: dict[str, int] = {}
         reserve, unknown_pending = 0, False
         if intent.side == "BUY":

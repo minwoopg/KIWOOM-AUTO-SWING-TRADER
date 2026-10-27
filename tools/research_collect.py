@@ -329,7 +329,13 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
                     print(f"열린 백필 작업 없음 — 마지막 작업 {done_jobs[0][0]} 완료. 새 날짜는 update로 받습니다.\n"
                           "전체를 정말 다시 받으려면 --new, 짧게 끝난 시계열만은 --recheck-shortfall, 일부 종목은 --codes")
                     return 0
-                codes = [c.strip() for c in args.codes.split(",")] if args.codes else None
+                codes = [c.strip() for c in args.codes.split(",") if c.strip()] if args.codes else None
+                bad = [c for c in codes or [] if not (len(c) == 6 and c.isalnum())]
+                if bad:
+                    tip = (' — 앞자리 0이 빠졌습니다. PowerShell에서는 따옴표로 감싸세요: --codes "000660,005930"'
+                           if any(c.isdigit() and len(c) < 6 for c in bad) else "")
+                    print(f"[중단] 6자리 종목코드가 아님: {', '.join(bad[:8])}{tip}")
+                    return 2
                 sids = None
                 if args.recheck_shortfall:
                     sids = [r[0] for r in store.conn.execute(

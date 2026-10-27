@@ -18,7 +18,7 @@
     python tools/watchlist.py status
     python tools/watchlist.py history
     python tools/watchlist.py suggest --kospi 20 --kosdaq 10   # E1: 관찰 확대 후보(읽기만 — 파일·DB 안 바꿈)
-    python tools/watchlist.py add-many 000660,035420 --interest --s1   # E1: 여러 종목을 한 번에(설정 1버전)
+    python tools/watchlist.py add-many "000660,035420" --interest --s1   # E1: 여러 종목을 한 번에(설정 1버전)
 
 - 바꾸는 명령(add·set·enable·disable·holding-close·remove·restore)은 바꾼 결과를 먼저 검증(보유 보호 포함)하고, 틀리면
   파일을 바꾸지 않고 종료 코드 2. 파일을 쓴 뒤 적용이 거부되면 파일을 되돌리고 종료 코드 2(W1b-R2).
@@ -158,6 +158,18 @@ def _band(s: str) -> dict:
 
 def _code(s: str) -> str:
     return s.strip().upper()
+
+
+def bad_code_hint(codes) -> str:
+    """6자리가 아닌 숫자 코드(예: 000660 → 660) — PowerShell이 따옴표 없는 쉼표 목록을 숫자로 읽어 앞자리 0을 지운 경우가 많음."""
+    bad = [c for c in codes if not (len(c) == 6 and c.isalnum())]
+    if not bad:
+        return ""
+    msg = f"6자리 종목코드가 아님: {', '.join(bad[:8])}{' …' if len(bad) > 8 else ''}"
+    if any(c.isdigit() and len(c) < 6 for c in bad):
+        msg += (" — 앞자리 0이 빠졌습니다. PowerShell에서는 목록을 따옴표로 감싸세요: "
+                '--codes "000660,005930" / add-many "000660,005930"')
+    return msg
 
 
 def _apply_holding_args(item: dict, args, *, create: bool) -> None:
@@ -419,8 +431,8 @@ def _suggest(args, rstore, cfg_path: Path, snap_id) -> int:
             print(f"| {i} | {r['code']} | {r['name']} | {r['last_price']:,} | {r['list_count'] * r['last_price'] // 100_000_000:,} |")
     print(f"\n기존 {len(have)}종목 + 추가 후보 {len(out)}종목 = 총 {len(have) + len(out)}종목 "
           f"(--kospi·--kosdaq은 기존을 뺀 **추가** 수)")
-    print(f"\n확인 뒤 추가(관심·S1, 설정 1버전, 과거 일봉 준비):\npython tools/watchlist.py add-many "
-          f"{','.join(r['code'] for r in out)} --interest --s1")
+    print(f"\n확인 뒤 추가(관심·S1, 설정 1버전, 과거 일봉 준비 — PowerShell에서도 그대로 되게 따옴표):\n"
+          f"python tools/watchlist.py add-many \"{','.join(r['code'] for r in out)}\" --interest --s1")
     return 0
 
 
@@ -545,6 +557,10 @@ def main(argv: list[str] | None = None, *, client=None, now=now_local, calendar:
 
         if args.cmd == "add-many":
             codes = [_code(c) for c in args.codes.split(",") if c.strip()]
+            hint = bad_code_hint(codes)
+            if hint:
+                print(f"[거부] {hint} — 아무것도 바꾸지 않음")
+                return 2
             if not codes or len(set(codes)) != len(codes):
                 print("[거부] 종목코드 목록이 비었거나 중복")
                 return 2

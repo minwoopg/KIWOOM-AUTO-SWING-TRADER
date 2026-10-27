@@ -90,7 +90,8 @@ def render(rid, args, params, sigs, res, seq, mi, ms, stocks, accts) -> str:
     else:
         L.append("보유 중 중간 공백 없음(확정 표본 = 청산 완료 전체).")
     nt = [r for r in rv if r.get("no_trades_days")]
-    L += ["", f"보유 중 거래 없는 봉(거래량 0)을 건너뛴 거래 {len(nt)}건 — 체결·손절이 불가능한 날로 보고 확정 표본에 포함."]
+    L += ["", f"보유 중 거래 없는 봉(거래량 0)을 건너뛴 거래 {len(nt)}건 — 체결·손절이 불가능한 날로 보고 확정 표본에 포함"
+          "(연구상 처리 규칙 — 그날 실제로 거래 가능·불가능했는지 확인한 것은 아님)."]
     L += ["", "## 6. 처리 기준", "",
           "- 시가 > 지정가(상한 호가 내림): 장중 저가가 내려와도 체결로 보지 않음(미진입).",
           "- 시가 ≤ 손절 기준: 미진입(운영도 현재가 ≤ 손절 기준이면 주문 안 함).",
@@ -116,9 +117,12 @@ def render(rid, args, params, sigs, res, seq, mi, ms, stocks, accts) -> str:
 
 
 def _account_section(accts, args) -> list[str]:
-    L = ["", f"## 3. 계좌 기준 (순차 선택, 초기 자금 {args.capital:,}원)", "",
+    L = ["", f"## 3. 가상계좌 — 관찰 {args.n_codes}종목·순차 선택, 초기 자금 {args.capital:,}원 (**실제 운영 재현 아님**)", "",
          "현금·보유 평가액(그날 종가)·매수·매도 비용을 반영한 일별 평가 곡선. 수량 기준에 따라 원화 결과가 달라지므로 두 기준을 "
-         "함께 냄 — 어느 쪽이 좋아 보이는지로 고르지 않음. **현재 운영 규칙은 1주 고정**이며 그 결과가 지금 운영의 계좌 결과임.", "",
+         "함께 냄 — 어느 쪽이 좋아 보이는지로 고르지 않음.", "",
+         "**운영과 다른 점:** 수량만 운영과 같은 1주로 맞춘 가상계좌임. 주문 허용 종목(운영은 일부 종목만), 실제 진입 시간"
+         "(09:05~09:30 현재가·호가 재확인), 계좌 안전 한도·일일 손실·실패 주문 중단을 재현하지 않음 — **현재 모의계좌에서 "
+         "기대할 수 있는 성과로 해석하지 않음.**", "",
          "| 수량 기준 | 거래 | 최종 평가액 | 손익 | 계좌 수익률 | 계좌 최대 낙폭 | 최대 투입 비중 | 보유일 비율 | 비용 합 | 건너뜀 |",
          "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
     for label, a in accts:
@@ -191,6 +195,7 @@ def main(argv=None) -> int:
     end = date.fromisoformat(args.end) if args.end else min(b[-1].date for b in indexes.values())
     sig_days = [d for d in all_days if d <= end][-args.days:]
     args.first, args.end = sig_days[0], end
+    args.n_codes = len(stocks)
     fr = analyze(sig_days, lambda t: all_days[:bisect.bisect_right(all_days, t)][-SCAN_LOOKBACK_SESSIONS:], stocks, indexes)
     sigs = sorted(({"date": r["date"], "code": r["code"], "stop_ref": r.get("stop_ref"), "entry_cap": r.get("entry_cap")}
                    for r in fr.rows if r["eligible_signal"] == "PASS"), key=lambda s: (s["date"], s["code"]))
@@ -204,7 +209,7 @@ def main(argv=None) -> int:
     mi, ms = metrics(res.values()), metrics(seq)
     cfn = params.cost_fn
     acct_days = [d for d in all_days if d >= sig_days[0]]
-    accts = [("1주 고정(현재 운영 규칙)", account(seq, bars, acct_days, args.capital, lambda px: 1, cfn)),
+    accts = [("1주 고정(운영과 같은 수량)", account(seq, bars, acct_days, args.capital, lambda px: 1, cfn)),
              (f"고정 금액 {args.per_trade:,}원(수량 내림)",
               account(seq, bars, acct_days, args.capital, lambda px: args.per_trade // px, cfn))]
     rid, files = create_exclusive(args.out_dir, f"s1_outcome_{end.isoformat()}", (".md", ".csv"))
