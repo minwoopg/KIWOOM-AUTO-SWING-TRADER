@@ -514,13 +514,15 @@ def build_s1_strategy(settings: Settings, broker, calendar, quote_source, sessio
             return v if type(v) is int and v > 0 else None
     hh, mm = st.entry_start.split(":")
     entry_end = session_cfg.entry_cancel_at or _time(9, 30)
+    from app.entry_observation import EntryObserver, observation_path
+    observer = EntryObserver(quote, _jsonl_sink(observation_path(settings.storage.state_file)), mode=st.mode)
     return S1EntryStrategy(
         mode=st.mode, scope=settings.broker.account_scope_id.strip() or "unscoped",
         candidates=candidates or reader.read, quote=quote,
         keys=SignalKeyStore(keys_path(settings.storage.state_file, st.mode)),
         decisions=_jsonl_sink(Path(settings.storage.state_file).with_name("strategy_decisions.jsonl")),
         entry_start=_time(int(hh), int(mm)), entry_end=entry_end, quantity=st.quantity,
-        calendar=calendar, price=price, allowed_symbols=st.allowed_symbols)
+        calendar=calendar, price=price, allowed_symbols=st.allowed_symbols, observer=observer)
 
 
 def run_session(settings: Settings, broker, app_logger, *, strategy=None, clock=None, sleep=None,

@@ -91,7 +91,8 @@ def generate_daily_report(
         trade_date=trade_date, events=events, metas=state.positions, closes=closes,
         unresolved_intents=sorted(state.unresolved_order_intents), journal_symbols=journal,
         reconcile=reconcile_report, balance_available=balance is not None or reconcile_report is not None,
-        session_lines=(session_lines or []) + _daily_risk_lines(settings, trade_date), generated_at=datetime.now(), historical=historical,
+        session_lines=(session_lines or []) + _daily_risk_lines(settings, trade_date)
+        + _observation_lines(settings, trade_date), generated_at=datetime.now(), historical=historical,
         reconcile_missing_reason=reconcile_missing_reason if reconcile_report is None else "",
         close_check=close_check, close_issues=list(close_issues or []),
         actual_costs=actual_costs, evidence_notes=evidence_notes,
@@ -178,6 +179,7 @@ def export_bundle(settings, day: date, *, root: Path, out_dir: str | Path = "exp
     sd = Path(st.state_file).parent
     files["strategy_decisions.jsonl"] = json_lines(sd / "strategy_decisions.jsonl", day_filter="at")
     files["shadow_intents.jsonl"] = json_lines(sd / "shadow_intents.jsonl", day_filter="at")
+    files["entry_observation.jsonl"] = json_lines(sd / "entry_observation.jsonl", day_filter="at")   # H1
     files["daily_risk.jsonl"] = json_lines(sd / "daily_risk.jsonl", day_filter="trade_date")
     for k in sorted(sd.glob("strategy_signal_keys_*.jsonl")):
         files[k.name] = json_lines(k)
@@ -258,6 +260,15 @@ def _daily_risk_lines(settings, trade_date) -> list[str]:
     for h in halts:
         out.append(f"신규 매수 중단(일일 위험) {h.get('at')}: {h.get('reason')}")
     return out
+
+
+def _observation_lines(settings, trade_date) -> list[str]:
+    """H1: 주문 미허용 승인 후보 장초반 관찰 요약(없으면 줄 없음)."""
+    try:
+        from app.entry_observation import observation_path, report_lines
+        return report_lines(observation_path(settings.storage.state_file), trade_date)
+    except Exception as exc:                               # noqa: BLE001 — 보고서 생성은 계속
+        return ["", f"주문 미허용 후보 관찰 요약 실패: {type(exc).__name__}: {exc}"]
 
 
 def _prev_day(day):

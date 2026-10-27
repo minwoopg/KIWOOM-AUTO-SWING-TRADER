@@ -26,11 +26,14 @@ E1 청산 (C2 — GPT 최소판 요청 4, B 검토 C3)
 - 같은 신호는 한 번만: 의도를 넘기기 전에 신호 키를 기록(SignalKeyStore). 취소로 FLAT이 돼도 다시 진입하지 않음.
 - 한 폴링에 의도 하나.
 - 판단 기록: 후보 상태·보류 사유·의도를 decisions(콜백)로 남김(같은 사유 반복은 한 번).
+- H1: 주문 미허용(allowed_symbols 밖) 승인 후보는 그 폴링의 주문 판단이 끝난 뒤 `EntryObserver`로 가격만 관찰해 따로 기록
+  (의도·신호 키 없음, 보유·미해결 주문이 있어도 계속). 관찰 실패는 매매에 영향 없음.
 """
 
 from datetime import date, datetime, time
 from typing import Callable
 
+from app.entry_observation import entry_reasons
 from domain.strategy.interface import OrderIntent, TickContext
 from utils.trading_calendar import MarketPhase
 
@@ -48,7 +51,8 @@ class S1EntryStrategy:
     def __init__(self, *, mode: str, scope: str, candidates: Callable[[date, datetime], object],
                  quote: Callable[[str], tuple[int | None, int | None]], keys, decisions: Callable[[dict], None],
                  entry_start: time, entry_end: time, quantity: int = 1, calendar=None,
-                 price: Callable[[str], int | None] | None = None, allowed_symbols: tuple[str, ...] = ()) -> None:
+                 price: Callable[[str], int | None] | None = None, allowed_symbols: tuple[str, ...] = (),
+                 observer=None) -> None:
         if quantity != 1:
             raise ValueError("최소판: 수량 1 고정")
         self.mode, self.scope = mode, scope
@@ -57,6 +61,7 @@ class S1EntryStrategy:
         self.calendar = calendar
         self.allowed = frozenset(allowed_symbols)       # C3: 비어 있으면 제한 없음(그림자). paper는 기동 점검에서 필수
         self.price = price or (lambda sym: quote(sym)[0])
+        self.observer = observer                        # H1: 주문 미허용 후보 가격 관찰(없으면 관찰 안 함)
         self.book = None
         self._now: datetime | None = None
         # C4: forced 매도가 미접수면 종목별 재전송 간격(60·120·240…초, 최대 900초). 메모리 — 재시작하면 처음부터
@@ -183,6 +188,23 @@ class S1EntryStrategy:
             return exits                                   # 청산이 있으면 그 폴링은 신규 진입을 보지 않음
         if not (self.entry_start <= now.time() < self.entry_end):
             return []
+        self.book = None
+        out = self._entry(ctx)
+        self._observe(ctx)                                 # H1: 주문 판단 뒤에(주문을 늦추지 않음)
+        return out
+
+    def _observe(self, ctx: TickContext) -> None:
+        if self.observer is None or not self.allowed or self.book is None or self.book.state != "READY":
+            return
+        try:
+            cands = [c for c in self.book.approved if c.symbol not in self.allowed]
+            if cands:
+                self.observer.observe(ctx.now, ctx.trade_date, cands)
+        except Exception as exc:                           # noqa: BLE001 — 관찰 실패가 매매를 멈추지 않음
+            self._note(ctx, "observe", "OBSERVE_FAILED", {"error": f"{type(exc).__name__}: {exc}"})
+
+    def _entry(self, ctx: TickContext) -> list[OrderIntent]:
+        now = ctx.now
         # C1(GPT 검토 R1): 신규 진입을 검토하는 폴링마다 승인을 새로 읽음 — 이전 READY를 계속 쓰지 않음.
         # 최신 결과가 ERROR·WAITING·거부면 그 폴링은 의도 없음. 이미 쓴 신호 키는 다시 살아나지 않음.
         self.book = self.candidates(ctx.trade_date, now)
@@ -217,18 +239,7 @@ class S1EntryStrategy:
             except Exception as exc:                       # noqa: BLE001
                 price, ask = None, None
                 self._note(ctx, c.symbol, "QUOTE_FAILED", {"error": f"{type(exc).__name__}: {exc}"})
-            why = []
-            if not price:
-                why.append("NO_PRICE")
-            else:
-                if price <= c.stop_ref:
-                    why.append("PRICE_AT_OR_BELOW_STOP")
-                if price > c.entry_cap:
-                    why.append("PRICE_ABOVE_CAP")
-            if not ask:
-                why.append("NO_ASK")
-            elif ask > c.limit_price:
-                why.append("ASK_ABOVE_LIMIT")
+            why = entry_reasons(price, ask, c)
             if why:
                 self._note(ctx, c.symbol, "WAIT_PRICE", {"reasons": why, "price": price, "ask": ask,
                                                          "limit": c.limit_price, "stop_ref": c.stop_ref,

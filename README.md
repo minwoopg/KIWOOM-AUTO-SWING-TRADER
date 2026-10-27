@@ -33,6 +33,7 @@
   일일 손실·실패 주문 한도·공통 비용·paper 사전 점검(M3 C3): [`docs/m3_c3_daily_risk_paper.md`](docs/m3_c3_daily_risk_paper.md).
   단계별 건수·S1 신호 빈도 분석·관찰 종목 확대(E1): [`docs/e1_frequency_expand.md`](docs/e1_frequency_expand.md).
   관찰 확대 기준·그룹/월별 비교·연구용 신호 결과 측정(E3): [`docs/e3_outcome_compare.md`](docs/e3_outcome_compare.md).
+  주문 미허용 승인 후보의 장초반 가격 관찰(H1): [`docs/h1_entry_observation.md`](docs/h1_entry_observation.md).
 - **명령어 모음**(복사해서 쓰기): [`docs/commands.md`](docs/commands.md).
 - **관리 창**: `scripts\run_dashboard.bat`(Tkinter 데스크톱, 추가 설치 없음) — 읽기 전용 + 신규 매수 중단 요청. [`docs/dashboard.md`](docs/dashboard.md).
 

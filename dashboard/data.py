@@ -649,7 +649,8 @@ def download_bundle(p: Paths, day: date, red: Redactor, summary: dict) -> bytes:
                         (p.fill_ledger.with_name("execution_mode.json"), "execution_mode.json"),
                         (p.fill_ledger.with_name("fill_evidence_spool.jsonl"), "fill_evidence_spool.jsonl"),
                         (p.state_file.with_name("daily_risk.jsonl"), "daily_risk.jsonl"),
-                        (p.state_file.with_name("strategy_decisions.jsonl"), "strategy_decisions.jsonl")):
+                        (p.state_file.with_name("strategy_decisions.jsonl"), "strategy_decisions.jsonl"),
+                        (p.state_file.with_name("entry_observation.jsonl"), "entry_observation.jsonl")):   # H1
             if f.exists() and f.is_file():
                 z.writestr(f"data/{name}", red.text(f.read_text(encoding="utf-8", errors="replace")))
     return buf.getvalue()
