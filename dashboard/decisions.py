@@ -70,6 +70,36 @@ def scan_evals(p: Paths, run_id: str) -> Section:
     return s
 
 
+# S1 점수(사용자 요청 10/27): 신호를 가르는 조건 9개의 충족 비율 × 10. 자격 조건(이력·보통주·위험 표시·거래대금·ATR)은
+# 점수에 넣지 않고 "자격 미달"로 따로 표시 — 거의 늘 충족이라 점수를 부풀리기 때문. **수익 예측·매수 추천 점수가 아님**:
+# S1은 모든 조건을 만족해야(10.0) 신호이고, 9.0이어도 매수하지 않음.
+SCORE_CHECKS = ("C_GT_MA120", "MA60_RISING", "RS60_POS", "PULLBACK", "CLOSE_GT_PREV_HIGH", "CLOSE_GE_MA20",
+                "NOT_EXTENDED", "MARKET_REGIME", "STOP_VALID")
+GATE_CHECKS = ("HISTORY", "ATR_POS", "SECURITY_TYPE", "RISK_STATUS", "LIQUIDITY_TV20")
+
+
+def s1_score(e: dict | None) -> dict | None:
+    """저장된 조건별 결과로 점수 — 판정 본문이 없으면 None(점수 없음). UNKNOWN은 미충족으로 셈."""
+    res = (e or {}).get("result") or {}
+    checks = {c["name"]: c.get("result") for c in res.get("checks") or []}
+    if not checks:
+        return None
+    met = [n for n in SCORE_CHECKS if checks.get(n) == "PASS"]
+    miss = [n for n in SCORE_CHECKS if checks.get(n) != "PASS"]
+    gate_bad = [n for n in GATE_CHECKS if n in checks and checks[n] != "PASS"]
+    return {"score": round(10 * len(met) / len(SCORE_CHECKS), 1), "met": len(met), "total": len(SCORE_CHECKS),
+            "missing": miss, "gate_bad": gate_bad}
+
+
+def score_text(sc: dict | None) -> str:
+    if sc is None:
+        return "-"
+    t = f"{sc['score']:.1f}/10 ({sc['total']}개 중 {sc['met']})"
+    if sc["gate_bad"]:
+        t += " · 자격 미달"
+    return t
+
+
 def fail_summary(e: dict | None) -> str:
     """S1 판단 한 줄: 통과 / 미충족 조건 / 판정 불가 사유 — 저장된 결과 그대로."""
     if not e:
@@ -390,14 +420,22 @@ def symbol_view(p: Paths, settings, day: date, now: datetime, *, calendar=None) 
         else:
             cur = "다음 스캔 대기"
         rk = risk_map.get(code)
+        sc = s1_score(e)
         rows.append({"종목": (e or {}).get("name", ""), "코드": code, "감시 목적": " · ".join(pur) or "-",
                      "데이터": data_txt, "S1 판단": s1, "주문 자격": order_ok, "현재 상태": cur,
-                     "마지막 확인": r["checked_at"]})
+                     "S1 점수": score_text(sc), "마지막 확인": r["checked_at"]})
         D = [f"{(e or {}).get('name', '')} {code} — 감시 목적 {' · '.join(pur) or '-'} · 주문 자격 {order_ok}",
              f"데이터: 가격 {r['status']} {r['reason'] or ''} · 분석 {r['analysis_status']} {r['analysis_reason'] or ''}"
              f" (판정 {r['checked_at']})"]
         if rk and rk["status"] != "OK":
             D.append(f"위험 표시: {rk['status']} {rk['flags_json']}")
+        if sc is not None:
+            D.append(f"S1 점수: {score_text(sc)} — 신호를 가르는 조건 {sc['total']}개 중 충족 비율(수익 예측·매수 추천 아님, "
+                     "10.0일 때만 신호)"
+                     + (f" · 남은 조건: {', '.join(check_label(n) for n in sc['missing'])}" if sc["missing"] else "")
+                     + (f" · 자격 미달: {', '.join(check_label(n) for n in sc['gate_bad'])}" if sc["gate_bad"] else ""))
+        else:
+            D.append("S1 점수: 기록 없음(판정 본문 없음)")
         D += eval_detail(e)
         if code in appr:
             a = appr[code]

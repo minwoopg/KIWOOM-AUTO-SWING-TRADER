@@ -107,7 +107,8 @@ class Table(ttk.Frame):
             for c in cols:
                 self.tree.heading(c, text=c)
                 width = 260 if c in ("내용", "조치", "신규 진입 제외 사유", "사유", "비고", "메모", "상태", "가격 출처", "결과",
-                                     "S1 판단", "현재 상태", "종목", "출처", "기준", "데이터") else 120
+                                     "S1 판단", "현재 상태", "종목", "출처", "기준", "데이터") else (
+                    170 if c == "S1 점수" else 120)
                 self.tree.column(c, width=width, minwidth=60, stretch=True, anchor="w")
             self.cols = cols
         self.tree.delete(*self.tree.get_children())

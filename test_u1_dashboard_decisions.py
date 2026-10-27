@@ -74,6 +74,19 @@ check("1-3) 종목별: 005930 S1 '탈락: 전일 고가 돌파, 시장 조건'(�
 check("1-4) 판정 본문이 없는 행(010120)은 상세에 '기록 없음' — 다시 계산하지 않음",
       any("기록 없음" in ln for ln in sy.data["details"]["010120"]))
 
+# 1-5. S1 점수(10/27 사용자 요청) — 신호를 가르는 조건 9개 충족 비율, 수익 예측 아님
+ALL = ("C_GT_MA120", "MA60_RISING", "RS60_POS", "PULLBACK", "CLOSE_GT_PREV_HIGH", "CLOSE_GE_MA20", "NOT_EXTENDED",
+       "MARKET_REGIME", "STOP_VALID")
+full = {"result": {"checks": [{"name": n, "result": "PASS"} for n in ALL + ("HISTORY", "SECURITY_TYPE")]}}
+gate = {"result": {"checks": [{"name": n, "result": "PASS" if i < 7 else "FAIL"} for i, n in enumerate(ALL)]
+                   + [{"name": "LIQUIDITY_TV20", "result": "FAIL"}]}}
+check("1-5) S1 점수: 감시 종목 표에서 '마지막 확인' 바로 앞 열, 005930 저장 결과 → 2.2/10(9개 중 2), 판정 본문 없음 → '-', "
+      "전부 충족 → 10.0, 자격 조건(거래대금) 미충족은 점수에 안 넣고 '자격 미달' 표시, 상세에 '수익 예측·매수 추천 아님'",
+      list(rows["005930"])[-2:] == ["S1 점수", "마지막 확인"] and rows["005930"]["S1 점수"] == "2.2/10 (9개 중 2)"
+      and rows["010120"]["S1 점수"] == "-" and X.s1_score(full)["score"] == 10.0
+      and X.score_text(X.s1_score(gate)) == "7.8/10 (9개 중 7) · 자격 미달"
+      and any("수익 예측·매수 추천 아님" in ln for ln in sy.data["details"]["005930"]))
+
 # 2. 승인됐지만 주문 미허용 → 가격만 관찰
 R2, S2, P2 = env("approved", allowed=("005930",))
 with sqlite3.connect(P2.watch_db) as cx:
