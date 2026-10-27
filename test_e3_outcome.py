@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from domain.research.s1_outcome import (  # noqa: E402
-    ENTERED, ENTRY_NO_DATA, NO_NEXT_DAY, NOT_ENTERED_ABOVE_CAP, NOT_ENTERED_AT_OR_BELOW_STOP, OPEN_AT_END, STOP,
+    DATA_GAP_UNCERTAIN, ENTERED, ENTRY_DATA_GAP, NO_NEXT_DAY, NOT_ENTERED_ABOVE_CAP, NOT_ENTERED_AT_OR_BELOW_STOP, OPEN_AT_END, STOP,
     STOP_GAP, TIME, OutcomeParams, metrics, sequential, simulate,
 )
 from domain.research.s1_stats import episodes, longest_gap, monthly, pullback_reasons  # noqa: E402
@@ -78,8 +78,9 @@ sp7 = flat(20)
 sp7.pop(11)
 sp7.pop(5)
 r7 = simulate(SIG, DAYS, bars(sp7), P)
-check("7) 보유 중 봉 없는 날(거래정지·휴장 등) 건너뜀 — 10번째 거래일 봉이 없으면 다음 봉 있는 날 시간 청산, 빠진 날 2",
-      r7["exit"] == TIME and r7["exit_date"] == DAYS[12].isoformat() and r7["missing_days"] == 2)
+check("7) 보유 중 봉 없는 세션 2개 — 계산은 이어 가(다음 봉 있는 날 시간 청산) 공백 불확실로 표시, 확정 통계 제외(G2 변경)",
+      r7["exit"] == TIME and r7["exit_date"] == DAYS[12].isoformat() and len(r7["gap_days"]) == 2
+      and r7["quality"] == DATA_GAP_UNCERTAIN and metrics([r7])["n"] == 0)
 r8 = simulate(SIG, DAYS, bars(flat(6)), P)
 check("8) 데이터가 끝날 때까지 청산 안 됨 → 미청산(OPEN_AT_END, 마지막 종가 평가) — 손익 통계에서 제외",
       r8["exit"] == OPEN_AT_END and metrics([r8])["n"] == 0)
@@ -87,8 +88,8 @@ sp9 = flat(20)
 sp9.pop(1)
 r9 = simulate(SIG, DAYS, bars(sp9), P)
 r9b = simulate({**SIG, "date": DAYS[-1].isoformat()}, DAYS, bars(flat(20)), P)
-check("9) 진입일 봉 없음(거래정지) → ENTRY_NO_DATA, 신호일이 데이터 끝 → NO_NEXT_DAY",
-      r9["status"] == ENTRY_NO_DATA and r9b["status"] == NO_NEXT_DAY)
+check("9) 진입일 봉 없음(중간 공백) → ENTRY_DATA_GAP, 신호일이 데이터 끝 → NO_NEXT_DAY",
+      r9["status"] == ENTRY_DATA_GAP and r9b["status"] == NO_NEXT_DAY)
 check("10) 비용: 진입 10,000·청산 9,990 → 비용 전 −10원, 비용 = 매수 35 + 매도 35·20(올림) = 90 → 비용 후 −100원(−1.00%)",
       abs(r6["gross"] + 10) < 1e-6 and r6["cost"] == 35 + 35 + 20 and abs(r6["net"] + 100) < 1e-6
       and abs(r6["net_pct"] + 1.0) < 1e-9)

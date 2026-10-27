@@ -2252,4 +2252,34 @@ GPT가 E1(`72c81bb`)을 검토하며 3건 재현 + 1건 지적: suggest가 쓰�
 ### 전달 파일
 - `swing_f1.zip`
 
+## G1 — 데이터 공백 처리 · 계좌 기준 손익 · 진입 시 손절 거리 · 보류 사유 세분화 (2026-10-27, GPT 10/27)
+
+### 배경
+- GPT 10/27 검토: ① 결과 측정이 보유 중 빠진 일봉을 "거래 불가일"로 건너뛰어, 수집 누락으로 손절 여부를 알 수 없는 거래(+11% 재현)를 확정 손익에 넣음 ② 1주 원화 −44,292원은 "참고"가 아니라 현재 운영 규칙의 결과이고, 수익률 단순 합산선의 −46.5%p는 계좌 낙폭이 아님 ③ `SHORT_HISTORY`가 이력 부족·중간 공백·거래 없는 봉을 모두 묶음 ④ 큰 손실 구조 확인을 위해 진입 시 손절 거리 측정 필요.
+- 실행기·관리자 자동 기동·미기동 경고는 사용자 결정으로 하지 않음(직접 켜고 끄는 방식 유지).
+
+### 변경 내용
+- `domain/research/s1_outcome.py`
+  - 보유 중 봉 없는 세션 → `quality=DATA_GAP_UNCERTAIN`(gap_days), 확정 통계(`confirmed`)에서 제외. 거래량 0 봉은 따로 세고(no_trades_days) 확정 표본에 포함. 그 종목 마지막 봉 이후는 데이터 끝.
+  - 진입일 `ENTRY_NO_DATA` → `ENTRY_DATA_GAP`(봉 없음) / `ENTRY_NO_TRADES`(거래량 0).
+  - 손절 거리(진입가 기준·상한 기준)·예상 손실액, `distance_buckets`·`distance_caps`.
+  - `account()` — 초기 자금·현금·보유 평가액·비용 반영 일별 평가 곡선(계좌 수익률·최대 낙폭·최대 투입 비중 등).
+- `tools/s1_outcome.py` — 보고서 재구성(확정 표본 / 거래 수익률은 "신호 특성 비교용" / 계좌 기준 1주·고정 금액 / 손절 거리 / 데이터 품질), `--capital`·`--per-trade`, CSV 열 추가(stop_dist_pct·stop_dist_cap_pct·exp_loss_1sh·quality·gap_days·no_trades_days; missing_days 제거).
+- `domain/research/s1_frequency.py` — 보류 사유 `SHORT_HISTORY` / `DATA_GAP_IN_WINDOW` / `NO_TRADES_IN_WINDOW` / `SHORT_SESSIONS`(+날짜). `s1_stats.data_quality`·`hold_counts`, 빈도 보고서 종목별 보류 사유·"4-1. 종목별 일봉 품질".
+- 문서 `docs/e3_outcome_compare.md`.
+
+### 테스트 및 검증
+- `test_g1_outcome_quality.py` 14건(GPT 공백 재현, 거래량 0, 데이터 끝, 진입일 구분, 손절 거리·예상 손실, 구간·상한 표, 계좌 1주·고정 금액·현금 한도·미청산 평가, 보류 사유·품질).
+- `test_e3_outcome.py` 7·9번을 바뀐 규칙으로 갱신, `test_e2_fixes.py` 5-1·5-2에 새 절 확인 추가. 회귀 전체, 단타 동등성 18/18.
+
+### 변경하지 않은 것
+- 운영 S1 판정 기준·주문·청산·위험 한도, 실행기·관리자 기동 방식, 설정 파일.
+
+### 다음 작업
+- 25종목 적용 뒤 빈도(base5/all25)·결과 측정 다시 실행 → 공백 불확실 건수·보류 원인·손절 거리 구간 확인.
+- 주문 미허용 승인 후보의 장초반 가격 관찰(신호 키 소진 없이 별도 기록).
+
+### 전달 파일
+- `swing_g1.zip`
+
 <!-- 이후 작업은 여기부터 이어서 기록합니다. -->

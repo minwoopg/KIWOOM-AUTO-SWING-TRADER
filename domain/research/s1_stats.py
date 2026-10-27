@@ -105,3 +105,19 @@ def period_summary(rows: list[dict], dates: list[date]) -> dict:
             "pattern": sum(r.get("pattern_pass") == PASS for r in rr), "final": len(fin),
             "signal_days": len({r["date"] for r in fin}), "symbols": len({r["code"] for r in fin}),
             "episodes_7d": episodes(rr), "longest_gap": longest_gap(dates, rr)}
+
+
+def data_quality(bars: list, sessions: list[date]) -> dict:
+    """종목 일봉 품질(G1 — GPT 10/27): 첫·마지막 봉, 그 사이 봉이 없는 세션(원인 불명 공백), 거래량 0 봉.
+    sessions: 기준 거래일 목록(KOSPI 지수 일봉 날짜). 첫 봉 이전·마지막 봉 이후는 공백으로 세지 않음."""
+    if not bars:
+        return {"first": None, "last": None, "gaps": [], "no_trades": []}
+    have = {b.date for b in bars}
+    first, last = bars[0].date, bars[-1].date
+    return {"first": first, "last": last,
+            "gaps": [d for d in sessions if first <= d <= last and d not in have],
+            "no_trades": [b.date for b in bars if not b.volume]}
+
+
+def hold_counts(rows: Iterable[dict]) -> dict[str, int]:
+    return dict(Counter(r.get("data_status") for r in rows if r.get("data_status") != "OK").most_common())

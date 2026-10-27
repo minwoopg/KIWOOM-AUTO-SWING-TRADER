@@ -66,6 +66,30 @@ def variants_of(res: dict, res_pb15: dict | None) -> dict[str, str]:
     return out
 
 
+# G1(GPT 10/27): 이력 창(min_history) 검사 실패를 원인별로 나눔 — 이전에는 모두 SHORT_HISTORY였음.
+HIST_SHORT = "SHORT_HISTORY"              # 첫 봉 이전 세션이 창에 걸림(상장·수집 시작이 늦음 — 진짜 이력 부족)
+HIST_GAP = "DATA_GAP_IN_WINDOW"           # 첫 봉 이후인데 봉이 없는 세션(수집 누락·원인 불명 공백)
+HIST_NO_TRADES = "NO_TRADES_IN_WINDOW"    # 창 안에 거래량 0 봉(거래정지 가능성 — 정지 확정 아님)
+HIST_SESSIONS = "SHORT_SESSIONS"          # 분석 세션 목록 자체가 짧음
+HOLD_LABEL = {HIST_SHORT: "이력 부족", HIST_GAP: "중간 공백(원인 불명)", HIST_NO_TRADES: "창 안 거래 없는 봉",
+              HIST_SESSIONS: "세션 목록 부족", "NO_TRADES_AT_T": "그날 거래 없는 봉", "NO_BAR_AT_T": "그날 봉 없음",
+              "T_NOT_SESSION": "거래일 아님"}
+
+
+def history_status(hist: dict | None) -> tuple[str, str]:
+    """HISTORY 검사 → (data_status, 세부). detail 예: INSUFFICIENT_HISTORY · DATA_GAP:2026-04-02 · NO_TRADES:2026-04-02."""
+    if hist and hist["result"] == PASS:
+        return "OK", ""
+    why = (hist or {}).get("detail") or ""
+    if why.startswith("DATA_GAP"):
+        return HIST_GAP, why.partition(":")[2]
+    if why.startswith("NO_TRADES"):
+        return HIST_NO_TRADES, why.partition(":")[2]
+    if why == "INSUFFICIENT_SESSIONS":
+        return HIST_SESSIONS, ""
+    return HIST_SHORT, why
+
+
 @dataclass
 class FrequencyResult:
     rows: list[dict] = field(default_factory=list)          # 종목·날짜 한 줄(판정 요약)
@@ -102,8 +126,8 @@ def analyze(dates: list[date], sessions_for: callable, stocks: dict[str, dict], 
             res = evaluate_s1(code, view, iv, None, s["eligibility"], cfg).to_dict()
             res15 = evaluate_s1(code, view, iv, None, s["eligibility"], cfg15).to_dict()
             hist = next((c for c in res["checks"] if c["name"] == "HISTORY"), None)
-            out.rows.append({"date": t.isoformat(), "code": code,
-                             "data_status": "OK" if hist and hist["result"] == PASS else "SHORT_HISTORY",
+            ds, dd = history_status(hist)
+            out.rows.append({"date": t.isoformat(), "code": code, "data_status": ds, "data_detail": dd,
                              **{g: res[g] for g in ("pattern_pass", "eligibility_pass", "market_pass", "stop_valid",
                                                     "eligible_signal")},
                              "checks": [{"name": c["name"], "result": c["result"],

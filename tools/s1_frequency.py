@@ -22,9 +22,9 @@ sys.path.insert(0, str(ROOT))
 
 from domain.research.market import RISK_ON  # noqa: E402,F401
 from domain.research.s1 import Eligibility, S1Config  # noqa: E402
-from domain.research.s1_frequency import VARIANT_LABEL, VARIANTS, analyze  # noqa: E402
+from domain.research.s1_frequency import HOLD_LABEL, VARIANT_LABEL, VARIANTS, analyze  # noqa: E402
 from domain.research.s1_funnel import funnel, funnel_line  # noqa: E402
-from domain.research.s1_stats import monthly, period_summary, pullback_reasons  # noqa: E402
+from domain.research.s1_stats import data_quality, hold_counts, monthly, period_summary, pullback_reasons  # noqa: E402
 from infra.research.report_files import create_exclusive  # noqa: E402
 from domain.research.universe import STOCK_MARKETS  # noqa: E402
 from infra.research.s1_scanner import INDEX_IDS, SCAN_LOOKBACK_SESSIONS  # noqa: E402
@@ -102,25 +102,45 @@ def render(res, f_base, stocks, missing, dates, args, snap) -> str:
     for iid in INDEX_IDS:
         sts = [reg.get(iid) for reg in res.regimes.values() if reg.get(iid)]
         L.append(f"| {iid} | " + " | ".join(str(sts.count(s)) for s in ("RISK_ON", "MIXED", "RISK_OFF", "UNKNOWN")) + " |")
-    L += ["", "## 4. 종목별", "", "| 코드 | 이름 | 데이터 준비 일 | 패턴 PASS 일 | 최종 PASS 일 | 시장 제외 시 PASS 일 |",
-          "|---|---|---:|---:|---:|---:|"]
+    L += ["", "## 4. 종목별", "", "| 코드 | 이름 | 데이터 준비 일 | 데이터 보류(사유) | 패턴 PASS 일 | 최종 PASS 일 | "
+          "시장 제외 시 PASS 일 |", "|---|---|---:|---|---:|---:|---:|"]
     for c, s in sorted(stocks.items()):
         rr = [r for r in res.rows if r["code"] == c]
-        L.append(f"| {c} | {s['name']} | {sum(r['data_status'] == 'OK' for r in rr)} | "
+        L.append(f"| {c} | {s['name']} | {sum(r['data_status'] == 'OK' for r in rr)} | {_holds(hold_counts(rr))} | "
                  f"{sum(r['pattern_pass'] == 'PASS' for r in rr)} | {sum(r['eligible_signal'] == 'PASS' for r in rr)} | "
                  f"{sum(r['variants'].get('NO_MARKET') == 'PASS' for r in rr)} |")
+    L += _quality_section(stocks, getattr(args, "all_days", dates))
     L += ["", "## 5. 월별 (그룹별)", ""]
     for name, codes in args.groups:
         rr = [r for r in res.rows if r["code"] in codes]
         L += [f"### {name} ({len(codes)}종목)", "", "| 월 | 분석 표본 | 데이터 준비 | 데이터 보류(사유) | 패턴 PASS | 최종 PASS | 신호 날 수 |",
               "|---|---:|---:|---|---:|---:|---:|"]
         for m in monthly(rr):
-            holds = ", ".join(f"{k} {v}" for k, v in sorted(m["holds"].items())) or "-"
+            holds = _holds(m["holds"])
             L.append(f"| {m['month']} | {m['rows']} | {m['ready']} | {holds} | {m['pattern']} | {m['final']} | {m['signal_days']} |")
         L.append("")
     if missing or res.skipped:
         L += ["", "## 6. 분석 못 한 종목", ""] + [f"- {c}: {w}" for c, w in {**missing, **res.skipped}.items()]
     return "\n".join(L) + "\n"
+
+
+def _holds(h: dict) -> str:
+    return ", ".join(f"{HOLD_LABEL.get(k, k)}({k}) {v}" for k, v in sorted(h.items())) or "-"
+
+
+def _quality_section(stocks, sessions) -> list[str]:
+    """G1: 종목별 일봉 품질 — 보류 원인 확인용(이력 창 160세션 안에 공백·거래 없는 봉이 하나라도 있으면 그 기간 동안 보류)."""
+    L = ["", "### 4-1. 종목별 일봉 품질", "",
+         "보류 사유: **이력 부족**(첫 봉 이전 세션이 이력 창에 걸림) · **중간 공백**(첫 봉 이후 봉이 없는 세션 — 수집 누락 등 "
+         "원인 불명) · **창 안 거래 없는 봉**(거래량 0 봉 — 거래정지 가능성, 정지 확정 아님). 운영 S1도 같은 기준으로 UNKNOWN 처리.", "",
+         "| 코드 | 이름 | 첫 봉 | 마지막 봉 | 중간 공백(세션) | 거래 없는 봉 |", "|---|---|---|---|---|---|"]
+
+    def _ds(xs):
+        return "0" if not xs else f"{len(xs)} ({', '.join(d.isoformat() for d in xs[:3])}{' …' if len(xs) > 3 else ''})"
+    for c, s in sorted(stocks.items()):
+        q = data_quality(s["bars"], sessions)
+        L.append(f"| {c} | {s['name']} | {q['first'] or '-'} | {q['last'] or '-'} | {_ds(q['gaps'])} | {_ds(q['no_trades'])} |")
+    return L
 
 
 def _compare_section(res, dates, args) -> list[str]:
@@ -197,6 +217,7 @@ def main(argv=None) -> int:
     res = analyze(dates, lambda t: all_days[:bisect.bisect_right(all_days, t)][-SCAN_LOOKBACK_SESSIONS:],
                   stocks, indexes)
     args.cal_note = cal_note
+    args.all_days = all_days
     args.groups = [(n, [c for c in gc if c in stocks]) for n, gc in groups] or [("전체", sorted(stocks))]
     f_base = funnel(res.rows)
     rid, files = create_exclusive(args.out_dir, f"s1_frequency_{end.isoformat()}", (".md", ".csv"))

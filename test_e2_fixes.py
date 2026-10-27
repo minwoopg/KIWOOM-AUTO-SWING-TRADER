@@ -113,7 +113,7 @@ with contextlib.redirect_stdout(io.StringIO()):
 gmd = next(gout.glob("*.md")).read_text(encoding="utf-8")
 check("5-1) 그룹·기간 비교: 그룹 a·b × 전체·최근 4줄, 월별 표(그룹별), 눌림 세부 사유, 중복 탈락 주의 문구, 실행 ID",
       gr == 0 and gmd.count("| a | ") == 2 and gmd.count("| b | ") == 2 and "### a (1종목)" in gmd
-      and "눌림(PULLBACK) 실패 세부 사유" in gmd and "중복" in gmd and "실행 ID" in gmd)
+      and "눌림(PULLBACK) 실패 세부 사유" in gmd and "중복" in gmd and "실행 ID" in gmd and "4-1. 종목별 일봉 품질" in gmd)
 oout = TMP / "out"
 b = io.StringIO()
 with contextlib.redirect_stdout(b):
@@ -124,6 +124,8 @@ ocsv = next(oout.glob("*.csv")).read_text(encoding="utf-8-sig")
 check("5-2) 결과 측정 도구: 10/7 005930 신호 1건 → 진입일 없음(데이터 끝 — 다음 날 봉 없음)으로 분류, 보고서에 '운영 체결 재현이 아님'·"
       "처리 기준, CSV 행, 연구 DB 바이트 그대로",
       orc == 0 and "운영 체결 재현이 아님" in omd and "처리 기준" in omd and "2026-10-07,005930" in ocsv
+      and "계좌 기준" in omd and "진입 시 손절 거리" in omd and "계좌 수익률·계좌 최대 낙폭이 아님" not in omd
+      and "stop_dist_pct" in ocsv and "quality" in ocsv
       and hashlib.sha256(rdb.read_bytes()).hexdigest() == h0)
 
 shutil.rmtree(TMP, ignore_errors=True)
